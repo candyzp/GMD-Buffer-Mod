@@ -3688,6 +3688,7 @@ public:
 // v2.46: the level complete screen says so if the buffer was on during the attempt.
 class $modify(BufEndLevelLayer, EndLevelLayer) {
     void customSetup() {
+        crashdiag::ActiveScope __diag("BufEndLevelLayer::customSetup");
         EndLevelLayer::customSetup();
         if (!buf.usedThisAttempt) {
             return;
@@ -3717,6 +3718,7 @@ class $modify(BufEndLevelLayer, EndLevelLayer) {
 
 class $modify(BufPauseLayer, PauseLayer) {
     void customSetup() {
+        crashdiag::ActiveScope __diag("BufPauseLayer::customSetup");
         PauseLayer::customSetup();
         auto* sprite = ButtonSprite::create("Buffer", "bigFont.fnt", BufferMenu::currentTheme().button, 0.8f);
         sprite->setScale(0.6f);
@@ -3812,6 +3814,7 @@ $on_mod(Loaded) {
 
 class $modify(BufPlayLayer, PlayLayer) {
     static void onModify(auto& self) {
+        crashdiag::record("HOOK_REGISTER BufPlayLayer priority=Priority::VeryEarly");
         (void)self.setHookPriority("PlayLayer::destroyPlayer", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayLayer::playEndAnimationToPos", HOOK_PRIORITY);
     }
@@ -4070,12 +4073,14 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void togglePracticeMode(bool practiceMode) {
+        crashdiag::ActiveScope __diag("BufPlayLayer::togglePracticeMode");
         PlayLayer::togglePracticeMode(practiceMode);
         refreshWatermark();
         refreshAutoTag();
     }
 
     void playEndAnimationToPos(CCPoint position) {
+        crashdiag::ActiveScope __diag("BufPlayLayer::playEndAnimationToPos");
         if (buf.simulating) {
             return;
         }
@@ -4085,6 +4090,7 @@ class $modify(BufPlayLayer, PlayLayer) {
 
 class $modify(BufEditorLayer, LevelEditorLayer) {
     bool init(GJGameLevel* level, bool noUI) {
+        crashdiag::ActiveScope __diag("BufEditorLayer::init");
         bool ok = LevelEditorLayer::init(level, noUI);
         dropGhosts();
         return ok;
@@ -4093,10 +4099,12 @@ class $modify(BufEditorLayer, LevelEditorLayer) {
 
 class $modify(BufHardStreak, HardStreak) {
     static void onModify(auto& self) {
+        crashdiag::record("HOOK_REGISTER BufHardStreak priority=Priority::VeryEarly");
         (void)self.setHookPriority("HardStreak::addPoint", HOOK_PRIORITY);
     }
 
     void addPoint(CCPoint point) {
+        crashdiag::ActiveScope __diag("BufHardStreak::addPoint");
         if (buf.simulating) {
             return;
         }
@@ -4106,10 +4114,12 @@ class $modify(BufHardStreak, HardStreak) {
 
 class $modify(BufEffectGameObject, EffectGameObject) {
     static void onModify(auto& self) {
+        crashdiag::record("HOOK_REGISTER BufEffectGameObject priority=Priority::VeryEarly");
         (void)self.setHookPriority("EffectGameObject::triggerObject", HOOK_PRIORITY);
     }
 
     void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
+        crashdiag::ActiveScope __diag("BufEffectGameObject::triggerObject");
         if (buf.simulating) {
             return;
         }
@@ -4119,10 +4129,12 @@ class $modify(BufEffectGameObject, EffectGameObject) {
 
 class $modify(BufGameObject, GameObject) {
     static void onModify(auto& self) {
+        crashdiag::record("HOOK_REGISTER BufGameObject priority=Priority::VeryEarly");
         (void)self.setHookPriority("GameObject::playShineEffect", HOOK_PRIORITY);
     }
 
     void playShineEffect() {
+        crashdiag::ActiveScope __diag("BufGameObject::playShineEffect");
         if (buf.simulating) {
             return;
         }
@@ -4132,6 +4144,7 @@ class $modify(BufGameObject, GameObject) {
 
 class $modify(BufPlayerObject, PlayerObject) {
     static void onModify(auto& self) {
+        crashdiag::record("HOOK_REGISTER BufPlayerObject priority=Priority::VeryEarly");
         (void)self.setHookPriority("PlayerObject::playSpiderDashEffect", HOOK_PRIORITY);
         // v2.18: run before Click Between Frames, so this sees each physics tick once, with
         // its full dt, and CBF's mid-tick clicks arrive while inRealUpdate is set.
@@ -4215,70 +4228,87 @@ class $modify(BufPlayerObject, PlayerObject) {
     // of it matters for physics, and some of it was added to the real level, so ghosts
     // skip all of it.
     bool ghostEffect() {
+        crashdiag::ActiveScope __diag("BufPlayerObject::ghostEffect");
         return buf.simulating && isGhost(this);
     }
 
     void spawnCircle() {
+        crashdiag::ActiveScope __diag("BufPlayerObject::spawnCircle");
         if (!ghostEffect()) PlayerObject::spawnCircle();
     }
 
     void spawnDualCircle() {
+        crashdiag::ActiveScope __diag("BufPlayerObject::spawnDualCircle");
         if (!ghostEffect()) PlayerObject::spawnDualCircle();
     }
 
     void spawnPortalCircle(ccColor3B color, float startRadius) {
+        crashdiag::ActiveScope __diag("BufPlayerObject::spawnPortalCircle");
         if (!ghostEffect()) PlayerObject::spawnPortalCircle(color, startRadius);
     }
 
     void spawnScaleCircle() {
+        crashdiag::ActiveScope __diag("BufPlayerObject::spawnScaleCircle");
         if (!ghostEffect()) PlayerObject::spawnScaleCircle();
     }
 
     void playBumpEffect(int objectType, GameObject* object) {
+        crashdiag::ActiveScope __diag("BufPlayerObject::playBumpEffect");
         if (!ghostEffect()) PlayerObject::playBumpEffect(objectType, object);
     }
 
     void playSpawnEffect() {
+        crashdiag::ActiveScope __diag("BufPlayerObject::playSpawnEffect");
         if (!ghostEffect()) PlayerObject::playSpawnEffect();
     }
 
     void createFadeOutDartStreak() {
+        crashdiag::ActiveScope __diag("BufPlayerObject::createFadeOutDartStreak");
         if (!ghostEffect()) PlayerObject::createFadeOutDartStreak();
     }
 
     void fadeOutStreak2(float duration) {
+        crashdiag::ActiveScope __diag("BufPlayerObject::fadeOutStreak2");
         if (!ghostEffect()) PlayerObject::fadeOutStreak2(duration);
     }
 
     void playDynamicSpiderRun() {
+        crashdiag::ActiveScope __diag("BufPlayerObject::playDynamicSpiderRun");
         if (!ghostEffect()) PlayerObject::playDynamicSpiderRun();
     }
 
     void animatePlatformerJump(float scale) {
+        crashdiag::ActiveScope __diag("BufPlayerObject::animatePlatformerJump");
         if (!ghostEffect()) PlayerObject::animatePlatformerJump(scale);
     }
 
     void runBallRotation(float speed) {
+        crashdiag::ActiveScope __diag("BufPlayerObject::runBallRotation");
         if (!ghostEffect()) PlayerObject::runBallRotation(speed);
     }
 
     void runBallRotation2() {
+        crashdiag::ActiveScope __diag("BufPlayerObject::runBallRotation2");
         if (!ghostEffect()) PlayerObject::runBallRotation2();
     }
 
     void runNormalRotation(bool notNormalMode, float speed) {
+        crashdiag::ActiveScope __diag("BufPlayerObject::runNormalRotation");
         if (!ghostEffect()) PlayerObject::runNormalRotation(notNormalMode, speed);
     }
 
     void toggleGhostEffect(GhostType type) {
+        crashdiag::ActiveScope __diag("BufPlayerObject::toggleGhostEffect");
         if (!ghostEffect()) PlayerObject::toggleGhostEffect(type);
     }
 
     void activateStreak() {
+        crashdiag::ActiveScope __diag("BufPlayerObject::activateStreak");
         if (!ghostEffect()) PlayerObject::activateStreak();
     }
 
     void playSpiderDashEffect(CCPoint from, CCPoint to) {
+        crashdiag::ActiveScope __diag("BufPlayerObject::playSpiderDashEffect");
         if (buf.simulating) {
             return;
         }
@@ -4286,6 +4316,7 @@ class $modify(BufPlayerObject, PlayerObject) {
     }
 
     void ringJump(RingObject* ring, bool skipCheck) {
+        crashdiag::ActiveScope __diag("BufPlayerObject::ringJump");
         if (buf.simulating) {
             if (!buf.smart || !isGhost(this)) {
                 return;
@@ -4313,6 +4344,7 @@ class $modify(BufPlayerObject, PlayerObject) {
 
     // Dash orbs don't go through ringJump.
     void startDashing(DashRingObject* ring) {
+        crashdiag::ActiveScope __diag("BufPlayerObject::startDashing");
         if (buf.simulating && isGhost(this)) {
             buf.orbsUsed.insert(ring);
             if (buf.orbUsedTick < 0) {
@@ -4372,6 +4404,7 @@ class $modify(BufKeyboard, CCKeyboardDispatcher) {
 
 class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     static void onModify(auto& self) {
+        crashdiag::record("HOOK_REGISTER BufBaseGameLayer priority=Priority::VeryEarly");
         (void)self.setHookPriority("GJBaseGameLayer::canBeActivatedByPlayer", HOOK_PRIORITY);
         (void)self.setHookPriority("GJBaseGameLayer::handleButton", HOOK_PRIORITY);
         (void)self.setHookPriority("GJBaseGameLayer::collisionCheckObjects", HOOK_PRIORITY);
@@ -4585,6 +4618,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     // otherwise toggle or spawn groups and change item counters for real (once per
     // prediction run, many times a click), which broke triggers in some levels.
     void toggleGroupTriggered(int group, bool activate, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::toggleGroupTriggered");
         if (buf.simulating) {
             // v2.75: a toggle orb that switches a group off: the ghost stops colliding with
             // that group for the rest of this prediction (the real objects aren't touched)
@@ -4601,6 +4635,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void spawnGroup(int group, bool ordered, double delay, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::spawnGroup");
         if (buf.simulating) {
             return;
         }
@@ -4608,6 +4643,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void toggleGroup(int id, bool activate) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::toggleGroup");
         if (buf.simulating) {
             return;
         }
@@ -4615,6 +4651,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void pickupItem(EffectGameObject* object) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::pickupItem");
         if (buf.simulating) {
             return;
         }
@@ -4622,6 +4659,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void updateCounters(int itemId, int value) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::updateCounters");
         if (buf.simulating) {
             return;
         }
@@ -4629,6 +4667,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void activateItemEditTrigger(ItemTriggerGameObject* object) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::activateItemEditTrigger");
         if (buf.simulating) {
             return;
         }
@@ -4636,6 +4675,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void activateItemCompareTrigger(ItemTriggerGameObject* object, gd::vector<int> const& remapKeys) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::activateItemCompareTrigger");
         if (buf.simulating) {
             return;
         }
@@ -4644,6 +4684,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     // Safety net in case a mode portal slips through: end prediction, change nothing.
     void playerWillSwitchMode(PlayerObject* player, GameObject* object) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::playerWillSwitchMode");
         if (buf.simulating) {
             buf.ghostHitPortal = true;
             return;
