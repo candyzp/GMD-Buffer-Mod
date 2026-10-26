@@ -2262,12 +2262,18 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             (!p->m_isShip && !p->m_isBird && !p->m_isBall && !p->m_isDart &&
              !p->m_isRobot && !p->m_isSpider && !p->m_isSwing));
         if (supportedPredictionMode && currentLayer && currentLayer->m_isPracticeMode &&
-            !sharedDualInput() && !(m_levelSettings && m_levelSettings->m_twoPlayerMode)) {
+            !currentLayer->m_isPlatformer && !sharedDualInput() &&
+            !(m_levelSettings && m_levelSettings->m_twoPlayerMode))
             bool wasHeld = s.held;
             if (down && !wasHeld) {
                 s.pressStep = step;
             } else if (!down && s.pressStep >= 0) {
-                recordPredictionHold(step - s.pressStep);
+                if (p->m_isRobot) {
+                    recordPredictionHold(step - s.pressStep, true);
+                } else if (!p->m_isShip && !p->m_isDart && !p->m_isRobot &&
+                           !p->m_isBall && !p->m_isSpider) {
+                    recordPredictionHold(step - s.pressStep, false);
+                }
                 s.pressStep = -1;
             }
             s.held = down;
