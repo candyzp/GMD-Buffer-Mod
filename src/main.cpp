@@ -1620,8 +1620,6 @@ class $modify(BufferReset, PlayLayer) {
 };
 
 
-#include <chrono>
-
 // Experimental iOS-safe prediction core. Unlike the old fixed landing wait, this makes
 // a detached ghost player run the same physics/collision steps for "press now" and
 // candidate delayed presses. It is deliberately limited to cube-like prediction in
@@ -1848,10 +1846,10 @@ static PredictionResult simulateCubePress(PlayLayer* layer, PlayerObject* real, 
         if (tick == delay) ghost->pushButton(PlayerButton::Jump);
         if (tick == delay + holdTicks) ghost->releaseButton(PlayerButton::Jump);
 
-        ghost->m_collisionLogTop->removeAllObjects();
-        ghost->m_collisionLogBottom->removeAllObjects();
-        ghost->m_collisionLogLeft->removeAllObjects();
-        ghost->m_collisionLogRight->removeAllObjects();
+        if (ghost->m_collisionLogTop) ghost->m_collisionLogTop->removeAllObjects();
+        if (ghost->m_collisionLogBottom) ghost->m_collisionLogBottom->removeAllObjects();
+        if (ghost->m_collisionLogLeft) ghost->m_collisionLogLeft->removeAllObjects();
+        if (ghost->m_collisionLogRight) ghost->m_collisionLogRight->removeAllObjects();
 
         ghost->update(SIM_DT);
         ghost->updateRotation(SIM_DT);
