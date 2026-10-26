@@ -1,5 +1,8 @@
 ## v1.2.0
 
+- Add an iOS arm64 build target and CI job alongside Windows.
+- Keep the iOS `runNormalRotation` path unhooked; this repository does not define that override.
+
 - Added optional master tick controller and shared 0–64 tick slider.
 - Added optional deterministic activation-rate limit.
 - Added an optional sound on every successful saved input.
