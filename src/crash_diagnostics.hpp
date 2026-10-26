@@ -143,7 +143,7 @@ namespace crashdiag {
         rawWrite(" fault_address=", 15);
         rawWriteHex(reinterpret_cast<uintptr_t>(info ? info->si_addr : nullptr));
         rawWrite("\nactive_hook=", 13);
-        rawWriteString(g_activeHook, sizeof(g_activeHook));
+        rawWriteString(g_activeHook, ACTIVE_SIZE);
         rawWrite("\npid=", 5);
         rawWriteSigned(static_cast<long long>(::getpid()));
         rawWrite("\n", 1);
