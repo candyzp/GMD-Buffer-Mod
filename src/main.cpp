@@ -4294,7 +4294,28 @@ class $modify(BufPlayerObject, PlayerObject) {
 
     void runNormalRotation(bool notNormalMode, float speed) {
         crashdiag::ActiveScope __diag("BufPlayerObject::runNormalRotation");
-        if (!ghostEffect()) PlayerObject::runNormalRotation(notNormalMode, speed);
+        if (ghostEffect()) {
+            return;
+        }
+#if defined(GEODE_IS_IOS)
+        // Confirmed iOS 2.2081 crash: calling the base overload from this modify hook
+        // recurses through the same Geode/Tulip hook until the main stack overflows.
+        // Keep the upstream hook installed, but do not forward into the broken trampoline
+        // on iOS. This only bypasses the rotation animation; it does not change physics,
+        // input handling, prediction, or remove any other upstream hook.
+        static bool loggedIOSBypass = false;
+        if (!loggedIOSBypass) {
+            loggedIOSBypass = true;
+            crashdiag::recordf("IOS_HOOK_BYPASS runNormalRotation(bool,float): skipped recursive base trampoline; notNormalMode=%d speed=%g",
+                notNormalMode ? 1 : 0, static_cast<double>(speed));
+            crashdiag::flush();
+        }
+        (void)notNormalMode;
+        (void)speed;
+        return;
+#else
+        PlayerObject::runNormalRotation(notNormalMode, speed);
+#endif
     }
 
     void toggleGhostEffect(GhostType type) {
