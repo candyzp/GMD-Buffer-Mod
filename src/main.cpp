@@ -270,6 +270,7 @@ namespace {
         CCLabelBMFont* autoTag = nullptr;  // optional on-screen auto-release tag
         bool showAutoTag = false;
         bool debugTools = false;
+        bool diagnosticCaptureRequested = false; // DIAG can enable crash capture without extra analysis work
         bool usedThisAttempt = false;      // the buffer was on at some point of this attempt
         bool learn = true;           // v2.13: per-level memory learned from your runs
         bool fullState = true;       // v2.11.1: copy the full v2.8 player state into the ghost
@@ -493,7 +494,7 @@ namespace {
         buf.perfLog = buf.debugTools;
         buf.deathLog = buf.debugTools;
         buf.explain = buf.debugTools;
-        crashdiag::setRecordingEnabled(buf.debugTools);
+        crashdiag::setRecordingEnabled(buf.debugTools || buf.diagnosticCaptureRequested);
         if (!buf.debugTools) {
             buf.showPath = false;
         }
@@ -3521,6 +3522,7 @@ private:
             saveProfile();
             refreshHeatmap();
             refreshWatermark();
+            refreshAutoTag();
         }
         else {
             buf.showPath = value;
@@ -3809,6 +3811,7 @@ class $modify(BufPauseLayer, PauseLayer) {
         // DIAG is an explicit request for crash capture; it does not turn on the
         // CPU-heavy in-game analysis tools.
         if (!buf.debugTools) {
+            buf.diagnosticCaptureRequested = true;
             crashdiag::setRecordingEnabled(true);
         }
         crashdiag::flush();
@@ -4247,7 +4250,26 @@ class $modify(BufPlayerObject, PlayerObject) {
         }
 
         bool isP1 = layer && this == layer->m_player1;
-        if (isP1 && tickCount > 0 && tickCount % 120 == 0) crashdiag::flush();
+        if (isP1 && tickCount > 0 && tickCount % 120 == 0) {
+            // Poll only the new live controls twice a second; full settings parsing happens
+            // only after a value actually changed, never on every frame or physics step.
+            auto* settings = Mod::get();
+            bool changed =
+                settings->getSettingValue<bool>("master-tick-control") != buf.masterTickControl ||
+                static_cast<int>(settings->getSettingValue<int64_t>("master-tick-limit")) != buf.masterTickLimit ||
+                settings->getSettingValue<bool>("save-aggression") != buf.saveAggression ||
+                static_cast<int>(settings->getSettingValue<int64_t>("save-aggression-level")) != buf.saveAggressionLevel ||
+                settings->getSettingValue<bool>("show-auto-tag") != buf.showAutoTag ||
+                settings->getSettingValue<bool>("debug-tools") != buf.debugTools;
+            if (changed) {
+                readSettings();
+                applyStage();
+                refreshAutoTag();
+                refreshHeatmap();
+                refreshPanel();
+            }
+            crashdiag::flush();
+        }
         if (isP1) {
             // v2.37: getPosition() is updated every physics step; PlayerObject::m_position lags
             // behind, which kept CBF sync, the drift check, path view and memory slices off.
