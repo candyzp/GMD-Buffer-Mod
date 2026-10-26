@@ -1,6 +1,6 @@
 # Input Buffer
 
-A Geode mod for Geometry Dash 2.2081 (Windows) that makes tight timings easier.
+A Geode mod for Geometry Dash 2.2081 on Windows and iOS that makes tight timings easier.
 
 If you click slightly too early, the mod remembers the click and fires it the moment you land or touch an orb. In ship, UFO, swing and wave it makes very quick taps come out consistent.
 
@@ -28,9 +28,9 @@ Switching wave mode in the middle of a wave section can cause one odd click, so 
 
 ## Install
 
-1. You need Geometry Dash 2.2081 on Windows with the [Geode](https://geode-sdk.org) loader installed.
-2. Download `lyophi.buffermod.geode` from the [Releases](../../releases) page.
-3. Put it in the `geode/mods` folder inside your Geometry Dash folder, then restart the game.
+1. You need Geometry Dash 2.2081 and a compatible [Geode](https://geode-sdk.org) installation on your platform.
+2. Download the combined `lyophi.buffermod.geode` package from the [Releases](../../releases) page or the CI Build Output artifact.
+3. Install it using your platform's Geode mod installation flow. On Windows, the file can be placed in `geode/mods`; on iOS, use the mods folder supported by your existing Geode iOS installation.
 
 The mod appears as **Input Buffer** in the Geode mod list.
 
@@ -78,7 +78,7 @@ Hotkeys only act while you are inside a level, and you can rebind them in the se
 
 ## Known limitations
 
-- The mod is built for Windows. Hotkeys use Geode's keybind system, but other platforms are untested.
+- CI builds Windows and iOS packages. The iOS target is compile-checked by CI, but in-game behavior must still be verified on an actual iOS device. Keyboard hotkeys are not useful on iPhone, so use the in-game Buffer menu and settings instead.
 - The TPS setting is typed by hand and must be kept in sync with your real TPS.
 - Dual portal support is experimental and off by default. In levels with mixed modes on the two icons, expect some rough edges.
 - Delayed inputs are injected by the mod, so effects that depend on the original input event may not see them at the exact moment.
@@ -127,3 +127,8 @@ Some lists may not accept input-assist mods. Check your list's rules before subm
 - **Lower default overhead:** detailed successful-save log writes now use the existing Debug Logging toggle, rather than writing a console line on every save when debugging is off.
 
 The currently published repository metadata and workflow still target Windows only. These changes do not add an iOS build target or change any rotation hooks.
+
+
+### iOS crash precaution
+
+This codebase does not currently override `PlayerObject::runNormalRotation(bool, float)`. Keep it that way on iOS unless an original-function/trampoline path has been verified for the exact Geode/Tulip target and confirmed not to recurse. Do not add a forwarding modify hook just to suppress the crash: native player rotation must remain intact.
