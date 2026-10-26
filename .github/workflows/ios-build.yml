@@ -6,6 +6,7 @@ on:
     branches:
       - ios-port
       - ios-perf-log-fix
+      - ios-predictive-experiment
     paths:
       - 'src/**'
       - 'mod.json'
