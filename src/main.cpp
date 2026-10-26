@@ -1629,10 +1629,11 @@ class $modify(BufferReset, PlayLayer) {
     // Applies the profile linked to this level, if there is one.
     void setupHasCompleted() {
         PlayLayer::setupHasCompleted();
-        // Preload only after the gameplay layer exists; keep audio-engine access
-        // out of the mod's early startup path.
-        if (g_saveDing) FMODAudioEngine::sharedEngine()->preloadEffect("counter003.ogg");
+        g_activationCounter = 0;
         if (!m_level) return;
+        // Preload only after a valid gameplay level exists; keep audio-engine
+        // access out of the mod's early startup path.
+        if (g_saveDing) FMODAudioEngine::sharedEngine()->preloadEffect("counter003.ogg");
         int id = levelKeyFor(m_level);
         if (id == 0) return;
         std::string name = levelProfileFor(id);
