@@ -1513,7 +1513,6 @@ public:
 
 $on_mod(Loaded) {
     loadSettings();
-    if (g_saveDing) FMODAudioEngine::sharedEngine()->preloadEffect("counter003.ogg");
     restoreAfterLevel(); // undo a level profile left over from a crash
     listenForSettingChanges<std::string>("stage", [](std::string) { loadSettings(); });
     listenForSettingChanges<int64_t>("tps-value", [](int64_t) { loadSettings(); });
@@ -1524,7 +1523,11 @@ $on_mod(Loaded) {
     listenForSettingChanges<bool>("debug", [](bool) { loadSettings(); });
     listenForSettingChanges<bool>("save-ding", [](bool enabled) {
         loadSettings();
-        if (enabled) FMODAudioEngine::sharedEngine()->preloadEffect("counter003.ogg");
+        // If toggled on during a level, preload immediately. Outside gameplay,
+        // setupHasCompleted will preload it on level entry.
+        if (enabled && PlayLayer::get()) {
+            FMODAudioEngine::sharedEngine()->preloadEffect("counter003.ogg");
+        }
     });
     listenForSettingChanges<bool>("master-tick-enabled", [](bool) { loadSettings(); });
     listenForSettingChanges<int64_t>("master-tick-value", [](int64_t) { loadSettings(); });
@@ -1626,6 +1629,9 @@ class $modify(BufferReset, PlayLayer) {
     // Applies the profile linked to this level, if there is one.
     void setupHasCompleted() {
         PlayLayer::setupHasCompleted();
+        // Preload only after the gameplay layer exists; keep audio-engine access
+        // out of the mod's early startup path.
+        if (g_saveDing) FMODAudioEngine::sharedEngine()->preloadEffect("counter003.ogg");
         if (!m_level) return;
         int id = levelKeyFor(m_level);
         if (id == 0) return;
