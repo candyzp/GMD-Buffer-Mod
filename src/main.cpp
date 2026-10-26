@@ -1742,6 +1742,13 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             DBG("[InputBuffer] {} pending EXPIRED waited={} limit={} mode={}",
                 tag, waited, limit, modeName(p));
             s.pending = false;
+
+            // The early press was intercepted, so it must not disappear when the
+            // landing window expires. Deliver it now and preserve tap/hold state.
+            sendInput(p, true);
+            if (!s.held) s.releaseNext = true;
+            DBG("[InputBuffer] {} pending fallback PRESS after expiry [{}]",
+                tag, modeName(p));
             return;
         }
 
@@ -1760,16 +1767,15 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             float ticksSaved = waited / stepsPerTick();
             char const* what = onRing ? "RING" : "GROUND";
 
-            if (s.held) {
-                DBG("[InputBuffer] {} reached {} after {} steps but button still held, skipping ({})",
-                    tag, what, waited, modeName(p));
-            } else {
-                sendInput(p, true);
-                s.releaseNext = true;
-                DBG("[InputBuffer] *** SAVED +{:.1f} TICKS ({:.2f} frames @ 60fps) PRESS! [{} {} {}] (Step0: {} -> Delayed: {}) [Limit: {} steps] ***",
-                          ticksSaved, ticksSaved / 4.0f, tag, modeName(p), what,
-                          s.pendingStart, step, limit);
-            }
+            // The original early press was swallowed. Start it at the opening,
+            // whether the player is still holding or already released. A tap
+            // released before the opening is ended on the next physics step.
+            sendInput(p, true);
+            if (!s.held) s.releaseNext = true;
+            DBG("[InputBuffer] *** SAVED +{:.1f} TICKS ({:.2f} frames @ 60fps) PRESS! [{} {} {}] (Step0: {} -> Delayed: {}) [Limit: {} steps]{} ***",
+                ticksSaved, ticksSaved / 4.0f, tag, modeName(p), what,
+                s.pendingStart, step, limit,
+                s.held ? " (preserving held input)" : " (tap; release next step)");
         }
     }
 
@@ -1845,6 +1851,14 @@ class $modify(BufferLayer, GJBaseGameLayer) {
 
         s.held = down;
 
+        // Once a ground-mode press is pending, swallow its release too. The
+        // corresponding press/release pair will be replayed at the opening.
+        if (!down && isGroundMode(p) && s.pending) {
+            DBG("[InputBuffer] {} buffered RELEASE while waiting for ground/ring [{}]",
+                tag, modeName(p));
+            return true;
+        }
+
         if (down) {
             s.pressStep = isFlyMode(p) ? step : -1;
 
@@ -1853,6 +1867,9 @@ class $modify(BufferLayer, GJBaseGameLayer) {
                 s.pending = true;
                 s.pendingStart = step;
                 s.lastRingCount = 0;
+                DBG("[InputBuffer] {} buffered early PRESS at step {} [{}]",
+                    tag, step, modeName(p));
+                return true; // Do not let the original early press reach the game.
             } else {
                 s.pending = false;
             }
