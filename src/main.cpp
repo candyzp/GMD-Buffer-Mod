@@ -1766,7 +1766,7 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             } else {
                 sendInput(p, true);
                 s.releaseNext = true;
-                log::info("[InputBuffer] *** SAVED +{:.1f} TICKS ({:.2f} frames @ 60fps) PRESS! [{} {} {}] (Step0: {} -> Delayed: {}) [Limit: {} steps] ***",
+                DBG("[InputBuffer] *** SAVED +{:.1f} TICKS ({:.2f} frames @ 60fps) PRESS! [{} {} {}] (Step0: {} -> Delayed: {}) [Limit: {} steps] ***",
                           ticksSaved, ticksSaved / 4.0f, tag, modeName(p), what,
                           s.pendingStart, step, limit);
             }
