@@ -40,7 +40,7 @@ namespace crashdiag {
     inline volatile sig_atomic_t g_sequence = 0;
     inline volatile sig_atomic_t g_lastFlushed = 0;
     inline volatile sig_atomic_t g_inFatalHandler = 0;
-    inline char g_activeHook[ACTIVE_SIZE] = "startup / hooks not entered";
+    inline const char* volatile g_activeHook = "startup / hooks not entered";
     inline std::filesystem::path g_currentPath;
     inline std::filesystem::path g_previousPath;
     inline bool g_installed = false;
@@ -221,17 +221,19 @@ namespace crashdiag {
     }
 
     inline void setActive(const char* name) {
-        copyText(g_activeHook, sizeof(g_activeHook), name);
+        g_activeHook = name ? name : "<null>";
     }
 
-    // Lightweight marker used on hot hooks. It intentionally does not save/restore
-    // a previous string: the last entered hook is the most useful label if we overflow
-    // the stack before a destructor can run, and this object adds almost no stack usage.
+    // Store only the previous literal pointer, not a copied char buffer. This keeps
+    // hot-hook stack overhead to one pointer while accurately restoring nested hook names.
     class ActiveScope {
     public:
-        explicit ActiveScope(const char* name) { setActive(name); }
+        explicit ActiveScope(const char* name) : m_previous(g_activeHook) { setActive(name); }
         ActiveScope(const ActiveScope&) = delete;
         ActiveScope& operator=(const ActiveScope&) = delete;
+        ~ActiveScope() { setActive(m_previous); }
+    private:
+        const char* m_previous;
     };
 
     // Use only for higher-level boundaries, where ENTER/RETURN events are valuable.
