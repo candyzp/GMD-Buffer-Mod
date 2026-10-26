@@ -323,6 +323,12 @@
             "name": "Debug Logging",
             "description": "Prints detailed messages to the console about what the buffer is doing. Only useful for troubleshooting. Leave it off for normal play.",
             "default": false
+        },
+        "save-ding": {
+            "type": "bool",
+            "name": "Sound on successful save",
+            "description": "Play the short in-game ding every time an early input is successfully buffered. Turn off to stay quiet.",
+            "default": true
         }
     }
 }
