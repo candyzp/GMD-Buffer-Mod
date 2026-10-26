@@ -1533,10 +1533,9 @@ class $modify(BufferPause, PauseLayer) {
 
 // Raises the reset flag on death, restart and checkpoint loads. The buffer
 // layer clears its state on the next step.
-// Experimental iOS-safe prediction core. Unlike the old fixed landing wait, this makes
-// a detached ghost player run the same physics/collision steps for "press now" and
-// candidate delayed presses. It is deliberately limited to cube-like prediction in
-// practice mode until the simulation is verified on-device.
+// Experimental iOS-safe prediction core. It runs the detached ghost against each
+// standard mode's press/release event, comparing immediate timing with delayed timings.
+// Mode-changing portals and unmodeled object interactions stop the prediction conservatively.
 struct PredictionGhostState {
     PlayerObject* ghost = nullptr;
     CCLayer* layer = nullptr;
@@ -1741,23 +1740,36 @@ struct PredictionResult {
 
 // Learn the user's actual tap duration from recent press/release pairs.
 // The first prediction uses a 50 ms tap, like the upstream predictor.
-static int g_predictionHoldSamples[8] = {};
-static int g_predictionHoldCount = 0;
-static int g_predictionHoldIndex = 0;
+struct PredictionHoldWindow {
+    int samples[8] = {};
+    int count = 0;
+    int index = 0;
 
-static int predictionHoldEstimate() {
-    if (g_predictionHoldCount == 0) return 12;
-    int values[8] = {};
-    std::copy(g_predictionHoldSamples, g_predictionHoldSamples + g_predictionHoldCount, values);
-    int middle = g_predictionHoldCount / 2;
-    std::nth_element(values, values + middle, values + g_predictionHoldCount);
-    return std::clamp(values[middle], 1, 240);
+    int estimate(int fallback) const {
+        if (count == 0) return fallback;
+        int values[8] = {};
+        std::copy(samples, samples + count, values);
+        int middle = count / 2;
+        std::nth_element(values, values + middle, values + count);
+        return std::clamp(values[middle], 1, 240);
+    }
+
+    void add(int ticks) {
+        samples[index] = std::clamp(ticks, 1, 240);
+        index = (index + 1) % 8;
+        count = std::min(count + 1, 8);
+    }
+};
+
+static PredictionHoldWindow g_tapHold;
+static PredictionHoldWindow g_robotHold;
+
+static int predictionHoldEstimate(bool robot = false) {
+    return robot ? g_robotHold.estimate(20) : g_tapHold.estimate(12);
 }
 
-static void recordPredictionHold(int ticks) {
-    g_predictionHoldSamples[g_predictionHoldIndex] = std::clamp(ticks, 1, 240);
-    g_predictionHoldIndex = (g_predictionHoldIndex + 1) % 8;
-    g_predictionHoldCount = std::min(g_predictionHoldCount + 1, 8);
+static void recordPredictionHold(int ticks, bool robot) {
+    (robot ? g_robotHold : g_tapHold).add(ticks);
 }
 
 static PredictionResult simulatePredictionInput(
@@ -1857,7 +1869,7 @@ static int findPredictiveDelay(PlayLayer* layer, PlayerObject* player, int maxDe
     const int horizon = (isShip || isWave || isSwing || isUfo)
         ? std::clamp(maxDelay * 6, 36, 72)
         : std::clamp(maxDelay * 8, 48, 144);
-    const int holdTicks = continuousHold ? -1 : predictionHoldEstimate();
+    const int holdTicks = continuousHold ? -1 : predictionHoldEstimate(player->m_isRobot);
     using clock = std::chrono::steady_clock;
     const auto started = clock::now();
     constexpr double budgetMs = 6.0;
@@ -2207,7 +2219,11 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             if (down && !s.held) {
                 s.pressStep = step;
             } else if (!down && s.pressStep >= 0) {
-                recordPredictionHold(step - s.pressStep);
+                if (p->m_isRobot) {
+                    recordPredictionHold(step - s.pressStep, true);
+                } else if (!isFlyMode(p) && !p->m_isBall && !p->m_isSpider) {
+                    recordPredictionHold(step - s.pressStep, false);
+                }
                 s.pressStep = -1;
             }
             s.held = down;
