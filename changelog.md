@@ -1,3 +1,11 @@
+## v1.2.0
+
+- Added optional master tick controller and shared 0–64 tick slider.
+- Added optional deterministic activation-rate limit.
+- Added an optional sound on every successful saved input.
+- Added the Extremely Aggressive 32-tick all-mode preset.
+- Gated successful-save console logging behind Debug Logging to avoid repeated log writes during normal play.
+
 ## v1.1.0
 - **Fixed:** the buffer did not help when you jumped with a **Jump P2** keybind in a normal one-player level. The game applies that input to player 1, but the mod was helping the hidden second icon, so clicks never got buffered. Thanks to manty987 for the report and the fix.
 - **New Buffer menu:** the pause menu's Buffer button now opens a simple window with **Basic** and **Advanced** tabs. Basic has a Quick setup (Off, Strict, Standard, Relaxed, Very relaxed) and your TPS. Advanced has the experimental switches, shortcuts to Profiles, Sections and all settings, and Reset all.
