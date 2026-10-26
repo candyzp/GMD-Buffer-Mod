@@ -224,33 +224,32 @@ namespace crashdiag {
         copyText(g_activeHook, sizeof(g_activeHook), name);
     }
 
+    // Lightweight marker used on hot hooks. It intentionally does not save/restore
+    // a previous string: the last entered hook is the most useful label if we overflow
+    // the stack before a destructor can run, and this object adds almost no stack usage.
     class ActiveScope {
     public:
-        explicit ActiveScope(const char* name) {
-            copyText(m_previous, sizeof(m_previous), g_activeHook);
-            copyText(m_name, sizeof(m_name), name);
-            setActive(m_name);
-        }
+        explicit ActiveScope(const char* name) { setActive(name); }
         ActiveScope(const ActiveScope&) = delete;
         ActiveScope& operator=(const ActiveScope&) = delete;
-        ~ActiveScope() { setActive(m_previous); }
-    private:
-        char m_previous[ACTIVE_SIZE]{};
-        char m_name[ACTIVE_SIZE]{};
     };
 
+    // Use only for higher-level boundaries, where ENTER/RETURN events are valuable.
+    // Keep the scope itself small because the bug being traced can be stack exhaustion.
     class HookScope {
     public:
-        explicit HookScope(const char* name) : m_active(name) {
-            copyText(m_name, sizeof(m_name), name);
+        explicit HookScope(const char* name) : m_name(name), m_active(name) {
             recordf("HOOK_ENTER %s", m_name);
         }
         HookScope(const HookScope&) = delete;
         HookScope& operator=(const HookScope&) = delete;
-        ~HookScope() { recordf("HOOK_RETURN %s", m_name); }
+        ~HookScope() {
+            setActive(m_name);
+            recordf("HOOK_RETURN %s", m_name);
+        }
     private:
+        const char* m_name;
         ActiveScope m_active;
-        char m_name[ACTIVE_SIZE]{};
     };
 
     inline void flush() {
