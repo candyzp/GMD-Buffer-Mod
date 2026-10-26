@@ -1,0 +1,29 @@
+name: Build iOS port
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ios-port
+
+jobs:
+  build-ios:
+    name: Build for Geometry Dash iOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build iOS mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: given
+          target: iOS
+          build-config: RelWithDebInfo
+
+      - name: Upload iOS package
+        uses: actions/upload-artifact@v7
+        with:
+          name: Input-Buffer-iOS
+          path: ${{ steps.build.outputs.build-output }}
+          if-no-files-found: error
