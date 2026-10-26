@@ -3,6 +3,7 @@
 #include <Geode/Geode.hpp>
 #include <array>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -115,7 +116,7 @@ namespace crashdiag {
         sig_atomic_t first = newest > static_cast<sig_atomic_t>(EVENT_CAPACITY)
             ? newest - static_cast<sig_atomic_t>(EVENT_CAPACITY)
             : 0;
-        rawWrite("\n--- RECENT EVENT RING (oldest to newest) ---\n", 47);
+        rawWrite("\n--- RECENT EVENT RING (oldest to newest) ---\n", 46);
         for (sig_atomic_t seq = first + 1; seq <= newest; ++seq) {
             auto& event = g_events[static_cast<size_t>(seq) % EVENT_CAPACITY];
             sig_atomic_t len = event.length;
@@ -134,7 +135,7 @@ namespace crashdiag {
         }
         g_inFatalHandler = 1;
 
-        rawWrite("\n\n========== INPUT BUFFER FATAL SIGNAL ==========\n", 49);
+        rawWrite("\n\n========== INPUT BUFFER FATAL SIGNAL ==========\n", 50);
         rawWrite("signal=", 7);
         rawWriteSigned(signalNumber);
         rawWrite(" code=", 6);
@@ -147,7 +148,7 @@ namespace crashdiag {
         rawWriteSigned(static_cast<long long>(::getpid()));
         rawWrite("\n", 1);
         dumpRingFromSignal();
-        rawWrite("========== CHAINING TO PREVIOUS CRASH HANDLER ==========\n", 56);
+        rawWrite("========== CHAINING TO PREVIOUS CRASH HANDLER ==========\n", 57);
 
         for (size_t i = 0; i < sizeof(FATAL_SIGNALS) / sizeof(FATAL_SIGNALS[0]); ++i) {
             if (FATAL_SIGNALS[i] != signalNumber || !g_signalInstalled[i]) continue;
