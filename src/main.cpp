@@ -1534,6 +1534,14 @@ class $modify(BufferPause, PauseLayer) {
 // Raises the reset flag on death, restart and checkpoint loads. The buffer
 // layer clears its state on the next step.
 class $modify(BufferReset, PlayLayer) {
+    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+        if (!createPredictionGhost(this)) {
+            log::warn("[InputBuffer] prediction ghost creation failed; predictive mode will pass inputs through");
+        }
+        return true;
+    }
+
     void resetLevel() {
         PlayLayer::resetLevel();
         g_resetEpoch++;
@@ -1550,6 +1558,12 @@ class $modify(BufferReset, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
+        // A predicted ghost death is only a simulation result, never a real death.
+        if (g_prediction.simulating && player == g_prediction.ghost) {
+            g_prediction.died = true;
+            player->m_isDead = true;
+            return;
+        }
         PlayLayer::destroyPlayer(player, object);
         g_resetEpoch++;
         g_lastDeathPct = this->getCurrentPercent();
@@ -1570,6 +1584,7 @@ class $modify(BufferReset, PlayLayer) {
 
     // Leaving the level puts the player's own settings back.
     void onExit() {
+        dropPredictionGhost();
         PlayLayer::onExit();
         g_secActive = false;
         g_secToken.clear();
@@ -1955,6 +1970,9 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             auto& s = f->ps[i];
             if (!p) { s = PState(); continue; }
             if (!s.waveQueue.empty()) flushWaveQueue(p, s, i);
+            for (auto const& ev : s.predictionQueue) sendInput(p, ev.first);
+            s.predictionQueue.clear();
+            s.predictionShift = 0;
             if (s.delayedRelease) {
                 s.delayedRelease = false;
                 s.held = false;
@@ -1976,7 +1994,8 @@ class $modify(BufferLayer, GJBaseGameLayer) {
 
         bool inconsistent = false;
         for (auto& s : f->ps) {
-            if (s.delayedRelease || s.releaseNext || !s.waveQueue.empty()) {
+            if (s.delayedRelease || s.releaseNext || !s.waveQueue.empty() ||
+                !s.predictionQueue.empty() || s.predictionShift > 0) {
                 inconsistent = true;
             }
             s = PState();
@@ -2022,6 +2041,22 @@ class $modify(BufferLayer, GJBaseGameLayer) {
                 }
                 s.waveQueue.erase(s.waveQueue.begin(), s.waveQueue.begin() + applied);
             }
+        }
+
+        if (!s.predictionQueue.empty()) {
+            size_t applied = 0;
+            while (applied < s.predictionQueue.size() &&
+                   step >= s.predictionQueue[applied].second) {
+                auto ev = s.predictionQueue[applied];
+                sendInput(p, ev.first);
+                DBG("[InputBuffer] {} PREDICT {} applied at step {}", tag, ev.first ? "PRESS" : "RELEASE", step);
+                ++applied;
+                if (!ev.first && applied == s.predictionQueue.size()) {
+                    s.predictionShift = 0;
+                }
+            }
+            s.predictionQueue.erase(s.predictionQueue.begin(), s.predictionQueue.begin() + applied);
+            if (s.predictionQueue.empty() && !s.held) s.predictionShift = 0;
         }
 
         if (s.delayedRelease) {
@@ -2088,6 +2123,43 @@ class $modify(BufferLayer, GJBaseGameLayer) {
     bool inputPlayer(PlayerObject* p, PState& s, int idx, bool down) {
         int step = m_fields->step;
         char const* tag = idx == 0 ? "P1" : "P2";
+
+        // Experimental predictive path: practice-mode cube inputs only. Once a
+        // press has been shifted, shift its release and any follow-up events too.
+        bool cubePredictionMode = p && !isFlyMode(p) && !p->m_isBall &&
+            !p->m_isRobot && !p->m_isSpider;
+        auto* currentLayer = PlayLayer::get();
+        if (cubePredictionMode && currentLayer && currentLayer->m_isPracticeMode &&
+            !sharedDualInput() && !(m_levelSettings && m_levelSettings->m_twoPlayerMode)) {
+            bool wasHeld = s.held;
+            if (s.predictionShift > 0 || !s.predictionQueue.empty()) {
+                s.held = down;
+                int target = step + s.predictionShift;
+                if (!s.predictionQueue.empty() && target <= s.predictionQueue.back().second) {
+                    target = s.predictionQueue.back().second + 1;
+                }
+                s.predictionQueue.emplace_back(down, target);
+                DBG("[InputBuffer] {} PREDICT {} queued at step {} -> {} (shift {})",
+                    tag, down ? "PRESS" : "RELEASE", step, target, s.predictionShift);
+                return true;
+            }
+
+            s.held = down;
+            s.pending = false;
+            if (down && !wasHeld) {
+                int maxDelay = modeLimitSteps(p);
+                int delay = findPredictiveCubeDelay(currentLayer, p, maxDelay);
+                if (delay > 0) {
+                    s.predictionShift = delay;
+                    s.predictionQueue.emplace_back(true, step + delay);
+                    DBG("[InputBuffer] {} PREDICT selected +{} steps [{}]", tag, delay, modeName(p));
+                    return true;
+                }
+            }
+            // When prediction sees no proven improvement, leave the input to the
+            // game. Do not fall back to the old unconditional wait-until-landing rule.
+            return false;
+        }
 
         if (!isFlyMode(p) && !s.waveQueue.empty()) {
             flushWaveQueue(p, s, idx);
@@ -2181,6 +2253,45 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             }
         }
         return false;
+    }
+
+    bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
+        if (g_prediction.simulating && player == g_prediction.ghost) return false;
+        return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
+    }
+
+    void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int objectCount, float dt) {
+        if (!g_prediction.simulating || player != g_prediction.ghost) {
+            GJBaseGameLayer::collisionCheckObjects(player, objects, objectCount, dt);
+            return;
+        }
+        static gd::vector<GameObject*> relevant;
+        relevant.clear();
+        if (static_cast<int>(relevant.capacity()) < objectCount) relevant.reserve(objectCount);
+        for (int i = 0; i < objectCount; ++i) {
+            auto* object = (*objects)[i];
+            if (!object) continue;
+            auto type = static_cast<unsigned>(object->m_objectType);
+            if (type < 64 && ((PREDICTION_COLLIDERS >> type) & 1ull)) {
+                relevant.push_back(object);
+            }
+        }
+        GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
+    }
+
+    void playerTouchedRing(PlayerObject* player, RingObject* ring) {
+        if (g_prediction.simulating && player == g_prediction.ghost) return;
+        GJBaseGameLayer::playerTouchedRing(player, ring);
+    }
+
+    void flipGravity(PlayerObject* player, bool flip, bool noEffects) {
+        if (g_prediction.simulating && player == g_prediction.ghost) return;
+        GJBaseGameLayer::flipGravity(player, flip, noEffects);
+    }
+
+    void gameEventTriggered(GJGameEvent event, int material, int playerID) {
+        if (g_prediction.simulating) return;
+        GJBaseGameLayer::gameEventTriggered(event, material, playerID);
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
