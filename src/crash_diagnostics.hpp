@@ -43,6 +43,7 @@ namespace crashdiag {
     inline const char* volatile g_activeHook = "startup / hooks not entered";
     inline std::filesystem::path g_currentPath;
     inline std::filesystem::path g_previousPath;
+    inline std::filesystem::path g_lastCrashPath;
     inline bool g_installed = false;
 
 #if defined(__APPLE__) || defined(__unix__)
@@ -304,14 +305,21 @@ namespace crashdiag {
         std::string result;
         auto previous = readTail(g_previousPath, EACH_FILE_LIMIT);
         auto current = readTail(g_currentPath, EACH_FILE_LIMIT);
+        auto lastCrash = readTail(g_lastCrashPath, EACH_FILE_LIMIT);
         if (!previous.empty()) {
-            result += "===== PREVIOUS SESSION (often the crashed run) =====\n";
+            result += "===== PREVIOUS SESSION =====\n";
             result += previous;
             result += "\n";
         }
         if (!current.empty()) {
             result += "===== CURRENT SESSION =====\n";
             result += current;
+            result += "\n";
+        }
+        // Put the preserved crash session last so the final-size cap retains it.
+        if (!lastCrash.empty()) {
+            result += "===== PRESERVED LAST CRASH SESSION (HIGHEST PRIORITY) =====\n";
+            result += lastCrash;
         }
         if (result.empty()) result = "No Input Buffer diagnostic files were readable yet.\n";
         constexpr size_t TOTAL_LIMIT = 100 * 1024;
@@ -336,10 +344,26 @@ namespace crashdiag {
         std::filesystem::create_directories(directory, ec);
         g_currentPath = directory / "crash-diagnostics-current.log";
         g_previousPath = directory / "crash-diagnostics-previous.log";
+        g_lastCrashPath = directory / "crash-diagnostics-last-crash.log";
 
-        // Preserve the last process's log at next launch. If it crashed, the signal
-        // handler will already have appended a fatal marker to this file.
-        if (std::filesystem::exists(g_currentPath, ec)) {
+        // Preserve the most recent crashed/unclean run separately before rotating
+        // sessions. Repeated relaunches can therefore not overwrite the crash trace
+        // before the user has a chance to press DIAG and copy it.
+        bool hadPreviousSession = std::filesystem::exists(g_currentPath, ec);
+        bool priorHadFatalMarker = false;
+        bool priorHadCleanExit = false;
+        if (hadPreviousSession) {
+            auto priorTail = readTail(g_currentPath, 48 * 1024);
+            priorHadFatalMarker = priorTail.find("INPUT BUFFER FATAL SIGNAL") != std::string::npos;
+            priorHadCleanExit = priorTail.find("PROCESS_ATEXIT: clean C/C++ exit path reached") != std::string::npos;
+            if (priorHadFatalMarker || !priorHadCleanExit) {
+                std::ofstream preserved(g_lastCrashPath, std::ios::out | std::ios::trunc | std::ios::binary);
+                if (preserved) {
+                    preserved << "PRESERVED_SESSION fatal_marker=" << (priorHadFatalMarker ? 1 : 0)
+                              << " clean_exit_marker=" << (priorHadCleanExit ? 1 : 0) << "\n";
+                    preserved << priorTail;
+                }
+            }
             std::filesystem::remove(g_previousPath, ec);
             ec.clear();
             std::filesystem::rename(g_currentPath, g_previousPath, ec);
@@ -359,6 +383,10 @@ namespace crashdiag {
         recordf("MOD id=%s version=%s", geode::Mod::get()->getID().data(),
                 geode::Mod::get()->getVersion().toVString().c_str());
         recordf("SAVE_DIR=%s", g_currentPath.parent_path().string().c_str());
+        if (hadPreviousSession) {
+            recordf("PREVIOUS_SESSION_REVIEW fatalMarker=%d cleanExitMarker=%d; last-crash snapshot preserved when unclean",
+                    priorHadFatalMarker ? 1 : 0, priorHadCleanExit ? 1 : 0);
+        }
         flush();
 #if defined(__APPLE__) || defined(__unix__)
         if (g_fd >= 0) installFatalHandlers();
