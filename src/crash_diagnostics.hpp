@@ -165,11 +165,11 @@ namespace crashdiag {
         // default disposition and re-deliver the signal so the process still crashes.
         struct sigaction defaultAction{};
         defaultAction.sa_handler = SIG_DFL;
-        ::sigemptyset(&defaultAction.sa_mask);
+        sigemptyset(&defaultAction.sa_mask);
         ::sigaction(signalNumber, &defaultAction, nullptr);
         sigset_t unblock;
-        ::sigemptyset(&unblock);
-        ::sigaddset(&unblock, signalNumber);
+        sigemptyset(&unblock);
+        sigaddset(&unblock, signalNumber);
         ::sigprocmask(SIG_UNBLOCK, &unblock, nullptr);
         ::kill(::getpid(), signalNumber);
         ::_exit(128 + signalNumber);
@@ -186,7 +186,7 @@ namespace crashdiag {
         for (size_t i = 0; i < sizeof(FATAL_SIGNALS) / sizeof(FATAL_SIGNALS[0]); ++i) {
             struct sigaction action{};
             action.sa_sigaction = &fatalSignalHandler;
-            ::sigemptyset(&action.sa_mask);
+            sigemptyset(&action.sa_mask);
             action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
             if (::sigaction(FATAL_SIGNALS[i], &action, &g_previousActions[i]) == 0) {
                 g_signalInstalled[i] = true;
