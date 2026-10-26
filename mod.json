@@ -34,17 +34,39 @@
             "min": 1,
             "max": 30
         },
+        "master-tick-control": {
+            "type": "bool",
+            "name": "Master tick control",
+            "description": "ON: every mode uses the same maximum prediction delay in ticks, including wave and ship. OFF: each mode uses the normal preset and its own settings.",
+            "default": false
+        },
+        "master-tick-limit": {
+            "type": "int",
+            "name": "Master maximum delay (ticks)",
+            "description": "Shared maximum delay while Master tick control is ON. 4 ticks = 1 frame at 60 FPS. Higher values can find more saves but increase prediction work.",
+            "default": 24,
+            "min": 1,
+            "max": 64
+        },
+        "save-aggression": {
+            "type": "bool",
+            "name": "Aggressive search",
+            "description": "Search farther and allow more computation to find more possible saves. OFF keeps the selected preset's normal search depth. Can increase lag, especially at 100%.",
+            "default": false
+        },
+        "save-aggression-level": {
+            "type": "int",
+            "name": "Search aggressiveness (%)",
+            "description": "Expands delay windows, lookahead and prediction time budget. 100% searches the widest supported ranges and may hitch. The master tick setting, when enabled, still controls the exact delay limit.",
+            "default": 50,
+            "min": 1,
+            "max": 100
+        },
         "smart-prediction": {
             "type": "bool",
             "name": "Orb / pad / portal prediction",
             "description": "Let the ghost use orbs, pads, gravity portals and speed portals. Turn off if you see glitches with objects.",
             "default": true
-        },
-        "debug-console": {
-            "type": "bool",
-            "name": "Debug console window",
-            "description": "Also open a separate Windows console with the same log as the in-game console (F9). Needs a restart.",
-            "default": false
         },
         "ground-horizon": {
             "type": "int",
@@ -53,12 +75,6 @@
             "default": 130,
             "min": 48,
             "max": 240
-        },
-        "practice-only": {
-            "type": "bool",
-            "name": "Practice mode only",
-            "description": "ON: only buffer inputs in practice mode. OFF: buffer in every run.",
-            "default": false
         },
         "wave-horizon": {
             "type": "int",
@@ -89,7 +105,7 @@
         "wave-auto-release": {
             "type": "bool",
             "name": "Wave auto-release",
-            "description": "While you hold in wave, if holding would crash within the window below and letting go clearly survives, the mod lets go for you. Your own release is then ignored. Practice mode only, unless 'Auto-release in normal runs' is on.",
+            "description": "While you hold in wave, if holding would crash within the window below and letting go clearly survives, the mod lets go for you. Your own release is then ignored. Works in normal and practice runs..",
             "default": false
         },
         "auto-release-window": {
@@ -99,12 +115,6 @@
             "default": 6,
             "min": 2,
             "max": 24
-        },
-        "drift-check": {
-            "type": "bool",
-            "name": "Drift check (debug)",
-            "description": "After each input, compare where the prediction said you'd go with where you actually went, and log the biggest gap in the in-game console (F9). Use it to see how precise the predictions are on a level.",
-            "default": false
         },
         "wave-spam-gap": {
             "type": "int",
@@ -140,12 +150,6 @@
             "description": "When a wave save is found, use a delay with one tick of room on both sides instead of the one that only just clears the spike, so tiny differences in the real run can't clip it. Can add 1 tick (0.25f) to some saves.",
             "default": true
         },
-        "show-path": {
-            "type": "bool",
-            "name": "Path view on at start",
-            "description": "Draw the predicted path in the level after each input (toggle any time with F10). Red = what the input would do right now, green = what the game actually gets, white dot = where a delayed input fires, red dot = crash. Costs two extra predictions per click while on.",
-            "default": false
-        },
         "orb-align-ground": {
             "type": "bool",
             "name": "Orb alignment: also from the ground",
@@ -167,7 +171,7 @@
         "robot-auto-release": {
             "type": "bool",
             "name": "Robot auto-release",
-            "description": "While you hold a robot jump, if holding longer would crash within the auto-release window and letting go survives, the mod lets go for you. Your own release is then ignored. Practice mode only, unless 'Auto-release in normal runs' is on.",
+            "description": "While you hold a robot jump, if holding longer would crash within the auto-release window and letting go survives, the mod lets go for you. Your own release is then ignored. Works in normal and practice runs..",
             "default": false
         },
         "level-memory": {
@@ -175,12 +179,6 @@
             "name": "Level memory (learns from your runs)",
             "description": "Remembers, per level and per spot, which delays worked, where saves ended in deaths and where you keep dying. Delays that worked before are tried first; spots where saves keep failing are left alone; orange dots in the path view mark spots where you die a lot. F11 forgets the current level.",
             "default": true
-        },
-        "auto-release-normal-runs": {
-            "type": "bool",
-            "name": "Auto-release in normal runs",
-            "description": "Let auto-release (wave / robot / dash) also work outside practice mode. While it can act, an 'AUTO INPUTS ON' tag is shown on screen. Never use it for verified or leaderboard runs.",
-            "default": false
         },
         "spider-smart": {
             "type": "bool",
@@ -191,13 +189,7 @@
         "dash-auto-release": {
             "type": "bool",
             "name": "Dash orb auto-release",
-            "description": "While you hold a dash, if holding longer would crash within the auto-release window and letting go survives, the mod lets go for you (your own release is then ignored). Practice mode only, unless 'Auto-release in normal runs' is on.",
-            "default": false
-        },
-        "perf-log": {
-            "type": "bool",
-            "name": "Performance log (debug)",
-            "description": "After each click, log in the console (F9) how long its predictions took, how many runs and ghost ticks it used, and the cost per ghost tick. Changes nothing about the decisions.",
+            "description": "While you hold a dash, if holding longer would crash within the auto-release window and letting go survives, the mod lets go for you (your own release is then ignored). Works in normal and practice runs..",
             "default": false
         },
         "ship-buffer": {
@@ -245,18 +237,6 @@
             "name": "Ignore hazards you're touching",
             "description": "Spikes / saws that overlap you at the moment of the click while you're alive can't be what kills you (e.g. a spike the level makes follow the player, or noclip), so predictions ignore them. Fixes predictions that died on their very first tick (GRIEF's wave).",
             "default": true
-        },
-        "death-log": {
-            "type": "bool",
-            "name": "Death log (debug)",
-            "description": "On every 'no save', log what killed the prediction ghost (object ID, type, where it is relative to you, hitboxes). Ghost deaths in the first 3 ticks are always logged. Use it with F8 when a level predicts badly.",
-            "default": false
-        },
-        "explain-inputs": {
-            "type": "bool",
-            "name": "Explain every input (debug)",
-            "description": "Also log the inputs that were passed straight to the game and why: safe as it is, spam guard, late-crash rule, max delay 0. Busy log; turn on to see what the mod does in a part, then use F8.",
-            "default": false
         },
         "cbf-sync": {
             "type": "bool",
@@ -325,6 +305,18 @@
             "name": "Ding on save",
             "description": "Plays a short ding every time the buffer saves one of your clicks.",
             "default": true
+        },
+        "show-auto-tag": {
+            "type": "bool",
+            "name": "Show auto-release status tag",
+            "description": "Optional on-screen warning when automatic wave / robot / dash release can act in a normal run. OFF by default to keep gameplay clear.",
+            "default": false
+        },
+        "debug-tools": {
+            "type": "bool",
+            "name": "Debug tools (verbose logging)",
+            "description": "OFF by default for performance. ON enables detailed event, performance, death and drift logging plus the Windows console. Tap DIAG during a level to enable crash capture without enabling these extra analysis tools.",
+            "default": false
         },
         "performance-mode": {
             "type": "bool",

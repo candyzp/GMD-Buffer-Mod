@@ -172,8 +172,15 @@ namespace {
 
         bool enabled = true;
         int stage = 0;
+        // Raw stage windows are kept separately so controls never compound on rereads.
+        int stageTicksAll = 2;
+        int stageTicksWave = 2;
         int ticksAll = 2;
         int ticksWave = 2;
+        bool masterTickControl = false;
+        int masterTickLimit = 24;
+        bool saveAggression = false;
+        int saveAggressionLevel = 50;
 
         std::deque<QueuedInput> queue;
         int shift = 0;  // delay applied to inputs while the queue is active
@@ -185,7 +192,6 @@ namespace {
         bool smart = true;
         bool console = false;
         double budgetMs = 6.0;
-        bool practiceOnly = true;    // v2.1: only buffer in practice mode
         int groundHorizon = 130;     // v2.1: how far ahead cube/ball/spider predictions look
         int releaseShift = 0;        // v2.1: delay of the last delivered press, reused for its release
         int waveHorizon = 65;        // v2.2: how far ahead wave predictions look (mini = 15 less)
@@ -234,7 +240,8 @@ namespace {
         bool predictMovers = false;  // v2.27: move objects along their current motion during predictions
         bool shipBuffer = false;     // v2.25: buffer ship inputs too
         int shipSpamGap = 6;         // v2.44: ship feathering is normal control, only taps closer than this are spam
-        int shipMaxDelay = 2;        // v2.25: ship's own max delay (240/s ticks)
+        int shipMaxDelay = 2;        // effective ship limit, may be controlled by the master tick
+        int configuredShipMaxDelay = 2; // user-selected ship limit before controller overrides
         bool perfLog = false;        // v2.21: log time / runs / ghost ticks per click
         int simRuns = 0;             // v2.21: predictions run for the current click
         long simTicks = 0;           // v2.21: ghost ticks stepped for the current click
@@ -260,10 +267,10 @@ namespace {
         int retapAt = -1;            // v2.15: ticks after the input at which the ghost taps again (-1 = never)
         bool robotSmart = true;      // v2.12: robot presses count as safe if some hold length survives
         bool robotAutoRelease = false;  // v2.12: robot auto-release (practice mode only)
-        bool autoNormalRuns = false; // v2.14: let auto-release work outside practice too
-        CCLabelBMFont* autoTag = nullptr;  // v2.14: on-screen "AUTO-RELEASE ON" tag
-        CCLabelBMFont* watermark = nullptr;  // v2.46: always-on "Click Before Frames" label while the buffer is on
-        bool usedThisAttempt = false;      // v2.46: the buffer was on at some point of this attempt
+        CCLabelBMFont* autoTag = nullptr;  // optional on-screen auto-release tag
+        bool showAutoTag = false;
+        bool debugTools = false;
+        bool usedThisAttempt = false;      // the buffer was on at some point of this attempt
         bool learn = true;           // v2.13: per-level memory learned from your runs
         bool fullState = true;       // v2.11.1: copy the full v2.8 player state into the ghost
         int orbWindow = 16;          // v2.6: how far ahead (ticks) an orb may be for that
@@ -390,6 +397,7 @@ namespace {
 
     template <class... Args>
     void say(fmt::format_string<Args...> f, Args&&... args) {
+        if (!buf.debugTools) return;
         auto msg = fmt::format(f, std::forward<Args>(args)...);
         crashdiag::recordf("BUFFER_EVENT step=%d %s", logClock, msg.c_str());
         exportLines.push_back(fmt::format("[{:>6}] {}", logClock, msg));
@@ -438,6 +446,30 @@ namespace {
         return 0;
     }
 
+    void applyTickController() {
+        buf.ticksAll = std::clamp(buf.stageTicksAll, 0, 64);
+        buf.ticksWave = std::clamp(buf.stageTicksWave, 0, 64);
+        buf.shipMaxDelay = std::clamp(buf.configuredShipMaxDelay, 0, 16);
+
+        // Aggressive search expands the delay window, unless the master tick is controlling
+        // the exact common limit for every mode.
+        if (buf.saveAggression && !buf.masterTickControl) {
+            float amount = std::clamp(buf.saveAggressionLevel, 1, 100) / 100.f;
+            auto expand = [amount](int base) {
+                return std::clamp(static_cast<int>(std::lround(base + (64 - base) * amount)), 0, 64);
+            };
+            buf.ticksAll = expand(buf.ticksAll);
+            buf.ticksWave = expand(buf.ticksWave);
+            buf.shipMaxDelay = expand(buf.shipMaxDelay);
+        }
+        if (buf.masterTickControl) {
+            int ticks = std::clamp(buf.masterTickLimit, 1, 64);
+            buf.ticksAll = ticks;
+            buf.ticksWave = ticks;
+            buf.shipMaxDelay = ticks;
+        }
+    }
+
     void readSettings() {
         auto* mod = Mod::get();
         buf.smart = mod->getSettingValue<bool>("smart-prediction");
@@ -448,16 +480,37 @@ namespace {
         for (int i = 0; i < 6; ++i) {
             buf.keys[i] = parseKey(mod->getSettingValue<std::string>(keyNames[i]));
         }
-        buf.practiceOnly = mod->getSettingValue<bool>("practice-only");
         buf.groundHorizon = static_cast<int>(mod->getSettingValue<int64_t>("ground-horizon"));
         buf.waveHorizon = static_cast<int>(mod->getSettingValue<int64_t>("wave-horizon"));
+        buf.masterTickControl = mod->getSettingValue<bool>("master-tick-control");
+        buf.masterTickLimit = static_cast<int>(mod->getSettingValue<int64_t>("master-tick-limit"));
+        buf.saveAggression = mod->getSettingValue<bool>("save-aggression");
+        buf.saveAggressionLevel = static_cast<int>(mod->getSettingValue<int64_t>("save-aggression-level"));
+        buf.showAutoTag = mod->getSettingValue<bool>("show-auto-tag");
+        buf.debugTools = mod->getSettingValue<bool>("debug-tools");
+        buf.console = buf.debugTools;
+        buf.driftCheck = buf.debugTools;
+        buf.perfLog = buf.debugTools;
+        buf.deathLog = buf.debugTools;
+        buf.explain = buf.debugTools;
+        crashdiag::setRecordingEnabled(buf.debugTools);
+        if (!buf.debugTools) {
+            buf.showPath = false;
+        }
+        if (buf.saveAggression) {
+            float amount = std::clamp(buf.saveAggressionLevel, 1, 100) / 100.f;
+            buf.groundHorizon = std::clamp(static_cast<int>(std::lround(
+                buf.groundHorizon + (240 - buf.groundHorizon) * amount)), 48, 240);
+            buf.waveHorizon = std::clamp(static_cast<int>(std::lround(
+                buf.waveHorizon + (160 - buf.waveHorizon) * amount)), 20, 160);
+            buf.budgetMs = std::max(buf.budgetMs, 4.0 + 8.0 * amount);
+        }
         buf.assumeOrbs = mod->getSettingValue<bool>("orb-assume-hit");
         buf.orbClick = buf.assumeOrbs;
         buf.tryBothOrbs = mod->getSettingValue<bool>("orb-try-both");
         buf.avoidMovers = mod->getSettingValue<bool>("avoid-moving-objects");
         buf.autoRelease = mod->getSettingValue<bool>("wave-auto-release");
         buf.autoWindow = static_cast<int>(mod->getSettingValue<int64_t>("auto-release-window"));
-        buf.driftCheck = mod->getSettingValue<bool>("drift-check");
         buf.spamGap = static_cast<int>(mod->getSettingValue<int64_t>("wave-spam-gap"));
         buf.orbAlign = mod->getSettingValue<bool>("orb-align");
         buf.orbTiming = mod->getSettingValue<bool>("orb-timing");
@@ -475,13 +528,10 @@ namespace {
         buf.saveDing = mod->getSettingValue<bool>("save-ding");
         buf.moreTime = mod->getSettingValue<bool>("more-time-death-spots");
         buf.dashAutoRelease = mod->getSettingValue<bool>("dash-auto-release");
-        buf.perfLog = mod->getSettingValue<bool>("perf-log");
         buf.shipBuffer = mod->getSettingValue<bool>("ship-buffer");
         buf.lateCrash = static_cast<int>(mod->getSettingValue<int64_t>("cube-late-crash"));
         buf.robustSaves = mod->getSettingValue<bool>("robust-saves");
         buf.ignoreTouching = mod->getSettingValue<bool>("ignore-touching-hazards");
-        buf.deathLog = mod->getSettingValue<bool>("death-log");
-        buf.explain = mod->getSettingValue<bool>("explain-inputs");
         // v2.35 low latency mode: for players who feel the buffer as input lag. Short searches
         // (no frame hitches), at most 1 frame of delay, no extra "margin" ticks, and clicks
         // made while a delay is waiting aren't shifted (see intercept).
@@ -492,11 +542,10 @@ namespace {
             buf.waveMargin = false;
         }
         buf.predictMovers = mod->getSettingValue<bool>("predict-moving-objects");
-        buf.shipMaxDelay = static_cast<int>(mod->getSettingValue<int64_t>("ship-max-delay"));
+        buf.configuredShipMaxDelay = static_cast<int>(mod->getSettingValue<int64_t>("ship-max-delay"));
         buf.shipSpamGap = static_cast<int>(mod->getSettingValue<int64_t>("ship-spam-gap"));
         buf.cbfSync = mod->getSettingValue<bool>("cbf-sync");
         buf.robotAutoRelease = mod->getSettingValue<bool>("robot-auto-release");
-        buf.autoNormalRuns = mod->getSettingValue<bool>("auto-release-normal-runs");
         buf.waveV46 = mod->getSettingValue<bool>("wave-v46");
         buf.waveMargin = mod->getSettingValue<bool>("wave-safety-margin");
         buf.orbWindow = static_cast<int>(mod->getSettingValue<int64_t>("orb-align-ticks"));
@@ -511,6 +560,7 @@ namespace {
             buf.driftCheck = false;
         }
         buf.userBudget = buf.budgetMs;
+        applyTickController();
     }
 
     // v2.76 auto budget: the budget setting is used as it is, and only cut (to 4 ms) while
@@ -539,36 +589,29 @@ namespace {
         auto const& s = STAGES[buf.stage];
         buf.enabled = s.enabled;
         if (s.custom) {
-            buf.ticksAll = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-ticks"));
-            buf.ticksWave = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-wave-ticks"));
+            buf.stageTicksAll = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-ticks"));
+            buf.stageTicksWave = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-wave-ticks"));
         }
         else {
-            buf.ticksAll = s.ticksAll;
-            buf.ticksWave = s.ticksWave;
+            buf.stageTicksAll = s.ticksAll;
+            buf.stageTicksWave = s.ticksWave;
         }
+        applyTickController();
     }
 
     // v2.14: a run outside practice where auto-release can press for you is marked on screen.
     // v2.46 watermark: whenever the buffer is on (any stage but OFF) the level shows it, and
     // can't be turned off, so runs made with the mod are recognisable.
-    void refreshWatermark() {
-        if (!buf.watermark) {
-            return;
-        }
-        // v2.57: hidden in practice mode (practice runs can't be submitted, and it crowded the
-        // checkpoint buttons); always shown in normal mode while the buffer is on.
-        auto* layer = GameManager::get()->m_playLayer;
-        buf.watermark->setVisible(buf.enabled && !(layer && layer->m_isPracticeMode));
-        buf.watermark->setString(fmt::format("Click Before Frames  |  {}", stageText()).c_str());
-    }
+    // No always-on bottom watermark: leave gameplay unobstructed.
+    void refreshWatermark() {}
 
     void refreshAutoTag() {
         if (!buf.autoTag) {
             return;
         }
         auto* layer = GameManager::get()->m_playLayer;
-        bool on = buf.enabled && buf.autoNormalRuns && (buf.autoRelease || buf.robotAutoRelease || buf.dashAutoRelease) && layer &&
-            !layer->m_isPracticeMode;
+        bool on = buf.enabled && buf.showAutoTag &&
+            (buf.autoRelease || buf.robotAutoRelease || buf.dashAutoRelease) && layer && !layer->m_isPracticeMode;
         buf.autoTag->setVisible(on);
     }
 
@@ -588,15 +631,14 @@ namespace {
         }
         float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
         text += fmt::format("{} | physics ~{:.0f} steps/s\n", stageText(), 60.f / dt);
-        text += fmt::format("budget {:g} ms | smart {} | full state {} | robust {} | late crash {} | practice only {}\n", buf.budgetMs,
-            buf.smart, buf.fullState, buf.robustSaves, buf.lateCrash, buf.practiceOnly);
+        text += fmt::format("budget {:g} ms | smart {} | full state {} | robust {} | late crash {}\n", buf.budgetMs,
+            buf.smart, buf.fullState, buf.robustSaves, buf.lateCrash);
         text += fmt::format("orbs: align {} (ground {}, {}t) timing {} assume {} both {} | memory {} ({} spots)\n", buf.orbAlign,
             buf.orbAlignGround, buf.orbWindow, buf.orbTiming, buf.assumeOrbs, buf.tryBothOrbs, buf.learn, memorySpots());
         text += fmt::format("wave: v4.6 {} margin {} horizon {} spam gap {} | robot smart {} | spider smart {} | ship {} (max {}t)\n",
             buf.waveV46, buf.waveMargin, buf.waveHorizon, buf.spamGap, buf.robotSmart, buf.spiderSmart, buf.shipBuffer, buf.shipMaxDelay);
-        text += fmt::format("auto-release: wave {} robot {} dash {} normal runs {} window {} | movers: avoid {} predict {}\n",
-            buf.autoRelease, buf.robotAutoRelease, buf.dashAutoRelease, buf.autoNormalRuns, buf.autoWindow, buf.avoidMovers,
-            buf.predictMovers);
+        text += fmt::format("auto-release: wave {} robot {} dash {} window {} | movers: avoid {} predict {}\n",
+            buf.autoRelease, buf.robotAutoRelease, buf.dashAutoRelease, buf.autoWindow, buf.avoidMovers, buf.predictMovers);
         text += fmt::format("debug: drift check {} | path view {} | perf log {} | death log {} | ignore touching {}\n", buf.driftCheck,
             buf.showPath, buf.perfLog, buf.deathLog, buf.ignoreTouching);
         text += fmt::format("explain inputs {} | low latency {} | cbf sync {}{}\n", buf.explain, buf.lowLatency, buf.cbfSync,
@@ -623,8 +665,10 @@ namespace {
         if (!buf.enabled) {
             return "Buffer: OFF";
         }
-        return fmt::format("Buffer{}: {:g}f / wave {:g}f{}", STAGES[buf.stage].custom ? " (custom)" : "", buf.ticksAll * TICK,
-            buf.ticksWave * TICK, buf.train ? " [training]" : "");
+        return fmt::format("Buffer{}: {:g}f / wave {:g}f{}{}",
+            STAGES[buf.stage].custom ? " (custom)" : "", buf.ticksAll * TICK, buf.ticksWave * TICK,
+            buf.train ? " [training]" : "",
+            buf.masterTickControl ? " [master tick]" : (buf.saveAggression ? " [aggressive search]" : ""));
     }
 
     void dropGhosts() {
@@ -650,7 +694,6 @@ namespace {
         buf.panelLines.clear();
         buf.pathNode = nullptr;
         buf.autoTag = nullptr;
-        buf.watermark = nullptr;
         buf.simulating = false;
         buf.injecting = false;
         buf.rapid = 0;
@@ -2758,10 +2801,6 @@ namespace {
             buf.appliedInput = down;
             return false;
         }
-        if (buf.practiceOnly && !layer->m_isPracticeMode) {
-            buf.appliedInput = down;
-            return false;
-        }
         // v2.4: the ghost never presses left/right, so platformer predictions are meaningless.
         if (layer->m_isPlatformer) {
             buf.appliedInput = down;
@@ -2901,7 +2940,7 @@ namespace {
         if (anyWave) {
             horizon = fullWaveHorizon(mini);
         }
-        int maxDelay = st(anyWave ? buf.ticksWave : (anyShip ? std::clamp(buf.shipMaxDelay, 0, 16) : buf.ticksAll));
+        int maxDelay = st(anyWave ? buf.ticksWave : (anyShip ? std::clamp(buf.shipMaxDelay, 0, 64) : buf.ticksAll));
         if (buf.lowLatency) {
             maxDelay = std::min(maxDelay, st(4));  // at most 1 frame (60 fps) of delay
         }
@@ -3245,15 +3284,12 @@ namespace {
         refreshPanel();
     }
 
-    // v2.4 wave auto-release (practice mode only): while you hold in wave, check every
+    // v2.4 wave auto-release: while you hold in wave, check every
     // tick whether holding crashes within the next `autoWindow` ticks. If it does and
     // letting go now clearly survives longer, let go for you. Your own release later is
     // swallowed, and your next press works as normal.
     void tryAutoRelease(PlayLayer* layer, PlayerObject* p1) {
         if ((!buf.autoRelease && !buf.robotAutoRelease && !buf.dashAutoRelease) || buf.autoReleased || layer->m_isPlatformer) {
-            return;
-        }
-        if (!layer->m_isPracticeMode && !buf.autoNormalRuns) {
             return;
         }
         if (!buf.queue.empty() || !buf.realInput || !buf.appliedInput || !buf.isPlayer1 || !buf.ghost1) {
@@ -3375,12 +3411,14 @@ class BufferMenu : public geode::Popup {
         { "swing-smart", "Smart swing" },
         { "cbf-sync", "CBF sync" },
         { "predict-moving-objects", "Predict moving objects" },
-        { nullptr, "Path view (F10)" },
         { "training-mode", "Training (hints only)" },
         { "death-heatmap", "Death heatmap" },
         { "save-ding", "Ding on save" },
         { "performance-mode", "Performance mode" },
-        { "explain-inputs", "Explain inputs (debug)" },
+        { "master-tick-control", "Master tick control" },
+        { "save-aggression", "Aggressive search" },
+        { "show-auto-tag", "Show status tag" },
+        { "debug-tools", "Debug tools" },
     };
 
     // v2.50: cute theme. v2.75: colour themes (setting "Menu theme")
@@ -3507,23 +3545,56 @@ private:
         exportConsole();
     }
 
-    // v2.75 presets: stage + the switches that matter most, in one click
+    // Presets keep common choices simple; Extremely Aggressive deliberately searches wider.
     void onPreset(CCObject* sender) {
         auto* mod = Mod::get();
         int which = sender->getTag();
-        int stage = which == 0 ? 2 : which == 1 ? 3 : 5;  // 2f / 4f / 8f
+        bool extreme = which == 3;
+        int stage = which == 0 ? 2 : which == 1 ? 3 : which == 2 ? 5 : 6;
         mod->setSettingValue<bool>("robust-saves", true);
-        mod->setSettingValue<bool>("wave-safety-margin", which != 2);
-        mod->setSettingValue<bool>("more-time-death-spots", which != 0);
+        mod->setSettingValue<bool>("wave-safety-margin", true);
+        mod->setSettingValue<bool>("more-time-death-spots", which >= 2);
         mod->setSettingValue<bool>("low-latency", false);
+        mod->setSettingValue<bool>("master-tick-control", extreme);
+        mod->setSettingValue<bool>("save-aggression", extreme);
+        if (extreme) {
+            mod->setSettingValue<int64_t>("master-tick-limit", 64);
+            mod->setSettingValue<int64_t>("custom-ticks", 64);
+            mod->setSettingValue<int64_t>("custom-wave-ticks", 64);
+            mod->setSettingValue<int64_t>("save-aggression-level", 100);
+            mod->setSettingValue<double>("sim-budget-ms", 12.0);
+            mod->setSettingValue<int64_t>("ground-horizon", 240);
+            mod->setSettingValue<int64_t>("wave-horizon", 160);
+            mod->setSettingValue<bool>("auto-budget", true);
+            mod->setSettingValue<bool>("performance-mode", false);
+            mod->setSettingValue<bool>("smart-prediction", true);
+            mod->setSettingValue<bool>("orb-try-both", true);
+            mod->setSettingValue<bool>("orb-align", true);
+            mod->setSettingValue<bool>("orb-timing", true);
+            mod->setSettingValue<bool>("full-ghost-state", true);
+            mod->setSettingValue<bool>("robot-smart", true);
+            mod->setSettingValue<bool>("ufo-smart", true);
+            mod->setSettingValue<bool>("ball-smart", true);
+            mod->setSettingValue<bool>("spider-smart", true);
+            mod->setSettingValue<bool>("swing-smart", true);
+            mod->setSettingValue<bool>("ship-buffer", true);
+            mod->setSettingValue<bool>("wave-auto-release", true);
+            mod->setSettingValue<bool>("robot-auto-release", true);
+            mod->setSettingValue<bool>("dash-auto-release", true);
+            mod->setSettingValue<bool>("save-ding", true);
+            mod->setSettingValue<bool>("debug-tools", false);
+        }
         buf.stage = stage;
         mod->setSavedValue("stage", buf.stage);
         resetPending();
         applyStage();
         readSettings();
+        applyStage();
         refreshWatermark();
+        refreshAutoTag();
         refreshPanel();
-        say("preset: {} -> {}", which == 0 ? "Safe" : which == 1 ? "Balanced" : "Aggressive", stageText());
+        say("preset: {} -> {}", which == 0 ? "Safe" : which == 1 ? "Balanced" :
+            which == 2 ? "Aggressive" : "Extremely Aggressive", stageText());
         refresh();
     }
 
@@ -3643,14 +3714,12 @@ protected:
             { 124.f, 26.f });
 
         // presets + run check
-        char const* presets[] = { "Safe", "Balanced", "Aggressive" };
-        for (int i = 0; i < 3; ++i) {
-            auto* button = textButton(presets[i], menu_selector(BufferMenu::onPreset), 0.5f);
+        char const* presets[] = { "Safe", "Balanced", "Aggressive", "Extremely Aggressive" };
+        for (int i = 0; i < 4; ++i) {
+            auto* button = textButton(presets[i], menu_selector(BufferMenu::onPreset), 0.42f);
             button->setTag(i);
             m_buttonMenu->addChildAtPosition(button, Anchor::Bottom, { -132.f + 82.f * i, 82.f });
         }
-        m_buttonMenu->addChildAtPosition(textButton("Run check", menu_selector(BufferMenu::onRunCheck), 0.5f), Anchor::Bottom,
-            { 124.f, 82.f });
 
         refresh();
         return true;
@@ -3694,13 +3763,6 @@ class $modify(BufEndLevelLayer, EndLevelLayer) {
             return;
         }
         auto win = CCDirector::get()->getWinSize();
-        auto* label = CCLabelBMFont::create("Click Before Frames was on", "bigFont.fnt");
-        label->setScale(0.35f);
-        label->setColor({ 150, 205, 255 });
-        label->setOpacity(170);
-        label->setAnchorPoint({ 1.f, 1.f });
-        label->setPosition({ win.width - 6.f, win.height - 4.f });
-        this->addChild(label, 100);
         if (attemptStats.saves > 0) {
             auto* stats = CCLabelBMFont::create(attemptSummary().c_str(), "bigFont.fnt");
             stats->setScale(0.28f);
@@ -3744,6 +3806,11 @@ class $modify(BufPauseLayer, PauseLayer) {
 
     void onDiagnostics(CCObject*) {
         crashdiag::HookScope __diag("BufPauseLayer::onDiagnostics");
+        // DIAG is an explicit request for crash capture; it does not turn on the
+        // CPU-heavy in-game analysis tools.
+        if (!buf.debugTools) {
+            crashdiag::setRecordingEnabled(true);
+        }
         crashdiag::flush();
         auto diagnostics = crashdiag::exportText();
         bool copied = geode::utils::clipboard::write(diagnostics);
@@ -3757,6 +3824,7 @@ class $modify(BufPauseLayer, PauseLayer) {
 };
 
 $on_mod(Loaded) {
+    crashdiag::setRecordingEnabled(Mod::get()->getSettingValue<bool>("debug-tools"));
     crashdiag::install();
     crashdiag::record("MOD_LOADED callback entered");
     auto allMods = Loader::get()->getAllMods();
@@ -3774,8 +3842,6 @@ $on_mod(Loaded) {
     }
     crashdiag::recordf("LOADED_MOD_SUMMARY total=%zu relevantLogged=%zu", allMods.size(), relevantMods);
     crashdiag::flush();
-    buf.console = Mod::get()->getSettingValue<bool>("debug-console");
-    buf.showPath = Mod::get()->getSettingValue<bool>("show-path");
     recoverGlobals();
     buf.stage = std::clamp(static_cast<int>(Mod::get()->getSavedValue<int64_t>("stage", 0)), 0, STAGE_COUNT - 1);
     // v2.62: per-level settings off (switched off once): every level uses the same switches, like v2.43.1
@@ -3980,14 +4046,6 @@ class $modify(BufPlayLayer, PlayLayer) {
         this->addChild(buf.panel);
         refreshPanel();
 
-        buf.watermark = CCLabelBMFont::create("", "bigFont.fnt");
-        buf.watermark->setScale(0.28f);
-        buf.watermark->setColor({ 150, 205, 255 });
-        buf.watermark->setOpacity(153);
-        buf.watermark->setAnchorPoint({ 0.f, 0.f });
-        buf.watermark->setPosition({ 6.f, 4.f });
-        buf.watermark->setZOrder(1000);
-        this->addChild(buf.watermark);
         buf.usedThisAttempt = false;
         refreshWatermark();
 

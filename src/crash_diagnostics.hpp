@@ -45,6 +45,7 @@ namespace crashdiag {
     inline std::filesystem::path g_previousPath;
     inline std::filesystem::path g_lastCrashPath;
     inline bool g_installed = false;
+    inline bool g_recordingEnabled = false;
 
 #if defined(__APPLE__) || defined(__unix__)
     inline int g_fd = -1;
@@ -197,6 +198,7 @@ namespace crashdiag {
 #endif
 
     inline void record(const char* message) {
+        if (!g_recordingEnabled) return;
         sig_atomic_t next = g_sequence + 1;
         auto& event = g_events[static_cast<size_t>(next) % EVENT_CAPACITY];
         int written = std::snprintf(event.text, sizeof(event.text), "[%08d] %s\n",
@@ -213,12 +215,21 @@ namespace crashdiag {
     }
 
     inline void recordf(const char* format, ...) {
+        if (!g_recordingEnabled) return;
         char message[EVENT_SIZE];
         va_list args;
         va_start(args, format);
         std::vsnprintf(message, sizeof(message), format ? format : "<null format>", args);
         va_end(args);
         record(message);
+    }
+
+    inline void setRecordingEnabled(bool enabled) {
+        bool wasEnabled = g_recordingEnabled;
+        g_recordingEnabled = enabled;
+        if (enabled && !wasEnabled) {
+            record("DIAGNOSTIC RECORDING ENABLED");
+        }
     }
 
     inline void setActive(const char* name) {
@@ -256,6 +267,7 @@ namespace crashdiag {
     };
 
     inline void flush() {
+        if (!g_recordingEnabled) return;
 #if defined(__APPLE__) || defined(__unix__)
         if (g_fd < 0) return;
         sig_atomic_t newest = g_sequence;
