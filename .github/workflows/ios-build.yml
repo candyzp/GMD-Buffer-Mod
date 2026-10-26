@@ -13,6 +13,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Verify Geometry Dash target
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          gd = json.loads(Path("mod.json").read_text())["gd"]
+          assert gd.get("ios") == "2.2081", (
+              f"Expected iOS target 2.2081, got {gd.get('ios')!r}"
+          )
+          assert gd.get("ios") != "2.2091", "Do not build this port against iOS 2.2091"
+          print("Confirmed: iOS target is Geometry Dash 2.2081")
+          PY
+
       - name: Build iOS mod
         id: build
         uses: geode-sdk/build-geode-mod@main
