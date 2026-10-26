@@ -13,7 +13,7 @@ on:
 
 jobs:
   build-ios:
-    name: Build for Geometry Dash iOS
+    name: Build iOS mod (Geometry Dash 2.2081)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -38,11 +38,16 @@ jobs:
         with:
           sdk: given
           target: iOS
+          # Keep SDK 5.11.2 paired with the bindings/codegen revision used by
+          # this branch's known-good Windows build; do not silently follow the
+          # moving bindings main branch.
+          bindings-ref: 1605f500d053f8de122bf5c7dc6d17c24866e02e
+          configure-args: -DSKIP_BUILDING_CODEGEN=OFF
           build-config: RelWithDebInfo
 
       - name: Upload iOS package
         uses: actions/upload-artifact@v7
         with:
-          name: Input-Buffer-iOS
+          name: Input-Buffer-iOS-GD-2.2081
           path: ${{ steps.build.outputs.build-output }}
           if-no-files-found: error
