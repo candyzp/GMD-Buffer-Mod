@@ -3391,6 +3391,11 @@ private:
         }
     }
 
+    void resetFloater(CCNode* node) {
+        // Reset the decorative floater to its original baseline; keep x unchanged.
+        node->setPositionY(20.f);
+    }
+
     void loopFloater(CCNode* node) {
         float rise = node->getTag() / 10.f;
         node->runAction(CCRepeatForever::create(CCSequence::create(
@@ -3398,7 +3403,7 @@ private:
                 CCSequence::create(CCFadeTo::create(rise * 0.3f, 110), CCDelayTime::create(rise * 0.4f), CCFadeTo::create(rise * 0.3f, 0),
                     nullptr),
                 nullptr),
-            CCPlace::create(node->getPosition()), nullptr)));
+            CCCallFuncN::create(this, callfuncN_selector(BufferMenu::resetFloater)), nullptr)));
     }
 
     void colorLabels() {
