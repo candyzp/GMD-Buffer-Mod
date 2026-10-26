@@ -2,6 +2,8 @@
 
 A Geode mod for Geometry Dash 2.2081 (Windows) that makes tight timings easier.
 
+> **Experimental iOS port:** The `ios-port` branch adds a Geometry Dash iOS 2.208 target and a dedicated iOS build workflow. The gameplay code uses Geode/Cocos hooks and has no direct Windows API dependency in the input path. A successful compile does **not** verify that the hooks behave correctly at runtime; on-device testing is still required.
+
 If you click slightly too early, the mod remembers the click and fires it the moment you land or touch an orb. In ship, UFO, swing and wave it makes very quick taps come out consistent.
 
 > **Note:** this is an input assist. Use it for practice and fun, not for leaderboard or submitted runs.
@@ -27,6 +29,8 @@ Pads fire on touch in the normal game, so they need no buffering.
 Switching wave mode in the middle of a wave section can cause one odd click, so change it while paused.
 
 ## Install
+
+### Windows release
 
 1. You need Geometry Dash 2.2081 on Windows with the [Geode](https://geode-sdk.org) loader installed.
 2. Download `lyophi.buffermod.geode` from the [Releases](../../releases) page.
@@ -78,7 +82,7 @@ Hotkeys only act while you are inside a level, and you can rebind them in the se
 
 ## Known limitations
 
-- The mod is built for Windows. Hotkeys use Geode's keybind system, but other platforms are untested.
+- The published release is Windows-focused. The experimental `ios-port` branch targets iOS 2.208, but has not yet been verified in a live game on an iPhone.
 - The TPS setting is typed by hand and must be kept in sync with your real TPS.
 - Dual portal support is experimental and off by default. In levels with mixed modes on the two icons, expect some rough edges.
 - Delayed inputs are injected by the mod, so effects that depend on the original input event may not see them at the exact moment.
