@@ -1,1610 +1,713 @@
-#include <Geode/Geode.hpp>
-#include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/PauseLayer.hpp>
-#include <Geode/modify/PlayLayer.hpp>
-#include <algorithm>
-#include <cmath>
-#include <chrono>
-#include <cstdio>
-#include <functional>
-#include <cstdlib>
-#include <string>
-#include <utility>
-#include <vector>
+// Click Before Frames v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
+//
+// When you click (or release, in wave / robot), a hidden "ghost" player is simulated
+// ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
+// delay and, if a delayed version clearly survives longer, your input is held back
+// and delivered that many physics ticks later. 1 tick = 1/240 s = 0.25 frames @ 60fps.
+//
+// v2 changes:
+//  - Bigger windows: F6 stages up to 32 ticks (8 frames) plus a CUSTOM stage (settings).
+//  - Smart prediction: ghost uses orbs, pads, gravity portals and speed portals; mode /
+//    size / dual / mirror / teleport portals end the prediction as "safe".
+//  - Input queue: every input arriving during a delay is shifted by the same amount,
+//    so taps and hold lengths are preserved (no more swallowed clicks / 1-tick taps).
+//  - Time budget per click so big windows don't hitch.
+//  - Fixes: ghost lifetime, init using `this`, time-warp dt, F6 only when GD focused,
+//    dead flipGravity hook priority, optional console, in-game console (stage + live log, hidden by default).
 
-#include <Geode/loader/GameEvent.hpp>
-#include <Geode/loader/SettingV3.hpp>
-#include <Geode/ui/Notification.hpp>
+#include <Geode/Geode.hpp>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
+#include <Geode/modify/CCKeyboardDispatcher.hpp>
+#endif
+#include <Geode/modify/EffectGameObject.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/GameObject.hpp>
+#include <Geode/modify/HardStreak.hpp>
+#include <Geode/modify/LevelEditorLayer.hpp>
+#include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/EndLevelLayer.hpp>
+#include <Geode/ui/GeodeUI.hpp>
 #include <Geode/ui/Popup.hpp>
-#include <Geode/ui/TextInput.hpp>
+#include <map>
+#include <Geode/modify/PlayerObject.hpp>
+#if defined(_WIN32)
+#include <Windows.h>
+#endif
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cctype>
+#include <climits>
+#include <cmath>
+#include <complex>
+#include <deque>
+#include <filesystem>
+#include <functional>
+#include <fstream>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 using namespace geode::prelude;
 
-// ---- settings --------------------------------------------------------
-static constexpr char const* STAGE_NAMES[] = {"2 ticks", "4 ticks", "8 ticks", "16 ticks", "Off"};
-static constexpr int STAGES[] = {2, 4, 8, 16, 0};
-static constexpr int STAGE_COUNT = 5;
-static int g_stage = 1;
+namespace {
+    constexpr int HOOK_PRIORITY = -1000000;
+    constexpr float TICK = 0.25f;
+    constexpr size_t PANEL_LINES = 8;
+    constexpr int SPIDER_LAND = 12;  // v2.15: ticks on a surface after a spider input = safe
+    constexpr int SPAM_STREAK = 3;  // this many fast inputs in a row = wave spam
 
-static constexpr int WAVE_MAX_TICKS = 8;
-
-// After a spawn, wave Grid / Min Gap are skipped for this many ticks.
-static constexpr int SPAWN_GRACE_TICKS = 16;
-
-// Index: 0 cube, 1 ball, 2 robot, 3 spider, 4 ship, 5 ufo, 6 swing, 7 wave.
-// Value: -1 = same as main window, 0 = off, >0 = custom ticks.
-static constexpr int MODE_COUNT = 8;
-static constexpr int MODE_WAVE = 7;
-static constexpr char const* MODE_KEYS[] = {
-    "cube-ticks", "ball-ticks", "robot-ticks", "spider-ticks",
-    "ship-ticks", "ufo-ticks", "swing-ticks", "wave-ticks"
-};
-static int g_modeTicks[MODE_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1};
-
-static constexpr char const* WAVE_NAMES[] = {"Min Hold", "Min Gap", "Grid"};
-enum WaveMode { WAVE_HOLD = 0, WAVE_GAP = 1, WAVE_GRID = 2 };
-static constexpr int WAVE_MODE_COUNT = 3;
-static int g_waveMode = WAVE_GRID;
-
-// Experimental: the same three timing styles for ship, UFO and swing.
-// Index: 0 ship, 1 ufo, 2 swing. Default is Min Hold (the old behavior).
-static constexpr char const* FLY_STYLE_KEYS[] = {"ship-style", "ufo-style", "swing-style"};
-static int g_flyStyle[3] = {WAVE_HOLD, WAVE_HOLD, WAVE_HOLD};
-
-// The game speed is typed in as a number. These common speeds are only used
-// by the TPS Up / TPS Down hotkeys.
-static constexpr int TPS_PRESETS[] = {60, 120, 240, 360, 480, 720, 960, 1000};
-static constexpr int TPS_COUNT = 8;
-static constexpr int TPS_MIN = 1;
-static constexpr int TPS_MAX = 10000;
-static int g_tps = 240;
-
-static bool g_debug = false;
-
-// Experimental: buffering during dual-portal sections of one-player levels.
-// Off by default. Real 2-player levels are not affected by this.
-static bool g_dualEnabled = false;
-
-// Hotkeys are keybind settings. Order: 0 stage, 1 tps up, 2 tps down, 3 debug, 4 wave mode, 5 add section.
-static constexpr int KEYBIND_COUNT = 6;
-static constexpr char const* KEYBIND_SETTINGS[] = {"kb-stage", "kb-tps-up", "kb-tps-down", "kb-debug", "kb-wave", "kb-section"};
-
-// Raised whenever the level resets (death, restart, checkpoint).
-static int g_resetEpoch = 0;
-// ----------------------------------------------------------------------
-
-#define DBG(...) do { if (g_debug) log::info(__VA_ARGS__); } while (0)
-
-static int indexOf(char const* const* names, int n, std::string const& v, int def) {
-    for (int i = 0; i < n; i++) if (v == names[i]) return i;
-    return def;
-}
-
-static void loadSettings() {
-    auto m = Mod::get();
-    g_stage = indexOf(STAGE_NAMES, STAGE_COUNT, m->getSettingValue<std::string>("stage"), 1);
-    g_tps = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("tps-value")), TPS_MIN, TPS_MAX);
-    g_waveMode = indexOf(WAVE_NAMES, WAVE_MODE_COUNT, m->getSettingValue<std::string>("wave-mode"), WAVE_GRID);
-    for (int i = 0; i < MODE_COUNT; i++) {
-        g_modeTicks[i] = static_cast<int>(m->getSettingValue<int64_t>(MODE_KEYS[i]));
+    constexpr uint64_t typeBit(GameObjectType type) {
+        return 1ull << static_cast<int>(type);
     }
-    for (int i = 0; i < 3; i++) {
-        g_flyStyle[i] = indexOf(WAVE_NAMES, WAVE_MODE_COUNT, m->getSettingValue<std::string>(FLY_STYLE_KEYS[i]), WAVE_HOLD);
+
+    // Objects the ghost always collides with.
+    // v2.61: back to the v2.48 set (v2.49 left CollisionObject out; cube and wave got less consistent)
+    constexpr uint64_t COLLIDING_TYPES = typeBit(GameObjectType::Solid) | typeBit(GameObjectType::Hazard) | typeBit(GameObjectType::Slope) |
+                                         typeBit(GameObjectType::CollisionObject) | typeBit(GameObjectType::AnimatedHazard);
+
+    constexpr uint64_t HAZARD_TYPES = typeBit(GameObjectType::Hazard) | typeBit(GameObjectType::AnimatedHazard);
+
+    // Objects the ghost may also interact with when smart prediction is on.
+    constexpr uint64_t INTERACT_TYPES =
+        typeBit(GameObjectType::YellowJumpPad) | typeBit(GameObjectType::PinkJumpPad) | typeBit(GameObjectType::RedJumpPad) |
+        typeBit(GameObjectType::GravityPad) | typeBit(GameObjectType::SpiderPad) | typeBit(GameObjectType::YellowJumpRing) |
+        typeBit(GameObjectType::PinkJumpRing) | typeBit(GameObjectType::RedJumpRing) | typeBit(GameObjectType::GravityRing) |
+        typeBit(GameObjectType::GreenRing) | typeBit(GameObjectType::DropRing) | typeBit(GameObjectType::CustomRing) |
+        typeBit(GameObjectType::DashRing) | typeBit(GameObjectType::GravityDashRing) | typeBit(GameObjectType::SpiderOrb) |
+        typeBit(GameObjectType::InverseGravityPortal) | typeBit(GameObjectType::NormalGravityPortal) |
+        typeBit(GameObjectType::GravityTogglePortal);
+
+    // Portals that change too much state to simulate: reaching one ends prediction as "safe".
+    constexpr uint64_t STOP_TYPES =
+        typeBit(GameObjectType::ShipPortal) | typeBit(GameObjectType::CubePortal) | typeBit(GameObjectType::BallPortal) |
+        typeBit(GameObjectType::UfoPortal) | typeBit(GameObjectType::WavePortal) | typeBit(GameObjectType::RobotPortal) |
+        typeBit(GameObjectType::SpiderPortal) | typeBit(GameObjectType::SwingPortal) | typeBit(GameObjectType::DualPortal) |
+        typeBit(GameObjectType::SoloPortal) | typeBit(GameObjectType::TeleportPortal) | typeBit(GameObjectType::TeleportOrb);
+
+    // v2.8: size portals are applied to the ghost instead of ending the prediction.
+    // (Mirror portals only flip the screen, so the ghost simply ignores them.)
+    constexpr uint64_t SIZE_TYPES = typeBit(GameObjectType::RegularSizePortal) | typeBit(GameObjectType::MiniSizePortal);
+
+    bool hasType(uint64_t mask, GameObject* object) {
+        auto type = static_cast<unsigned>(object->m_objectType);
+        return type < 64 && ((mask >> type) & 1);
     }
-    g_debug = m->getSettingValue<bool>("debug");
-    g_dualEnabled = m->getSettingValue<bool>("dual-mode");
-}
 
-static char const* waveModeName() { return WAVE_NAMES[g_waveMode]; }
-
-static float stepsPerTick() {
-    return g_tps / 240.0f;
-}
-
-static int mainLimitSteps() {
-    return static_cast<int>(std::lround(STAGES[g_stage] * stepsPerTick()));
-}
-
-static bool isFlyMode(PlayerObject* p) {
-    return p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
-}
-
-static bool isGroundMode(PlayerObject* p) {
-    return !isFlyMode(p);
-}
-
-static int modeIndex(PlayerObject* p) {
-    if (p->m_isShip) return 4;
-    if (p->m_isBird) return 5;
-    if (p->m_isDart) return 7;
-    if (p->m_isSwing) return 6;
-    if (p->m_isBall) return 1;
-    if (p->m_isRobot) return 2;
-    if (p->m_isSpider) return 3;
-    return 0;
-}
-
-// Timing style of the icon's current mode (Min Hold, Min Gap or Grid).
-static int styleFor(PlayerObject* p) {
-    int idx = modeIndex(p);
-    if (idx == MODE_WAVE) return g_waveMode;
-    if (idx >= 4 && idx <= 6) return g_flyStyle[idx - 4];
-    return WAVE_HOLD;
-}
-
-static int ticksForMode(int idx) {
-    int c = g_modeTicks[idx];
-    if (c < 0) {
-        int t = STAGES[g_stage];
-        if (idx == MODE_WAVE && t > 0) t = std::min(t, WAVE_MAX_TICKS);
-        return t;
-    }
-    return c;
-}
-
-static int modeLimitSteps(PlayerObject* p) {
-    int ticks = ticksForMode(modeIndex(p));
-    if (ticks <= 0) return 0;
-    return std::max(1, static_cast<int>(std::lround(ticks * stepsPerTick())));
-}
-
-static int waveGridSteps() {
-    int ticks = ticksForMode(MODE_WAVE);
-    if (ticks <= 0) return 0;
-    return std::max(1, static_cast<int>(std::lround(ticks * stepsPerTick())));
-}
-
-static int spawnGraceSteps() {
-    return std::max(1, static_cast<int>(std::lround(SPAWN_GRACE_TICKS * stepsPerTick())));
-}
-
-static int ringsTouching(PlayerObject* p) {
-    return p->m_touchingRings ? static_cast<int>(p->m_touchingRings->count()) : 0;
-}
-
-static char const* modeName(PlayerObject* p) {
-    if (p->m_isShip) return "ship";
-    if (p->m_isBird) return "ufo";
-    if (p->m_isDart) return "wave";
-    if (p->m_isSwing) return "swing";
-    if (p->m_isBall) return "ball";
-    if (p->m_isRobot) return "robot";
-    if (p->m_isSpider) return "spider";
-    return "cube";
-}
-
-// Next common speed above / below the current one. A typed value between two
-// presets moves to the neighbor in the direction pressed; at the ends it stays.
-static int stepTps(int cur, bool up) {
-    if (up) {
-        for (int i = 0; i < TPS_COUNT; i++) {
-            if (TPS_PRESETS[i] > cur) return TPS_PRESETS[i];
-        }
-        return cur;
-    }
-    for (int i = TPS_COUNT - 1; i >= 0; i--) {
-        if (TPS_PRESETS[i] < cur) return TPS_PRESETS[i];
-    }
-    return cur;
-}
-
-static void addSectionHere();
-
-static void doHotkey(int action) {
-    auto m = Mod::get();
-    switch (action) {
-        case 0:
-            g_stage = (g_stage + 1) % STAGE_COUNT;
-            m->setSettingValue<std::string>("stage", STAGE_NAMES[g_stage]);
-            log::info("[InputBuffer] Main window -> {} ({} steps, wave {} steps @ {} TPS)",
-                      STAGE_NAMES[g_stage], mainLimitSteps(), waveGridSteps(), g_tps);
-            break;
-        case 1:
-            g_tps = stepTps(g_tps, true);
-            m->setSettingValue<int64_t>("tps-value", static_cast<int64_t>(g_tps));
-            log::info("[InputBuffer] TPS -> {} ({:.2f} steps/tick)", g_tps, stepsPerTick());
-            break;
-        case 2:
-            g_tps = stepTps(g_tps, false);
-            m->setSettingValue<int64_t>("tps-value", static_cast<int64_t>(g_tps));
-            log::info("[InputBuffer] TPS -> {} ({:.2f} steps/tick)", g_tps, stepsPerTick());
-            break;
-        case 3:
-            g_debug = !g_debug;
-            m->setSettingValue<bool>("debug", g_debug);
-            log::info("[InputBuffer] Debug logging -> {}", g_debug ? "ON" : "OFF");
-            break;
-        case 4:
-            g_waveMode = (g_waveMode + 1) % WAVE_MODE_COUNT;
-            m->setSettingValue<std::string>("wave-mode", WAVE_NAMES[g_waveMode]);
-            log::info("[InputBuffer] Wave mode -> {} ({} steps)", waveModeName(), waveGridSteps());
-            break;
-        case 5:
-            addSectionHere();
-            break;
-    }
-}
-
-static void hotkeyPressed(int action, bool down, bool repeat) {
-    if (!down || repeat) return;
-    if (!PlayLayer::get()) return; // hotkeys only act inside a level
-    doHotkey(action);
-}
-
-// ---- profiles --------------------------------------------------------
-// A profile is a named copy of the timing settings (not hotkeys or debug).
-// It is stored as one line of text: key=value|key=value|...
-struct ProfileKey { char const* key; char type; }; // s = string, i = int, b = bool
-static constexpr ProfileKey PROFILE_KEYS[] = {
-    {"stage", 's'}, {"wave-mode", 's'}, {"tps-value", 'i'},
-    {"cube-ticks", 'i'}, {"ball-ticks", 'i'}, {"robot-ticks", 'i'}, {"spider-ticks", 'i'},
-    {"ship-ticks", 'i'}, {"ufo-ticks", 'i'}, {"swing-ticks", 'i'}, {"wave-ticks", 'i'},
-    {"dual-mode", 'b'},
-    {"ship-style", 's'}, {"ufo-style", 's'}, {"swing-style", 's'},
-};
-
-static std::string serializeProfile() {
-    auto m = Mod::get();
-    std::string out;
-    for (auto const& k : PROFILE_KEYS) {
-        if (!out.empty()) out += '|';
-        out += k.key;
-        out += '=';
-        if (k.type == 's') out += m->getSettingValue<std::string>(k.key);
-        else if (k.type == 'i') out += std::to_string(m->getSettingValue<int64_t>(k.key));
-        else out += m->getSettingValue<bool>(k.key) ? "1" : "0";
-    }
-    return out;
-}
-
-static void applyProfileData(std::string const& data) {
-    auto m = Mod::get();
-    size_t pos = 0;
-    while (pos <= data.size()) {
-        size_t end = data.find('|', pos);
-        if (end == std::string::npos) end = data.size();
-        std::string item = data.substr(pos, end - pos);
-        pos = end + 1;
-        size_t eq = item.find('=');
-        if (eq == std::string::npos) continue;
-        std::string key = item.substr(0, eq);
-        std::string val = item.substr(eq + 1);
-        for (auto const& k : PROFILE_KEYS) {
-            if (key != k.key) continue;
-            if (k.type == 's') m->setSettingValue<std::string>(k.key, val);
-            else if (k.type == 'i') m->setSettingValue<int64_t>(k.key, static_cast<int64_t>(std::strtoll(val.c_str(), nullptr, 10)));
-            else m->setSettingValue<bool>(k.key, val == "1");
-            break;
+    float speedPortalValue(int id) {
+        switch (id) {
+            case 200: return 0.7f;   // slow
+            case 201: return 0.9f;   // normal
+            case 202: return 1.1f;   // fast
+            case 203: return 1.3f;   // faster
+            case 1334: return 1.6f;  // fastest
+            default: return 0.f;
         }
     }
-    loadSettings();
-}
 
-static std::string profileDataKey(std::string const& name) { return "profile-data-" + name; }
+    struct Stage {
+        bool enabled;
+        int ticksAll;
+        int ticksWave;
+        bool custom;
+    };
 
-static std::vector<std::string> loadProfileNames() {
-    std::vector<std::string> out;
-    std::string raw = Mod::get()->getSavedValue<std::string>("profile-names", "");
-    size_t pos = 0;
-    while (pos < raw.size()) {
-        size_t end = raw.find('\n', pos);
-        if (end == std::string::npos) end = raw.size();
-        if (end > pos) out.push_back(raw.substr(pos, end - pos));
-        pos = end + 1;
-    }
-    return out;
-}
+    constexpr Stage STAGES[] = {
+        { true, 2, 2, false },
+        { true, 4, 4, false },
+        { true, 8, 8, false },
+        { true, 16, 8, false },
+        { true, 24, 12, false },
+        { true, 32, 16, false },
+        { true, 0, 0, true },
+        { false, 0, 0, false },
+    };
+    constexpr int STAGE_COUNT = sizeof(STAGES) / sizeof(STAGES[0]);
 
-static void saveProfileNames(std::vector<std::string> const& names) {
-    std::string raw;
-    for (auto const& n : names) {
-        raw += n;
-        raw += '\n';
-    }
-    Mod::get()->setSavedValue<std::string>("profile-names", raw);
-}
+    struct QueuedInput {
+        int ticksLeft;
+        bool down;
+    };
 
-static bool applyProfileByName(std::string const& name) {
-    std::string data = Mod::get()->getSavedValue<std::string>(profileDataKey(name), "");
-    if (data.empty()) return false;
-    applyProfileData(data);
-    return true;
-}
+    struct ObjSnapshot {
+        GameObject* object;
+        bool isActivated;
+        EffectGameObject* effect;
+        bool activated;
+        bool byP1;
+        bool byP2;
+    };
 
-// When a level applies its own profile, the player's settings from before are
-// saved first and put back when the level is left. The copy is kept on disk,
-// so it is also restored the next time the game starts if the game crashed.
-static void restoreAfterLevel() {
-    std::string snap = Mod::get()->getSavedValue<std::string>("restore-snapshot", "");
-    if (snap.empty()) return;
-    Mod::get()->setSavedValue<std::string>("restore-snapshot", "");
-    applyProfileData(snap);
-    log::info("[InputBuffer] Restored your settings from before the level profile");
-}
+    struct Buffer {
+        PlayerObject* ghost1 = nullptr;
+        PlayerObject* ghost2 = nullptr;
+        CCLayer* ghostLayer = nullptr;
+        unsigned ghostLayerBase = 0;  // v2.24: children the ghost layer has right after the ghosts are made
 
-// Which profile a level should use (level id -> profile name).
-static std::vector<std::pair<int, std::string>> loadLevelProfiles() {
-    std::vector<std::pair<int, std::string>> out;
-    std::string raw = Mod::get()->getSavedValue<std::string>("level-profiles", "");
-    size_t pos = 0;
-    while (pos < raw.size()) {
-        size_t end = raw.find('\n', pos);
-        if (end == std::string::npos) end = raw.size();
-        std::string line = raw.substr(pos, end - pos);
-        pos = end + 1;
-        size_t eq = line.find('=');
-        if (eq == std::string::npos || eq == 0) continue;
-        out.emplace_back(std::atoi(line.substr(0, eq).c_str()), line.substr(eq + 1));
-    }
-    return out;
-}
+        CCNode* panel = nullptr;
+        CCLabelBMFont* panelTitle = nullptr;               // current stage
+        std::vector<CCLabelBMFont*> panelLines;            // one label per log line (colored)
+        bool panelOpen = false;  // closed by default, remembered for the session
+        bool panelDirty = false; // v2.71: new log lines, the panel is redrawn once on the next step
+        bool perfMode = false;   // v2.71: performance mode
+        double userBudget = 6.0; // v2.75: the budget from the settings (budgetMs is this click's)
+        bool autoBudget = true;  // v2.75: budget follows the frame rate
+        int keys[6] = { 0, 0, 0, 0, 0, 0 };  // v2.75: stage, menu, export, console, path, forget
+        std::unordered_set<GameObject*> simDisabled;  // v2.75: objects a toggle orb switched off in this prediction
+        std::deque<std::string> logLines;
 
-static void saveLevelProfiles(std::vector<std::pair<int, std::string>> const& v) {
-    std::string raw;
-    for (auto const& e : v) {
-        raw += std::to_string(e.first);
-        raw += '=';
-        raw += e.second;
-        raw += '\n';
-    }
-    Mod::get()->setSavedValue<std::string>("level-profiles", raw);
-}
+        bool simulating = false;
+        bool injecting = false;
+        bool ghostDied = false;
+        bool ghostHitPortal = false;
+        bool realInput = false;
+        bool appliedInput = false;
+        bool isPlayer1 = true;
 
-static std::string levelProfileFor(int id) {
-    for (auto const& e : loadLevelProfiles()) {
-        if (e.first == id) return e.second;
-    }
-    return "";
-}
+        bool enabled = true;
+        int stage = 0;
+        int ticksAll = 2;
+        int ticksWave = 2;
 
-static void setLevelProfile(int id, std::string const& name) {
-    auto v = loadLevelProfiles();
-    v.erase(std::remove_if(v.begin(), v.end(), [&](auto const& e) { return e.first == id; }), v.end());
-    if (!name.empty()) v.emplace_back(id, name);
-    saveLevelProfiles(v);
-}
+        std::deque<QueuedInput> queue;
+        int shift = 0;  // delay applied to inputs while the queue is active
 
-static void forgetProfileEverywhere(std::string const& name) {
-    auto v = loadLevelProfiles();
-    v.erase(std::remove_if(v.begin(), v.end(), [&](auto const& e) { return e.second == name; }), v.end());
-    saveLevelProfiles(v);
-}
+        float tickLength = TICK;
+        int sinceInput = 999;
+        int rapid = 0;
 
-// A key that identifies a level. Uploaded levels use their real ID. Levels
-// that were never uploaded (such as copies you made to edit) have ID 0, so
-// they get a negative key made from their name instead.
-static int levelKeyFor(GJGameLevel* level) {
-    if (!level) return 0;
-    int id = level->m_levelID.value();
-    if (id > 0) return id;
-    std::string name = level->m_levelName;
-    if (name.empty()) return 0;
-    int h = static_cast<int>(std::hash<std::string>{}(name) & 0x3fffffff);
-    return -(h + 1);
-}
+        bool smart = true;
+        bool console = false;
+        double budgetMs = 6.0;
+        bool practiceOnly = true;    // v2.1: only buffer in practice mode
+        int groundHorizon = 130;     // v2.1: how far ahead cube/ball/spider predictions look
+        int releaseShift = 0;        // v2.1: delay of the last delivered press, reused for its release
+        int waveHorizon = 65;        // v2.2: how far ahead wave predictions look (mini = 15 less)
+        bool assumeOrbs = true;      // v2.2: the ghost clicks every orb it touches ("calculation mode")
+        bool held1 = false, held2 = false;   // button state the ghosts are meant to be in
+        bool auto1 = false, auto2 = false;   // an orb auto-click is currently held on this ghost
+        bool orbTiming = true;       // v2.26: orb clicks at specific timings inside the orb
+        int orbClickDelay = 0;       // v2.26: ghost orb auto-clicks wait this many ticks into the orb
+        int autoAt1 = -1, autoAt2 = -1;      // v2.26: tick a delayed orb auto-click fires (-1 none, -2 done)
+        bool orbWasTiming = false;   // v2.26: the last orb save re-timed a press that was already in the orb
 
-static int currentLevelID() {
-    auto pl = PlayLayer::get();
-    if (!pl || !pl->m_level) return 0;
-    return levelKeyFor(pl->m_level);
-}
+        bool tryBothOrbs = true;     // v2.4: if a run touches an orb and dies, retry with the other orb choice
+        bool orbClick = true;        // v2.4: orb choice of the current run
+        bool touchedOrb = false;     // v2.4: the current run touched an orb
+        bool skipPress = false;      // v2.4: run without pressing anything (auto-release hold check)
+        bool avoidMovers = true;     // v2.4: don't buffer when the ghost's path has moving objects
+        bool sawMover = false;       // v2.4: a run this decision touched a moving object
+        bool trackMovers = false;    // v2.5.1: watch objects only in this run (not in every search run)
+        bool autoRelease = false;    // v2.4: wave auto-release (practice mode only)
+        int autoWindow = 6;          // v2.4: hold must die within this many ticks to auto-release
+        bool autoReleased = false;   // v2.4: we released for you; your real release is swallowed
+        int spamGap = 16;            // v2.5.2: inputs closer than this (ticks) count toward wave spam
+        bool waveMargin = true;      // v2.10: center wave saves in the safe window (1 tick of room)
+        bool waveV46 = false;        // v2.7: use the old v4.6 wave rules instead of the cube-style ones
+        bool orbAlign = true;        // v2.6: hold an early press back until the ghost is inside the orb
+        bool orbAlignGround = false; // v2.11.1: also align presses made on the ground (jumps)
+        bool ignoreTouching = true;  // v2.31: hazards you touch right now without dying can't kill the ghost
+        bool haveRealRect = false;
+        CCRect realRect1, realRect2;  // your hitboxes when the prediction starts
+        std::unordered_set<GameObject*> harmless;  // hazards on you at the start of this prediction
+        int baseEscape = -1;         // v2.36: press-now run only survives if you react by this tick
+        int baseCrash = -1;          // v2.36: ...otherwise it crashes here
+        bool lowLatency = false;     // v2.35: never chain delays, small budget and max delay
+        bool explain = false;        // v2.33: log why an input was passed through untouched
+        bool deathLog = false;       // v2.32: log what kills the press-now ghost on every no-save
+        bool captureKiller = false;  // v2.30: record what kills the ghost in the press-now run
+        bool baseTouchedDown = false;  // v2.63: the press-now ghost was back on the ground at some point
+        bool killerSeen = false;
+        int killerTick = -1;
+        int killerId = 0, killerType = -1;
+        bool killerNoTouch = false, killerDisabled = false;
+        CCRect killerRect, ghostDeathRect;
+        bool robustSaves = true;     // v2.28: a save must also survive with you slightly off
+        float ghostShiftX = 0.f;     // v2.28: horizontal offset applied to the ghost's start
+        int lateCrash = 90;          // v2.27: cube / ball crashes after this many ticks aren't this click's (0 = off)
+        bool predictMovers = false;  // v2.27: move objects along their current motion during predictions
+        bool shipBuffer = false;     // v2.25: buffer ship inputs too
+        int shipSpamGap = 6;         // v2.44: ship feathering is normal control, only taps closer than this are spam
+        int shipMaxDelay = 2;        // v2.25: ship's own max delay (240/s ticks)
+        bool perfLog = false;        // v2.21: log time / runs / ghost ticks per click
+        int simRuns = 0;             // v2.21: predictions run for the current click
+        long simTicks = 0;           // v2.21: ghost ticks stepped for the current click
+        bool cbfSync = true;         // v2.18: line the ghost up with Click Between Frames' mid-tick clicks
+        float firstStep = 1.f;       // v2.18: fraction of a tick the ghost's first step lasts
+        bool inRealUpdate = false;   // v2.18: inside P1's physics step (a CBF click lands here)
+        float tickStartX = 0.f;      // v2.18: P1's x at the start of the current tick
+        float tickDx = 0.f;          // v2.18: how far P1 moved in the last full tick
+        bool dashAutoRelease = false;  // v2.16: let go of a dash for you when it would crash
+        bool autoDash = false;       // v2.16: the current auto-release ended a dash
+        std::unordered_set<GameObject*> orbsUsed;  // v2.16: orbs the ghost actually used this run
+        bool moreTime = true;        // v2.43: at spots you keep dying, delay to give you more time
+        bool ballSmart = true;       // v2.45: ball landing rules + spam guard
+        bool swingSmart = true;      // v2.51: swing "could you have flipped back" scoring + spam guard
+        bool train = false;          // v2.51: training mode: predict, never delay, show how early you were
+        bool perLevel = true;        // v2.51: stage + switches remembered per level
+        bool heatmap = true;         // v2.51: death marks on the progress bar
+        bool saveDing = true;        // v2.56: ding when a click is saved
+        CCLabelBMFont* hintLabel = nullptr;  // v2.51: training hint ("2t early")
+        CCDrawNode* heatNode = nullptr;      // v2.51: death marks on the progress bar
+        bool ufoSmart = true;        // v2.40: UFO landing + "could you have flapped again" scoring
+        bool spiderSmart = true;     // v2.15: spider-aware landing + "could you have flipped back" scoring
+        int retapAt = -1;            // v2.15: ticks after the input at which the ghost taps again (-1 = never)
+        bool robotSmart = true;      // v2.12: robot presses count as safe if some hold length survives
+        bool robotAutoRelease = false;  // v2.12: robot auto-release (practice mode only)
+        bool autoNormalRuns = false; // v2.14: let auto-release work outside practice too
+        CCLabelBMFont* autoTag = nullptr;  // v2.14: on-screen "AUTO-RELEASE ON" tag
+        CCLabelBMFont* watermark = nullptr;  // v2.46: always-on "Click Before Frames" label while the buffer is on
+        bool usedThisAttempt = false;      // v2.46: the buffer was on at some point of this attempt
+        bool learn = true;           // v2.13: per-level memory learned from your runs
+        bool fullState = true;       // v2.11.1: copy the full v2.8 player state into the ghost
+        int orbWindow = 16;          // v2.6: how far ahead (ticks) an orb may be for that
+        int simTick = 0;             // v2.6: tick of the current run
+        int firstOrbTick = -1;       // v2.6: first tick the current run touched an orb
+        int orbUsedTick = -1;        // v2.6: first tick the current run actually used an orb
+        bool driftCheck = false;     // v2.4: log how far the real player strays from the prediction
+        std::vector<CCPoint>* recordPath = nullptr;  // v2.4: ghost1 positions of the current run
+        bool showPath = false;       // v2.11: draw the predicted path (F10)
+        CCDrawNode* pathNode = nullptr;  // v2.11: owned by the level's object layer
+        int pathHoldUntil = 0;       // v2.65: live path waits while a click's path is on screen
 
+        std::unordered_set<GameObject*> simUsed;
+        std::vector<ObjSnapshot> snapshots;
+    } buf;
 
-// ---- sections (experimental) -------------------------------------------
-// A level can be split into sections by percent. Each section has its own
-// start and end (two decimals) and its own copy of the settings. Parts of the
-// level that no section covers follow the "empty sections" choice. If sections
-// overlap, the one that starts last wins.
-struct Section { float start; float end; std::string data; };
-struct LevelSections {
-    int emptyMode = 0; // 0 level's blanket profile, 1 normal settings, 2 buffer off
-    std::vector<Section> secs;
-};
-static constexpr char const* EMPTY_MODE_NAMES[] = {"Blanket profile", "My normal settings", "Buffer off"};
-static constexpr int EMPTY_MODE_COUNT = 3;
-static constexpr char const* OFF_PROFILE =
-    "stage=Off|cube-ticks=0|ball-ticks=0|robot-ticks=0|spider-ticks=0|ship-ticks=0|ufo-ticks=0|swing-ticks=0|wave-ticks=0";
+    std::string stageText();
 
-static std::vector<std::string> splitStr(std::string const& s, char sep) {
-    std::vector<std::string> out;
-    size_t pos = 0;
-    while (pos <= s.size()) {
-        size_t end = s.find(sep, pos);
-        if (end == std::string::npos) end = s.size();
-        out.push_back(s.substr(pos, end - pos));
-        pos = end + 1;
-    }
-    return out;
-}
-
-static std::string fmtPct(float p) {
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "%.2f", p);
-    return buf;
-}
-
-static float roundPct(float p) {
-    return std::round(std::clamp(p, 0.f, 100.f) * 100.f) / 100.f;
-}
-
-static void sortSections(LevelSections& ls) {
-    std::stable_sort(ls.secs.begin(), ls.secs.end(), [](Section const& a, Section const& b) { return a.start < b.start; });
-}
-
-// Read / change one key inside a profile string (key=value|key=value|...).
-static std::string profGet(std::string const& data, std::string const& key, std::string const& def = "") {
-    for (auto const& item : splitStr(data, '|')) {
-        size_t eq = item.find('=');
-        if (eq != std::string::npos && item.substr(0, eq) == key) return item.substr(eq + 1);
-    }
-    return def;
-}
-
-static std::string profSet(std::string const& data, std::string const& key, std::string const& val) {
-    std::string out;
-    bool done = false;
-    for (auto const& item : splitStr(data, '|')) {
-        if (item.empty()) continue;
-        size_t eq = item.find('=');
-        std::string k = eq == std::string::npos ? item : item.substr(0, eq);
-        if (!out.empty()) out += '|';
-        if (k == key) { out += key + "=" + val; done = true; }
-        else out += item;
-    }
-    if (!done) {
-        if (!out.empty()) out += '|';
-        out += key + "=" + val;
-    }
-    return out;
-}
-
-// Saved as one line per level: id <tab> emptyMode <tab> start,end,data;start,end,data
-static LevelSections loadLevelSections(int id) {
-    LevelSections ls;
-    std::string raw = Mod::get()->getSavedValue<std::string>("level-sections", "");
-    for (auto const& line : splitStr(raw, '\n')) {
-        auto parts = splitStr(line, '\t');
-        if (parts.size() < 3 || std::atoi(parts[0].c_str()) != id) continue;
-        ls.emptyMode = std::clamp(std::atoi(parts[1].c_str()), 0, EMPTY_MODE_COUNT - 1);
-        for (auto const& item : splitStr(parts[2], ';')) {
-            size_t c1 = item.find(',');
-            size_t c2 = c1 == std::string::npos ? c1 : item.find(',', c1 + 1);
-            if (c2 == std::string::npos) continue;
-            float a = roundPct(static_cast<float>(std::atof(item.substr(0, c1).c_str())));
-            float b = roundPct(static_cast<float>(std::atof(item.substr(c1 + 1, c2 - c1 - 1).c_str())));
-            ls.secs.push_back({a, std::max(a, b), item.substr(c2 + 1)});
+    // v2.23 unlocked FPS: GD runs round(max(1, frameTime * 240)) physics steps per frame,
+    // so only 60 / 120 / 240 FPS give 240 steps a second (144 FPS -> 288, 360 FPS -> 360).
+    // Every window in this mod was written in 240-per-second ticks, so at other frame rates
+    // it covered the wrong amount of time (at 360 FPS the cube's look-ahead ended before a
+    // jump could land, so every click looked like a death). `st()` converts a 240-tick
+    // amount into physics steps at the current rate. At 60 / 120 / 240 FPS it changes nothing.
+    float stepScale() {
+        float dt = buf.tickLength;
+        if (!(dt > 0.001f && dt < 2.f)) {
+            return 1.f;
         }
-        break;
+        return std::clamp(TICK / dt, 0.25f, 8.f);
     }
-    return ls;
-}
 
-static void saveLevelSections(int id, LevelSections const& ls) {
-    std::string raw = Mod::get()->getSavedValue<std::string>("level-sections", "");
-    std::string out;
-    for (auto const& line : splitStr(raw, '\n')) {
-        if (line.empty()) continue;
-        auto parts = splitStr(line, '\t');
-        if (!parts.empty() && std::atoi(parts[0].c_str()) == id) continue;
-        out += line;
-        out += '\n';
-    }
-    if (!ls.secs.empty() || ls.emptyMode != 0) {
-        out += std::to_string(id) + '\t' + std::to_string(ls.emptyMode) + '\t';
-        for (size_t i = 0; i < ls.secs.size(); i++) {
-            if (i) out += ';';
-            out += fmtPct(ls.secs[i].start) + ',' + fmtPct(ls.secs[i].end) + ',' + ls.secs[i].data;
+    int st(int ticks240) {
+        if (ticks240 <= 0) {
+            return ticks240;
         }
-        out += '\n';
-    }
-    Mod::get()->setSavedValue<std::string>("level-sections", out);
-}
-
-// Runtime state for the level being played.
-static bool g_secActive = false;
-static LevelSections g_sec;      // sorted copy
-static std::string g_secToken;   // what is currently applied
-static float g_lastDeathPct = -1.f;
-
-static std::string snapshotData() {
-    return Mod::get()->getSavedValue<std::string>("restore-snapshot", "");
-}
-
-static void ensureSnapshot() {
-    if (snapshotData().empty()) {
-        Mod::get()->setSavedValue<std::string>("restore-snapshot", serializeProfile());
-    }
-}
-
-static std::string emptyToken() {
-    return g_sec.emptyMode == 1 ? "N" : (g_sec.emptyMode == 2 ? "O" : "B");
-}
-
-// Which section covers this percent. The one that starts last wins.
-static std::string sectionToken(float pct) {
-    int idx = -1;
-    for (size_t i = 0; i < g_sec.secs.size(); i++) {
-        auto const& s = g_sec.secs[i];
-        if (s.data.empty()) continue;
-        bool inside = pct + 0.0001f >= s.start && (pct < s.end - 0.0001f || s.end >= 99.995f);
-        if (inside) idx = static_cast<int>(i);
-    }
-    return idx >= 0 ? "S:" + std::to_string(idx) : emptyToken();
-}
-
-static void applyToken(std::string const& tok, int levelID) {
-    if (tok == "O") { applyProfileData(OFF_PROFILE); return; }
-    if (tok.rfind("S:", 0) == 0) {
-        size_t i = static_cast<size_t>(std::atoi(tok.c_str() + 2));
-        if (i < g_sec.secs.size()) applyProfileData(g_sec.secs[i].data);
-        return;
-    }
-    if (tok == "B") {
-        std::string name = levelProfileFor(levelID);
-        if (!name.empty() && applyProfileByName(name)) return;
-    }
-    std::string snap = snapshotData();
-    if (!snap.empty()) applyProfileData(snap);
-}
-
-// Call after the sections of the current level were edited.
-static void reloadSectionsRuntime() {
-    int id = currentLevelID();
-    if (id == 0) return;
-    bool wasActive = g_secActive;
-    LevelSections ls = loadLevelSections(id);
-    sortSections(ls);
-    bool on = Mod::get()->getSettingValue<bool>("sections") && !ls.secs.empty();
-    g_sec = ls;
-    g_secActive = on;
-    g_secToken.clear();
-    if (on) ensureSnapshot();
-    else if (wasActive) applyToken("B", id);
-}
-
-// A new section starts at `start`, ends where the next one starts (or at the
-// end of the level), and begins as a copy of the current settings.
-static Section newSection(LevelSections const& ls, float start) {
-    float end = 100.f;
-    for (auto const& s : ls.secs) {
-        if (s.start > start + 0.005f) end = std::min(end, s.start);
-    }
-    return {start, end, serializeProfile()};
-}
-
-static void addSectionHere() {
-    auto pl = PlayLayer::get();
-    int id = currentLevelID();
-    if (!pl || id == 0) return;
-    float pct = roundPct(pl->getCurrentPercent());
-    LevelSections ls = loadLevelSections(id);
-    for (auto const& s : ls.secs) {
-        if (std::fabs(s.start - pct) < 0.005f) return;
-    }
-    ls.secs.push_back(newSection(ls, pct));
-    sortSections(ls);
-    saveLevelSections(id, ls);
-    reloadSectionsRuntime();
-    std::string msg = "Section added at " + fmtPct(pct) + "%";
-    Notification::create(msg.c_str(), NotificationIcon::Success, 1.5f)->show();
-}
-
-// Small window that asks where a new section should start.
-class AddSectionPopup : public geode::Popup {
-protected:
-    std::function<void(float)> m_pick;
-    TextInput* m_input = nullptr;
-    CCLabelBMFont* m_status = nullptr;
-
-    bool init(std::function<void(float)> pick) {
-        if (!Popup::init(300.f, 190.f)) return false;
-        m_pick = std::move(pick);
-        this->setTitle("Add a section");
-
-        auto label = CCLabelBMFont::create("Where should it start?", "bigFont.fnt");
-        label->setScale(0.4f);
-        m_mainLayer->addChildAtPosition(label, Anchor::Center, {0.f, 50.f});
-
-        m_input = TextInput::create(100.f, "Type %");
-        m_input->setFilter("0123456789.");
-        m_input->setMaxCharCount(6);
-        m_input->setScale(0.8f);
-        m_mainLayer->addChildAtPosition(m_input, Anchor::Center, {-50.f, 24.f});
-        button("Add", 70.f, 24.f, menu_selector(AddSectionPopup::onTyped));
-
-        std::string death = g_lastDeathPct >= 0.f
-            ? "Last death: " + fmtPct(roundPct(g_lastDeathPct)) + "%"
-            : "Last death: none yet";
-        button(death.c_str(), 0.f, -10.f, menu_selector(AddSectionPopup::onDeath));
-
-        auto pl = PlayLayer::get();
-        std::string now = pl
-            ? "Current position: " + fmtPct(roundPct(pl->getCurrentPercent())) + "%"
-            : "Current position: unavailable";
-        button(now.c_str(), 0.f, -42.f, menu_selector(AddSectionPopup::onNow));
-
-        m_status = CCLabelBMFont::create("", "bigFont.fnt");
-        m_status->setScale(0.3f);
-        m_mainLayer->addChildAtPosition(m_status, Anchor::Center, {0.f, -70.f});
-        return true;
+        return std::max(1, static_cast<int>(std::lround(ticks240 * stepScale())));
     }
 
-    void button(char const* s, float x, float y, SEL_MenuHandler cb) {
-        auto spr = ButtonSprite::create(s);
-        spr->setScale(0.55f);
-        auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
-        m_buttonMenu->addChildAtPosition(btn, Anchor::Center, {x, y});
+    // v2.4 moving-object guard: last known position of each object the ghost collided with.
+    struct Watched {
+        double x;
+        double y;
+        int movedTick;
+        double vx = 0.0;  // v2.27: movement per physics step while it's moving
+        double vy = 0.0;
+        double pvx = 0.0;  // v2.68: the step before (curved paths: how the direction turns)
+        double pvy = 0.0;
+        double rot = 0.0;  // v2.68: rotation, and how much it turns per step
+        double vrot = 0.0;
+    };
+    constexpr int MOVER_TICKS = 120;
+    constexpr size_t WATCH_LIMIT = 4096;
+    std::unordered_map<GameObject*, Watched> watched;
+
+    // v2.4 drift check: the recorded ghost run for your last input and how far you strayed.
+    struct Drift {
+        std::vector<CCPoint> path;
+        bool active = false;
+        int index = -1;
+        int compared = 0;
+        float maxErr = 0.f;
+        int maxAt = 0;
+    } drift;
+
+    constexpr float PANEL_W = 320.f;
+    constexpr float PANEL_H = 178.f;
+
+    // Log line colors: saves green, orbs cyan, auto-release purple, misses grey,
+    // budget / skips orange, drift yellow.
+    ccColor3B lineColor(std::string const& line) {
+        auto starts = [&](char const* prefix) { return line.rfind(prefix, 0) == 0; };
+        if (starts("SAVED") || starts("MORE TIME")) return { 120, 255, 140 };
+        if (starts("ORB") || starts("orb")) return { 90, 220, 255 };
+        if (starts("AUTO")) return { 200, 150, 255 };
+        if (starts("no save")) return { 175, 175, 190 };
+        if (starts("skip") || starts("prediction budget")) return { 255, 180, 80 };
+        if (starts("drift")) return { 255, 240, 150 };
+        if (starts("ghost killed") || starts("  hitbox")) return { 255, 120, 120 };
+        if (starts("perf")) return { 150, 200, 255 };
+        if (starts("F6") || starts("v2") || starts("path") || starts("Click") || starts("CBF")) return { 255, 215, 90 };
+        if (starts("pass")) return { 140, 150, 170 };
+        if (starts("memory")) return { 255, 150, 220 };
+        if (starts("console")) return { 150, 255, 200 };
+        return { 255, 255, 255 };
     }
 
-    void choose(float pct) {
-        auto pick = m_pick;
-        this->onClose(nullptr);
-        if (pick) pick(roundPct(pct));
-    }
-
-public:
-    static AddSectionPopup* create(std::function<void(float)> pick) {
-        auto ret = new AddSectionPopup();
-        if (ret->init(std::move(pick))) {
-            ret->autorelease();
-            return ret;
-        }
-        delete ret;
-        return nullptr;
-    }
-
-    void onTyped(CCObject*) {
-        std::string s = m_input->getString();
-        if (s.empty()) { m_status->setString("Type a percentage first."); return; }
-        float v = static_cast<float>(std::atof(s.c_str()));
-        if (v < 0.f || v > 100.f) { m_status->setString("Use a number from 0 to 100."); return; }
-        choose(v);
-    }
-
-    void onDeath(CCObject*) {
-        if (g_lastDeathPct < 0.f) { m_status->setString("You haven't died in this level yet."); return; }
-        choose(g_lastDeathPct);
-    }
-
-    void onNow(CCObject*) {
-        auto pl = PlayLayer::get();
-        if (!pl) { m_status->setString("Open this from inside a level."); return; }
-        choose(pl->getCurrentPercent());
-    }
-};
-
-// The window where sections are edited. Every section keeps its own copy of
-// the settings, which can be changed here without leaving the window.
-class SectionsPopup : public geode::Popup {
-protected:
-    int m_levelID = 0;
-    LevelSections m_ls;
-    int m_idx = 0;
-    int m_page = 0; // 0 window, 1 modes, 2 styles, 3 more
-    bool m_updating = false;
-    std::vector<std::string> m_names;
-    int m_copySel = 0;
-    std::vector<CCNode*> m_pageNodes;
-    TextInput* m_startInput = nullptr;
-    TextInput* m_endInput = nullptr;
-    TextInput* m_copyInput = nullptr;
-    CCLabelBMFont* m_idxLabel = nullptr;
-    CCLabelBMFont* m_nameLabel = nullptr;
-    CCLabelBMFont* m_emptyLabel = nullptr;
-    CCLabelBMFont* m_status = nullptr;
-
-    CCLabelBMFont* text(char const* s, float x, float y, float scale, bool leftAlign = false, bool onPage = false) {
-        auto label = CCLabelBMFont::create(s, "bigFont.fnt");
-        label->setScale(scale);
-        if (leftAlign) label->setAnchorPoint({0.f, 0.5f});
-        m_mainLayer->addChildAtPosition(label, Anchor::Center, {x, y});
-        if (onPage) m_pageNodes.push_back(label);
-        return label;
-    }
-
-    CCMenuItemSpriteExtra* button(char const* s, float x, float y, SEL_MenuHandler cb, float scale = 0.6f) {
-        auto spr = ButtonSprite::create(s);
-        spr->setScale(scale);
-        auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
-        m_buttonMenu->addChildAtPosition(btn, Anchor::Center, {x, y});
-        return btn;
-    }
-
-    CCMenuItemSpriteExtra* arrow(bool flip, float x, float y, SEL_MenuHandler cb, int tag = 0, bool onPage = false) {
-        auto spr = CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png");
-        spr->setScale(0.5f);
-        spr->setFlipX(flip);
-        auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
-        btn->setTag(tag);
-        m_buttonMenu->addChildAtPosition(btn, Anchor::Center, {x, y});
-        if (onPage) m_pageNodes.push_back(btn);
-        return btn;
-    }
-
-    TextInput* input(float w, char const* hint, char const* filter, int maxChars, float x, float y, bool onPage) {
-        auto in = TextInput::create(w, hint);
-        in->setFilter(filter);
-        in->setMaxCharCount(maxChars);
-        m_mainLayer->addChildAtPosition(in, Anchor::Center, {x, y});
-        if (onPage) m_pageNodes.push_back(in);
-        return in;
-    }
-
-    bool init(int levelID) {
-        if (!Popup::init(400.f, 290.f)) return false;
-        m_levelID = levelID;
-        bool sectionsOn = Mod::get()->getSettingValue<bool>("sections");
-        this->setTitle(sectionsOn ? "Sections (Experimental)" : "Sections are OFF");
-        m_names = loadProfileNames();
-        m_ls = loadLevelSections(levelID);
-        sortSections(m_ls);
-
-        m_idxLabel = text("", 0.f, 106.f, 0.45f);
-        arrow(false, -95.f, 106.f, menu_selector(SectionsPopup::onPrev));
-        arrow(true, 95.f, 106.f, menu_selector(SectionsPopup::onNext));
-
-        text("Starts at %", -190.f, 80.f, 0.35f, true);
-        m_startInput = input(70.f, "0.00", "0123456789.", 6, -95.f, 80.f, false);
-        m_startInput->setCallback([this](std::string const& s) {
-            if (m_updating || m_ls.secs.empty()) return;
-            auto& sec = m_ls.secs[m_idx];
-            sec.start = roundPct(static_cast<float>(std::atof(s.c_str())));
-            if (sec.end < sec.start) sec.end = sec.start;
-            this->commit();
-        });
-        m_startInput->setScale(0.8f);
-        text("Ends at %", 0.f, 80.f, 0.35f, true);
-        m_endInput = input(70.f, "100.00", "0123456789.", 6, 95.f, 80.f, false);
-        m_endInput->setCallback([this](std::string const& s) {
-            if (m_updating || m_ls.secs.empty()) return;
-            auto& sec = m_ls.secs[m_idx];
-            sec.end = std::max(sec.start, roundPct(static_cast<float>(std::atof(s.c_str()))));
-            this->commit();
-        });
-        m_endInput->setScale(0.8f);
-
-        button("Window", -135.f, 54.f, menu_selector(SectionsPopup::onPageWindow), 0.5f);
-        button("Modes", -45.f, 54.f, menu_selector(SectionsPopup::onPageModes), 0.5f);
-        button("Styles", 40.f, 54.f, menu_selector(SectionsPopup::onPageStyles), 0.5f);
-        button("More", 125.f, 54.f, menu_selector(SectionsPopup::onPageMore), 0.5f);
-
-        button("Add", -165.f, 106.f, menu_selector(SectionsPopup::onAdd), 0.5f);
-        button("Delete", 165.f, 106.f, menu_selector(SectionsPopup::onDelete), 0.5f);
-        m_status = text("", 0.f, 32.f, 0.27f);
-
-
-        this->refresh();
-        this->defaultStatus();
-        this->buildPage();
-        return true;
-    }
-
-    // Saves the edits and updates the running level.
-    void commit() {
-        saveLevelSections(m_levelID, m_ls);
-        reloadSectionsRuntime();
-    }
-
-    Section* current() {
-        if (m_ls.secs.empty() || m_idx < 0 || m_idx >= static_cast<int>(m_ls.secs.size())) return nullptr;
-        return &m_ls.secs[m_idx];
-    }
-
-    // Name and short label for the cycling rows (tag = row * 2 + direction).
-    void cycleRow(char const* label, int row, std::string const& value, float y) {
-        text(label, -190.f, y, 0.4f, true, true);
-        arrow(false, -10.f, y, menu_selector(SectionsPopup::onCycle), row * 2, true);
-        text(value.c_str(), 70.f, y, 0.4f, false, true);
-        arrow(true, 150.f, y, menu_selector(SectionsPopup::onCycle), row * 2 + 1, true);
-    }
-
-    void tickInput(char const* label, char const* key, float lx, float ix, float y, std::string const& val, bool isTps) {
-        text(label, lx, y, 0.4f, true, true);
-        auto in = input(80.f, "-1", isTps ? "0123456789" : "-0123456789", isTps ? 5 : 4, ix, y, true);
-        in->setScale(0.7f);
-        in->setString(val);
-        std::string k = key;
-        in->setCallback([this, k, isTps](std::string const& s) {
-            if (m_updating) return;
-            auto sec = current();
-            if (!sec || s.empty() || s == "-") return;
-            int v = std::atoi(s.c_str());
-            v = isTps ? std::clamp(v, TPS_MIN, TPS_MAX) : std::clamp(v, -1, 1000);
-            sec->data = profSet(sec->data, k, std::to_string(v));
-            this->commit();
-        });
-    }
-
-    // Rebuilds the settings area for the current section and page.
-    void buildPage() {
-        m_updating = true;
-        for (auto n : m_pageNodes) n->removeFromParent();
-        m_pageNodes.clear();
-        m_nameLabel = nullptr;
-        m_emptyLabel = nullptr;
-        m_copyInput = nullptr;
-        if (m_page == 3) {
-            buildMore();
-            m_updating = false;
+    // In-game console (F9): current stage + the same live log the Windows console shows.
+    // Hidden by default; only touched when open, so it costs nothing while closed.
+    void refreshPanel() {
+        if (!buf.panel) {
             return;
         }
-        auto sec = current();
-        if (m_levelID == 0 || !sec) {
-            text("Add a section to edit its settings.", 0.f, 0.f, 0.4f, false, true);
-            m_updating = false;
+        buf.panel->setVisible(buf.panelOpen);
+        if (!buf.panelOpen) {
             return;
         }
-        std::string const& d = sec->data;
-        if (m_page == 0) {
-            cycleRow("Main window", 0, profGet(d, "stage", "4 ticks"), 8.f);
-            tickInput("Game speed (TPS)", "tps-value", -190.f, 70.f, -24.f, profGet(d, "tps-value", "240"), true);
-            cycleRow("Dual mode", 5, profGet(d, "dual-mode", "0") == "1" ? "On" : "Off", -56.f);
-        } else if (m_page == 1) {
-            static constexpr char const* NAMES[] = {"Cube", "Ball", "Robot", "Spider", "Ship", "UFO", "Swing", "Wave"};
-            for (int i = 0; i < 8; i++) {
-                int col = i / 4, row = i % 4;
-                float y = 8.f - 32.f * row;
-                tickInput(NAMES[i], MODE_KEYS[i], col ? 10.f : -190.f, col ? 100.f : -100.f, y, profGet(d, MODE_KEYS[i], "-1"), false);
+        buf.panelTitle->setString(stageText().c_str());
+        buf.panelTitle->limitLabelWidth(PANEL_W - 20.f, 0.4f, 0.2f);
+        size_t first = buf.logLines.size() > buf.panelLines.size() ? buf.logLines.size() - buf.panelLines.size() : 0;
+        for (size_t i = 0; i < buf.panelLines.size(); ++i) {
+            auto* label = buf.panelLines[i];
+            size_t at = first + i;
+            if (at < buf.logLines.size()) {
+                auto const& line = buf.logLines[at];
+                label->setString(line.c_str());
+                label->setColor(lineColor(line));
+                label->limitLabelWidth(PANEL_W - 20.f, 0.55f, 0.3f);
             }
-        } else {
-            cycleRow("Wave", 1, profGet(d, "wave-mode", "Grid"), 8.f);
-            cycleRow("Ship", 2, profGet(d, "ship-style", "Min Hold"), -24.f);
-            cycleRow("UFO", 3, profGet(d, "ufo-style", "Min Hold"), -56.f);
-            cycleRow("Swing", 4, profGet(d, "swing-style", "Min Hold"), -88.f);
-        }
-        m_updating = false;
-    }
-
-    void updateMoreLabels() {
-        if (m_nameLabel) {
-            std::string nm = m_names.empty() ? "(none saved)" : m_names[std::clamp(m_copySel, 0, static_cast<int>(m_names.size()) - 1)];
-            m_nameLabel->setString(nm.c_str());
-        }
-        if (m_emptyLabel) {
-            std::string e = std::string("Empty parts use: ") + EMPTY_MODE_NAMES[m_ls.emptyMode];
-            m_emptyLabel->setString(e.c_str());
-        }
-    }
-
-    // The "More" page: copy a saved profile in, choose what empty parts use,
-    // and copy the sections to another level.
-    void buildMore() {
-        text("Copy settings from a saved profile", -190.f, 12.f, 0.33f, true, true);
-        arrow(false, -60.f, -12.f, menu_selector(SectionsPopup::onNamePrev), 0, true);
-        m_nameLabel = text("", 20.f, -12.f, 0.4f, false, true);
-        arrow(true, 100.f, -12.f, menu_selector(SectionsPopup::onNameNext), 0, true);
-        m_pageNodes.push_back(button("Load", 160.f, -12.f, menu_selector(SectionsPopup::onLoadProfile), 0.5f));
-
-        m_emptyLabel = text("", -190.f, -46.f, 0.36f, true, true);
-        m_pageNodes.push_back(button("Change", 150.f, -46.f, menu_selector(SectionsPopup::onEmptyMode), 0.5f));
-
-        text("Copy these sections to another level", -190.f, -74.f, 0.33f, true, true);
-        m_copyInput = input(100.f, "Level ID", "0123456789", 10, -120.f, -98.f, true);
-        m_copyInput->setScale(0.75f);
-        m_pageNodes.push_back(button("Copy sections", 0.f, -98.f, menu_selector(SectionsPopup::onCopy), 0.5f));
-        text("Recommended: build on a copy of the level, then copy to the main level.", 0.f, -124.f, 0.25f, false, true);
-        updateMoreLabels();
-    }
-
-    void defaultStatus() {
-        if (!Mod::get()->getSettingValue<bool>("sections")) {
-            m_status->setString("OFF: turn on in Buffer > Advanced");
-            m_status->setColor({255, 120, 120});
-            return;
-        }
-        m_status->setColor({255, 255, 255});
-        m_status->setString("Add: type a %, last death, or current position");
-    }
-
-    void refresh() {
-        m_updating = true;
-        int n = static_cast<int>(m_ls.secs.size());
-        if (m_idx >= n) m_idx = n - 1;
-        if (m_idx < 0) m_idx = 0;
-        if (m_levelID == 0) {
-            m_idxLabel->setString("Open from inside a level");
-            m_startInput->setString("");
-            m_endInput->setString("");
-        } else if (n == 0) {
-            m_idxLabel->setString("No sections yet");
-            m_startInput->setString("");
-            m_endInput->setString("");
-        } else {
-            std::string s = "Section " + std::to_string(m_idx + 1) + " / " + std::to_string(n);
-            m_idxLabel->setString(s.c_str());
-            m_startInput->setString(fmtPct(m_ls.secs[m_idx].start));
-            m_endInput->setString(fmtPct(m_ls.secs[m_idx].end));
-        }
-        updateMoreLabels();
-        m_updating = false;
-    }
-
-public:
-    static SectionsPopup* create(int levelID) {
-        auto ret = new SectionsPopup();
-        if (ret->init(levelID)) {
-            ret->autorelease();
-            return ret;
-        }
-        delete ret;
-        return nullptr;
-    }
-
-    void onPrev(CCObject*) {
-        int n = static_cast<int>(m_ls.secs.size());
-        if (n == 0) return;
-        m_idx = (m_idx - 1 + n) % n;
-        refresh();
-        defaultStatus();
-        buildPage();
-    }
-
-    void onNext(CCObject*) {
-        int n = static_cast<int>(m_ls.secs.size());
-        if (n == 0) return;
-        m_idx = (m_idx + 1) % n;
-        refresh();
-        defaultStatus();
-        buildPage();
-    }
-
-    void onPageWindow(CCObject*) { m_page = 0; defaultStatus(); buildPage(); }
-    void onPageModes(CCObject*) {
-        m_page = 1;
-        m_status->setString("-1 = main window, 0 = off");
-        buildPage();
-    }
-    void onPageMore(CCObject*) { m_page = 3; defaultStatus(); buildPage(); }
-    void onPageStyles(CCObject*) { m_page = 2; defaultStatus(); buildPage(); }
-
-    // Arrow on a cycling row. Tag = row * 2 + (1 for next, 0 for previous).
-    void onCycle(CCObject* sender) {
-        auto sec = current();
-        if (!sec) return;
-        int tag = static_cast<CCNode*>(sender)->getTag();
-        int row = tag / 2;
-        int dir = (tag % 2) ? 1 : -1;
-        std::string& d = sec->data;
-        if (row == 0) {
-            int cur = indexOf(STAGE_NAMES, STAGE_COUNT, profGet(d, "stage", "4 ticks"), 1);
-            d = profSet(d, "stage", STAGE_NAMES[(cur + dir + STAGE_COUNT) % STAGE_COUNT]);
-        } else if (row == 5) {
-            d = profSet(d, "dual-mode", profGet(d, "dual-mode", "0") == "1" ? "0" : "1");
-        } else {
-            std::string key = row == 1 ? "wave-mode" : FLY_STYLE_KEYS[row - 2];
-            int cur = indexOf(WAVE_NAMES, WAVE_MODE_COUNT, profGet(d, key, row == 1 ? "Grid" : "Min Hold"), 0);
-            d = profSet(d, key, WAVE_NAMES[(cur + dir + WAVE_MODE_COUNT) % WAVE_MODE_COUNT]);
-        }
-        commit();
-        buildPage();
-    }
-
-    void onNamePrev(CCObject*) {
-        if (m_names.empty()) return;
-        int n = static_cast<int>(m_names.size());
-        m_copySel = (m_copySel - 1 + n) % n;
-        refresh();
-    }
-
-    void onNameNext(CCObject*) {
-        if (m_names.empty()) return;
-        int n = static_cast<int>(m_names.size());
-        m_copySel = (m_copySel + 1) % n;
-        refresh();
-    }
-
-    // Copies a saved profile's settings into the current section.
-    void onLoadProfile(CCObject*) {
-        auto sec = current();
-        if (!sec) { m_status->setString("Add a section first."); return; }
-        if (m_names.empty()) { m_status->setString("No saved profiles yet."); return; }
-        std::string name = m_names[std::clamp(m_copySel, 0, static_cast<int>(m_names.size()) - 1)];
-        std::string data = Mod::get()->getSavedValue<std::string>(profileDataKey(name), "");
-        if (data.empty()) { m_status->setString("Could not load that profile."); return; }
-        for (auto const& item : splitStr(data, '|')) {
-            size_t eq = item.find('=');
-            if (eq == std::string::npos) continue;
-            sec->data = profSet(sec->data, item.substr(0, eq), item.substr(eq + 1));
-        }
-        commit();
-        buildPage();
-        m_status->setString(("Loaded '" + name + "'.").c_str());
-    }
-
-    // Add asks where the new section should start.
-    void onAdd(CCObject*) {
-        if (m_levelID == 0) { m_status->setString("Open this from inside a level."); return; }
-        auto popup = AddSectionPopup::create([this](float pct) { this->addAt(pct); });
-        if (popup) popup->show();
-    }
-
-    void addAt(float start) {
-        start = roundPct(start);
-        for (auto const& s : m_ls.secs) {
-            if (std::fabs(s.start - start) < 0.005f) { m_status->setString("A section already starts there."); return; }
-        }
-        m_ls.secs.push_back(newSection(m_ls, start));
-        sortSections(m_ls);
-        for (size_t i = 0; i < m_ls.secs.size(); i++) {
-            if (std::fabs(m_ls.secs[i].start - start) < 0.005f) m_idx = static_cast<int>(i);
-        }
-        commit();
-        refresh();
-        m_status->setString("Section added.");
-        buildPage();
-    }
-
-    void onDelete(CCObject*) {
-        if (!current()) return;
-        m_ls.secs.erase(m_ls.secs.begin() + m_idx);
-        commit();
-        refresh();
-        m_status->setString("Section deleted.");
-        buildPage();
-    }
-
-    void onEmptyMode(CCObject*) {
-        m_ls.emptyMode = (m_ls.emptyMode + 1) % EMPTY_MODE_COUNT;
-        commit();
-        refresh();
-    }
-
-    // Copies these sections (and the level's linked profile) to another level.
-    void onCopy(CCObject*) {
-        int target = std::atoi(m_copyInput->getString().c_str());
-        if (target <= 0) { m_status->setString("Type the level ID to copy to."); return; }
-        if (target == m_levelID) { m_status->setString("That is this level."); return; }
-        if (m_ls.secs.empty()) { m_status->setString("There are no sections to copy."); return; }
-        saveLevelSections(target, m_ls);
-        std::string linked = levelProfileFor(m_levelID);
-        if (!linked.empty()) setLevelProfile(target, linked);
-        std::string msg = "Copied " + std::to_string(m_ls.secs.size()) + " sections to level " + std::to_string(target) + ".";
-        m_status->setString(msg.c_str());
-    }
-
-    void onClose(CCObject* sender) {
-        // Sections only take their final order once the window is closed.
-        sortSections(m_ls);
-        commit();
-        Popup::onClose(sender);
-    }
-};
-
-// Opens the Sections window. If sections are switched off, a message says so.
-static void openSectionsWindow(int levelID) {
-    if (auto p = SectionsPopup::create(levelID)) p->show();
-    if (!Mod::get()->getSettingValue<bool>("sections")) {
-        FLAlertLayer::create(
-            "Sections are off",
-            "Level sections are turned off, so nothing you set here will be used.\n\nTurn on <cy>Level sections</c> in <cy>Buffer > Advanced</c> to use them.",
-            "OK"
-        )->show();
-    }
-}
-
-class ProfilesPopup : public geode::Popup {
-protected:
-    TextInput* m_nameInput = nullptr;
-    CCLabelBMFont* m_selLabel = nullptr;
-    CCLabelBMFont* m_levelLabel = nullptr;
-    CCLabelBMFont* m_status = nullptr;
-    std::vector<std::string> m_names;
-    int m_sel = -1;
-    int m_levelID = 0;
-
-    bool init(int levelID) {
-        if (!Popup::init(360.f, 260.f)) return false;
-        m_levelID = levelID;
-        this->setTitle("Profiles");
-
-        m_names = loadProfileNames();
-        if (!m_names.empty()) {
-            m_sel = 0;
-            std::string linked = levelProfileFor(levelID);
-            for (size_t i = 0; i < m_names.size(); i++) {
-                if (m_names[i] == linked) m_sel = static_cast<int>(i);
+            else {
+                label->setString("");
             }
         }
-
-        auto text = [&](char const* s, float x, float y, float scale) {
-            auto label = CCLabelBMFont::create(s, "bigFont.fnt");
-            label->setScale(scale);
-            m_mainLayer->addChildAtPosition(label, Anchor::Center, {x, y});
-            return label;
-        };
-        auto button = [&](char const* s, float x, float y, SEL_MenuHandler cb) {
-            auto spr = ButtonSprite::create(s);
-            spr->setScale(0.6f);
-            auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
-            m_buttonMenu->addChildAtPosition(btn, Anchor::Center, {x, y});
-        };
-
-        button("Sections", 125.f, 100.f, menu_selector(ProfilesPopup::onSections));
-        text("Saved profile", 0.f, 88.f, 0.45f);
-        m_selLabel = text("", 0.f, 62.f, 0.6f);
-
-        auto left = CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png");
-        left->setScale(0.6f);
-        auto leftBtn = CCMenuItemSpriteExtra::create(left, this, menu_selector(ProfilesPopup::onPrev));
-        m_buttonMenu->addChildAtPosition(leftBtn, Anchor::Center, {-125.f, 62.f});
-
-        auto right = CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png");
-        right->setScale(0.6f);
-        right->setFlipX(true);
-        auto rightBtn = CCMenuItemSpriteExtra::create(right, this, menu_selector(ProfilesPopup::onNext));
-        m_buttonMenu->addChildAtPosition(rightBtn, Anchor::Center, {125.f, 62.f});
-
-        button("Load", -55.f, 30.f, menu_selector(ProfilesPopup::onLoad));
-        button("Delete", 55.f, 30.f, menu_selector(ProfilesPopup::onDelete));
-
-        text("Save current settings as:", 0.f, 2.f, 0.4f);
-        m_nameInput = TextInput::create(190.f, "Profile name");
-        m_nameInput->setFilter("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -_");
-        m_nameInput->setMaxCharCount(20);
-        m_mainLayer->addChildAtPosition(m_nameInput, Anchor::Center, {-45.f, -22.f});
-        button("Save", 120.f, -22.f, menu_selector(ProfilesPopup::onSave));
-
-        m_levelLabel = text("", 0.f, -58.f, 0.4f);
-        button("Use for this level", -70.f, -86.f, menu_selector(ProfilesPopup::onLink));
-        button("Clear", 85.f, -86.f, menu_selector(ProfilesPopup::onUnlink));
-
-        m_status = text("", 0.f, -115.f, 0.4f);
-
-        this->refresh();
-        return true;
     }
 
-    void refresh() {
-        if (m_sel >= 0 && m_sel < static_cast<int>(m_names.size())) {
-            m_selLabel->setString(m_names[m_sel].c_str());
-        } else {
-            m_selLabel->setString("(none saved)");
+    // Log line -> in-game panel history, plus the Windows console if enabled.
+    // (Formatting a short string is cheap; it was the synchronous console writes
+    //  that hitched, and those still only happen with the console setting on.)
+    // v2.29: the full log (not just the 8 lines on screen) for the F8 export, with the
+    // physics step each line happened on.
+    constexpr size_t EXPORT_LINES = 400;
+    std::deque<std::string> exportLines;
+    int logClock = 0;  // physics steps since the level started, kept by the update hook
+
+    template <class... Args>
+    void say(fmt::format_string<Args...> f, Args&&... args) {
+        auto msg = fmt::format(f, std::forward<Args>(args)...);
+        exportLines.push_back(fmt::format("[{:>6}] {}", logClock, msg));
+        while (exportLines.size() > EXPORT_LINES) {
+            exportLines.pop_front();
         }
-        if (m_levelID == 0) {
-            m_levelLabel->setString("Open this from inside a level to link a profile");
-        } else {
-            std::string n = levelProfileFor(m_levelID);
-            std::string s = "This level uses: " + (n.empty() ? std::string("your current settings") : n);
-            m_levelLabel->setString(s.c_str());
+        buf.logLines.push_back(msg);
+        while (buf.logLines.size() > PANEL_LINES) {
+            buf.logLines.pop_front();
         }
-    }
-
-    void setStatus(std::string const& s) { m_status->setString(s.c_str()); }
-
-    std::string selectedName() const {
-        if (m_sel < 0 || m_sel >= static_cast<int>(m_names.size())) return "";
-        return m_names[m_sel];
-    }
-
-public:
-    static ProfilesPopup* create(int levelID) {
-        auto ret = new ProfilesPopup();
-        if (ret->init(levelID)) {
-            ret->autorelease();
-            return ret;
+        if (buf.console) {
+            std::printf("[InputBuffer] %s\n", msg.c_str());
         }
-        delete ret;
-        return nullptr;
+        // v2.71: redrawn once per physics step instead of on every line (a click that logs
+        // 4 lines rebuilt all 8 labels 4 times)
+        buf.panelDirty = buf.panelOpen;
     }
 
-    void onPrev(CCObject*) {
-        if (m_names.empty()) return;
-        int n = static_cast<int>(m_names.size());
-        m_sel = (m_sel - 1 + n) % n;
-        refresh();
+    bool isGhost(PlayerObject* p) {
+        return p && (p == buf.ghost1 || p == buf.ghost2);
     }
 
-    void onNext(CCObject*) {
-        if (m_names.empty()) return;
-        int n = static_cast<int>(m_names.size());
-        m_sel = (m_sel + 1) % n;
-        refresh();
+    void resetPending() {
+        buf.queue.clear();
+        buf.shift = 0;
+        buf.releaseShift = 0;
     }
 
-    void onLoad(CCObject*) {
-        std::string name = selectedName();
-        if (name.empty()) { setStatus("No profile selected."); return; }
-        if (applyProfileByName(name)) setStatus("Loaded '" + name + "'.");
-        else setStatus("Could not load that profile.");
-    }
-
-    void onDelete(CCObject*) {
-        std::string name = selectedName();
-        if (name.empty()) { setStatus("No profile selected."); return; }
-        Mod::get()->setSavedValue<std::string>(profileDataKey(name), "");
-        m_names.erase(m_names.begin() + m_sel);
-        saveProfileNames(m_names);
-        forgetProfileEverywhere(name);
-        if (m_sel >= static_cast<int>(m_names.size())) m_sel = static_cast<int>(m_names.size()) - 1;
-        setStatus("Deleted '" + name + "'.");
-        refresh();
-    }
-
-    void onSave(CCObject*) {
-        std::string name = m_nameInput->getString();
-        // trim spaces on both ends
-        size_t a = name.find_first_not_of(' ');
-        size_t b = name.find_last_not_of(' ');
-        name = a == std::string::npos ? std::string() : name.substr(a, b - a + 1);
-        if (name.empty()) { setStatus("Type a name first."); return; }
-
-        bool exists = std::find(m_names.begin(), m_names.end(), name) != m_names.end();
-        if (!exists) {
-            m_names.push_back(name);
-            saveProfileNames(m_names);
+    // v2.75: "F6", "G", "7", "None" -> key code (0 = unbound)
+    int parseKey(std::string name) {
+        for (auto& c : name) {
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         }
-        Mod::get()->setSavedValue<std::string>(profileDataKey(name), serializeProfile());
-        for (size_t i = 0; i < m_names.size(); i++) {
-            if (m_names[i] == name) m_sel = static_cast<int>(i);
+        if (name.size() >= 2 && name[0] == 'F') {
+            int n = std::atoi(name.c_str() + 1);
+            if (n >= 1 && n <= 12) {
+                return KEY_F1 + (n - 1);
+            }
         }
-        m_nameInput->setString("");
-        setStatus((exists ? "Updated '" : "Saved '") + name + "'.");
-        refresh();
-    }
-
-    void onLink(CCObject*) {
-        if (m_levelID == 0) { setStatus("Open this from inside a level."); return; }
-        std::string name = selectedName();
-        if (name.empty()) { setStatus("Pick a profile first."); return; }
-        setLevelProfile(m_levelID, name);
-        setStatus("This level will use '" + name + "'.");
-        refresh();
-    }
-
-    void onSections(CCObject*) {
-        openSectionsWindow(m_levelID);
-    }
-
-    void onUnlink(CCObject*) {
-        if (m_levelID == 0) { setStatus("Open this from inside a level."); return; }
-        setLevelProfile(m_levelID, "");
-        setStatus("Level profile cleared.");
-        refresh();
-    }
-};
-
-
-// ---- main popup: Basic and Advanced tabs --------------------------------
-static constexpr int PRESET_COUNT = 5;
-static constexpr char const* PRESET_NAMES[PRESET_COUNT] = {"Off", "Strict", "Standard", "Relaxed", "Very relaxed"};
-static constexpr char const* PRESET_STAGE[PRESET_COUNT] = {"Off", "2 ticks", "4 ticks", "8 ticks", "16 ticks"};
-static constexpr char const* PRESET_INFO[PRESET_COUNT] = {
-    "No buffering or timing help.",
-    "Remembers a click about half a frame early.",
-    "Remembers a click about 1 frame early. A good start.",
-    "Remembers a click about 2 frames early.",
-    "Remembers a click about 4 frames early. Very forgiving."
-};
-static constexpr char const* DEFAULT_PROFILE =
-    "stage=4 ticks|wave-mode=Grid|tps-value=240|cube-ticks=-1|ball-ticks=-1|robot-ticks=-1|spider-ticks=-1|"
-    "ship-ticks=-1|ufo-ticks=-1|swing-ticks=-1|wave-ticks=-1|dual-mode=0|"
-    "ship-style=Min Hold|ufo-style=Min Hold|swing-style=Min Hold";
-
-// Which quick setup matches the current settings, or -1 for custom.
-static int currentPreset() {
-    auto m = Mod::get();
-    for (auto key : MODE_KEYS) {
-        if (m->getSettingValue<int64_t>(key) != -1) return -1;
-    }
-    std::string stage = m->getSettingValue<std::string>("stage");
-    for (int i = 0; i < PRESET_COUNT; i++) {
-        if (stage == PRESET_STAGE[i]) return i;
-    }
-    return -1;
-}
-
-class BufferPopup : public geode::Popup {
-protected:
-    bool m_advanced = false;
-    int m_levelID = 0;
-    std::vector<CCNode*> m_tabNodes;
-    CCLabelBMFont* m_presetLabel = nullptr;
-    CCLabelBMFont* m_presetInfo = nullptr;
-    CCLabelBMFont* m_waveLabel = nullptr;
-    CCLabelBMFont* m_dualLabel = nullptr;
-    CCLabelBMFont* m_secLabel = nullptr;
-    CCLabelBMFont* m_note = nullptr;
-
-    bool init(int levelID) {
-        if (!Popup::init(360.f, 260.f)) return false;
-        m_levelID = levelID;
-        this->setTitle("Input Buffer");
-        tabButton("Basic", -60.f, menu_selector(BufferPopup::onTabBasic));
-        tabButton("Advanced", 60.f, menu_selector(BufferPopup::onTabAdvanced));
-        m_note = CCLabelBMFont::create("", "bigFont.fnt");
-        m_note->setScale(0.35f);
-        m_mainLayer->addChildAtPosition(m_note, Anchor::Center, {0.f, -122.f});
-        this->build();
-        return true;
-    }
-
-    void tabButton(char const* s, float x, SEL_MenuHandler cb) {
-        auto spr = ButtonSprite::create(s);
-        spr->setScale(0.6f);
-        auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
-        m_buttonMenu->addChildAtPosition(btn, Anchor::Center, {x, 76.f});
-    }
-
-    CCLabelBMFont* text(char const* s, float x, float y, float scale) {
-        auto label = CCLabelBMFont::create(s, "bigFont.fnt");
-        label->setScale(scale);
-        m_mainLayer->addChildAtPosition(label, Anchor::Center, {x, y});
-        m_tabNodes.push_back(label);
-        return label;
-    }
-
-    void button(char const* s, float x, float y, SEL_MenuHandler cb) {
-        auto spr = ButtonSprite::create(s);
-        spr->setScale(0.6f);
-        auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
-        m_buttonMenu->addChildAtPosition(btn, Anchor::Center, {x, y});
-        m_tabNodes.push_back(btn);
-    }
-
-    void arrow(bool flip, float x, float y, SEL_MenuHandler cb) {
-        auto spr = CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png");
-        spr->setScale(0.6f);
-        spr->setFlipX(flip);
-        auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
-        m_buttonMenu->addChildAtPosition(btn, Anchor::Center, {x, y});
-        m_tabNodes.push_back(btn);
-    }
-
-    // Rebuilds the content of the current tab.
-    void build() {
-        for (auto n : m_tabNodes) n->removeFromParent();
-        m_tabNodes.clear();
-        m_presetLabel = m_presetInfo = m_waveLabel = m_dualLabel = m_secLabel = nullptr;
-        m_note->setString("");
-
-        if (!m_advanced) {
-            text("Quick setup", 0.f, 48.f, 0.45f);
-            m_presetLabel = text("", 0.f, 26.f, 0.6f);
-            arrow(false, -125.f, 26.f, menu_selector(BufferPopup::onPresetPrev));
-            arrow(true, 125.f, 26.f, menu_selector(BufferPopup::onPresetNext));
-            m_presetInfo = text("", 0.f, 4.f, 0.35f);
-
-            text("Game speed (TPS)", 0.f, -24.f, 0.45f);
-            auto input = TextInput::create(100.f, "240");
-            input->setFilter("0123456789");
-            input->setMaxCharCount(5);
-            input->setString(std::to_string(g_tps));
-            input->setCallback([](std::string const& s) {
-                if (s.empty()) return;
-                int v = std::clamp(std::atoi(s.c_str()), TPS_MIN, TPS_MAX);
-                Mod::get()->setSettingValue<int64_t>("tps-value", static_cast<int64_t>(v));
-            });
-            m_mainLayer->addChildAtPosition(input, Anchor::Center, {0.f, -48.f});
-            m_tabNodes.push_back(input);
-
-            text("Not sure? Leave it on Standard and set your TPS.", 0.f, -80.f, 0.33f);
-        } else {
-            m_waveLabel = text("", -50.f, 46.f, 0.38f);
-            button("Change", 125.f, 46.f, menu_selector(BufferPopup::onWaveStyle));
-            m_dualLabel = text("", -50.f, 20.f, 0.38f);
-            button("Change", 125.f, 20.f, menu_selector(BufferPopup::onToggleDual));
-            m_secLabel = text("", -50.f, -6.f, 0.38f);
-            button("Change", 125.f, -6.f, menu_selector(BufferPopup::onToggleSections));
-
-            button("All settings", -75.f, -38.f, menu_selector(BufferPopup::onAllSettings));
-            button("Profiles", 75.f, -38.f, menu_selector(BufferPopup::onProfiles));
-            button("Sections", -75.f, -68.f, menu_selector(BufferPopup::onSections));
-            button("Reset all", 75.f, -68.f, menu_selector(BufferPopup::onResetAll));
-            text("Per-mode windows are in All settings.", 0.f, -96.f, 0.33f);
+        if (name.size() == 1 && name[0] >= 'A' && name[0] <= 'Z') {
+            return KEY_A + (name[0] - 'A');
         }
-        this->refresh();
+        if (name.size() == 1 && name[0] >= '0' && name[0] <= '9') {
+            return KEY_Zero + (name[0] - '0');
+        }
+        return 0;
     }
 
-    void refresh() {
-        auto m = Mod::get();
-        if (m_presetLabel) {
-            int p = currentPreset();
-            m_presetLabel->setString(p >= 0 ? PRESET_NAMES[p] : "Custom");
-            m_presetInfo->setString(p >= 0 ? PRESET_INFO[p] : "You changed the settings by hand.");
+    void readSettings() {
+        auto* mod = Mod::get();
+        buf.smart = mod->getSettingValue<bool>("smart-prediction");
+        buf.budgetMs = mod->getSettingValue<double>("sim-budget-ms");
+        buf.autoBudget = mod->getSettingValue<bool>("auto-budget");
+        // v2.75 rebindable keys
+        char const* keyNames[] = { "key-stage", "key-menu", "key-export", "key-console", "key-path", "key-forget" };
+        for (int i = 0; i < 6; ++i) {
+            buf.keys[i] = parseKey(mod->getSettingValue<std::string>(keyNames[i]));
         }
-        if (m_waveLabel) {
-            std::string a = std::string("Wave style: ") + waveModeName();
-            m_waveLabel->setString(a.c_str());
-            std::string b = std::string("Dual mode (experimental): ") + (g_dualEnabled ? "On" : "Off");
-            m_dualLabel->setString(b.c_str());
-            std::string c = std::string("Level sections (experimental): ") + (m->getSettingValue<bool>("sections") ? "On" : "Off");
-            m_secLabel->setString(c.c_str());
+        buf.practiceOnly = mod->getSettingValue<bool>("practice-only");
+        buf.groundHorizon = static_cast<int>(mod->getSettingValue<int64_t>("ground-horizon"));
+        buf.waveHorizon = static_cast<int>(mod->getSettingValue<int64_t>("wave-horizon"));
+        buf.assumeOrbs = mod->getSettingValue<bool>("orb-assume-hit");
+        buf.orbClick = buf.assumeOrbs;
+        buf.tryBothOrbs = mod->getSettingValue<bool>("orb-try-both");
+        buf.avoidMovers = mod->getSettingValue<bool>("avoid-moving-objects");
+        buf.autoRelease = mod->getSettingValue<bool>("wave-auto-release");
+        buf.autoWindow = static_cast<int>(mod->getSettingValue<int64_t>("auto-release-window"));
+        buf.driftCheck = mod->getSettingValue<bool>("drift-check");
+        buf.spamGap = static_cast<int>(mod->getSettingValue<int64_t>("wave-spam-gap"));
+        buf.orbAlign = mod->getSettingValue<bool>("orb-align");
+        buf.orbTiming = mod->getSettingValue<bool>("orb-timing");
+        buf.orbAlignGround = mod->getSettingValue<bool>("orb-align-ground");
+        buf.fullState = mod->getSettingValue<bool>("full-ghost-state");
+        buf.learn = mod->getSettingValue<bool>("level-memory");
+        buf.robotSmart = mod->getSettingValue<bool>("robot-smart");
+        buf.spiderSmart = mod->getSettingValue<bool>("spider-smart");
+        buf.ufoSmart = mod->getSettingValue<bool>("ufo-smart");
+        buf.ballSmart = mod->getSettingValue<bool>("ball-smart");
+        buf.swingSmart = mod->getSettingValue<bool>("swing-smart");
+        buf.train = mod->getSettingValue<bool>("training-mode");
+        buf.perLevel = mod->getSettingValue<bool>("per-level-settings");
+        buf.heatmap = mod->getSettingValue<bool>("death-heatmap");
+        buf.saveDing = mod->getSettingValue<bool>("save-ding");
+        buf.moreTime = mod->getSettingValue<bool>("more-time-death-spots");
+        buf.dashAutoRelease = mod->getSettingValue<bool>("dash-auto-release");
+        buf.perfLog = mod->getSettingValue<bool>("perf-log");
+        buf.shipBuffer = mod->getSettingValue<bool>("ship-buffer");
+        buf.lateCrash = static_cast<int>(mod->getSettingValue<int64_t>("cube-late-crash"));
+        buf.robustSaves = mod->getSettingValue<bool>("robust-saves");
+        buf.ignoreTouching = mod->getSettingValue<bool>("ignore-touching-hazards");
+        buf.deathLog = mod->getSettingValue<bool>("death-log");
+        buf.explain = mod->getSettingValue<bool>("explain-inputs");
+        // v2.35 low latency mode: for players who feel the buffer as input lag. Short searches
+        // (no frame hitches), at most 1 frame of delay, no extra "margin" ticks, and clicks
+        // made while a delay is waiting aren't shifted (see intercept).
+        buf.lowLatency = mod->getSettingValue<bool>("low-latency");
+        if (buf.lowLatency) {
+            buf.budgetMs = std::min(buf.budgetMs, 3.0);
+            buf.robustSaves = false;
+            buf.waveMargin = false;
+        }
+        buf.predictMovers = mod->getSettingValue<bool>("predict-moving-objects");
+        buf.shipMaxDelay = static_cast<int>(mod->getSettingValue<int64_t>("ship-max-delay"));
+        buf.shipSpamGap = static_cast<int>(mod->getSettingValue<int64_t>("ship-spam-gap"));
+        buf.cbfSync = mod->getSettingValue<bool>("cbf-sync");
+        buf.robotAutoRelease = mod->getSettingValue<bool>("robot-auto-release");
+        buf.autoNormalRuns = mod->getSettingValue<bool>("auto-release-normal-runs");
+        buf.waveV46 = mod->getSettingValue<bool>("wave-v46");
+        buf.waveMargin = mod->getSettingValue<bool>("wave-safety-margin");
+        buf.orbWindow = static_cast<int>(mod->getSettingValue<int64_t>("orb-align-ticks"));
+        // v2.71 performance mode: for PCs that drop frames on clicks. Shorter searches, no
+        // extra robustness runs, orbs clicked only the normal way (no late-click retries), and
+        // the debug runs (drift check, live path view) off.
+        buf.perfMode = mod->getSettingValue<bool>("performance-mode");
+        if (buf.perfMode) {
+            buf.budgetMs = std::min(buf.budgetMs, 4.0);
+            buf.robustSaves = false;
+            buf.orbTiming = false;
+            buf.driftCheck = false;
+        }
+        buf.userBudget = buf.budgetMs;
+    }
+
+    // v2.76 auto budget: the budget setting is used as it is, and only cut (to 4 ms) while
+    // the game is already dropping frames. v2.75 also capped every click at 45% of a frame:
+    // at 240+ fps that was 2 ms, too short for a long cube jump's search (Penumbral's first
+    // jump: only +1..+5 delays were ever tried, so most clicks got no save).
+    void clickBudget() {
+        double budget = buf.userBudget;
+        if (buf.autoBudget) {
+            auto* director = CCDirector::get();
+            double interval = director->getAnimationInterval() * 1000.0;
+            double frame = director->getDeltaTime() * 1000.0;
+            // v2.77: at most about one frame per click (never under 4 ms, so long cube jumps
+            // still get searched): 4.2 ms at 240 fps, 7 ms at 144, the setting at 60
+            if (interval > 0.0) {
+                budget = std::min(budget, std::max(4.0, interval));
+            }
+            if (interval > 0.0 && frame > std::max(interval * 2.0, 20.0)) {
+                budget = std::min(budget, 4.0);
+            }
+        }
+        buf.budgetMs = budget;
+    }
+
+    void applyStage() {
+        auto const& s = STAGES[buf.stage];
+        buf.enabled = s.enabled;
+        if (s.custom) {
+            buf.ticksAll = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-ticks"));
+            buf.ticksWave = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-wave-ticks"));
+        }
+        else {
+            buf.ticksAll = s.ticksAll;
+            buf.ticksWave = s.ticksWave;
         }
     }
 
-public:
-    static BufferPopup* create(int levelID) {
-        auto ret = new BufferPopup();
-        if (ret->init(levelID)) {
-            ret->autorelease();
-            return ret;
+    // v2.14: a run outside practice where auto-release can press for you is marked on screen.
+    // v2.46 watermark: whenever the buffer is on (any stage but OFF) the level shows it, and
+    // can't be turned off, so runs made with the mod are recognisable.
+    void refreshWatermark() {
+        if (!buf.watermark) {
+            return;
         }
-        delete ret;
-        return nullptr;
+        // v2.57: hidden in practice mode (practice runs can't be submitted, and it crowded the
+        // checkpoint buttons); always shown in normal mode while the buffer is on.
+        auto* layer = GameManager::get()->m_playLayer;
+        buf.watermark->setVisible(buf.enabled && !(layer && layer->m_isPracticeMode));
+        buf.watermark->setString(fmt::format("Click Before Frames  |  {}", stageText()).c_str());
     }
 
-    void onTabBasic(CCObject*) { m_advanced = false; build(); }
-    void onTabAdvanced(CCObject*) { m_advanced = true; build(); }
-
-    // Picking a quick setup resets the per-mode windows to follow it.
-    void setPreset(int p) {
-        auto m = Mod::get();
-        m->setSettingValue<std::string>("stage", PRESET_STAGE[p]);
-        for (auto key : MODE_KEYS) m->setSettingValue<int64_t>(key, -1);
-        refresh();
+    void refreshAutoTag() {
+        if (!buf.autoTag) {
+            return;
+        }
+        auto* layer = GameManager::get()->m_playLayer;
+        bool on = buf.enabled && buf.autoNormalRuns && (buf.autoRelease || buf.robotAutoRelease || buf.dashAutoRelease) && layer &&
+            !layer->m_isPracticeMode;
+        buf.autoTag->setVisible(on);
     }
 
-    void onPresetPrev(CCObject*) {
-        int p = currentPreset();
-        setPreset(p < 0 ? 2 : (p + PRESET_COUNT - 1) % PRESET_COUNT);
+    size_t memorySpots();
+
+    // v2.29 F8: copy the console to the clipboard (and save it to console-export.txt in the
+    // mod's save folder), with the version, level, physics rate and settings on top, so it
+    // can be pasted somewhere in one go.
+    void exportConsole() {
+        auto* mod = Mod::get();
+        auto* layer = GameManager::get()->m_playLayer;
+        std::string text;
+        text += fmt::format("Click Before Frames {} console export\n", mod->getVersion().toVString());
+        if (layer && layer->m_level) {
+            text += fmt::format("Level: {} (id {}){}\n", std::string(layer->m_level->m_levelName), layer->m_level->m_levelID.value(),
+                layer->m_isPracticeMode ? ", practice" : "");
+        }
+        float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
+        text += fmt::format("{} | physics ~{:.0f} steps/s\n", stageText(), 60.f / dt);
+        text += fmt::format("budget {:g} ms | smart {} | full state {} | robust {} | late crash {} | practice only {}\n", buf.budgetMs,
+            buf.smart, buf.fullState, buf.robustSaves, buf.lateCrash, buf.practiceOnly);
+        text += fmt::format("orbs: align {} (ground {}, {}t) timing {} assume {} both {} | memory {} ({} spots)\n", buf.orbAlign,
+            buf.orbAlignGround, buf.orbWindow, buf.orbTiming, buf.assumeOrbs, buf.tryBothOrbs, buf.learn, memorySpots());
+        text += fmt::format("wave: v4.6 {} margin {} horizon {} spam gap {} | robot smart {} | spider smart {} | ship {} (max {}t)\n",
+            buf.waveV46, buf.waveMargin, buf.waveHorizon, buf.spamGap, buf.robotSmart, buf.spiderSmart, buf.shipBuffer, buf.shipMaxDelay);
+        text += fmt::format("auto-release: wave {} robot {} dash {} normal runs {} window {} | movers: avoid {} predict {}\n",
+            buf.autoRelease, buf.robotAutoRelease, buf.dashAutoRelease, buf.autoNormalRuns, buf.autoWindow, buf.avoidMovers,
+            buf.predictMovers);
+        text += fmt::format("debug: drift check {} | path view {} | perf log {} | death log {} | ignore touching {}\n", buf.driftCheck,
+            buf.showPath, buf.perfLog, buf.deathLog, buf.ignoreTouching);
+        text += fmt::format("explain inputs {} | low latency {} | cbf sync {}{}\n", buf.explain, buf.lowLatency, buf.cbfSync,
+            Loader::get()->isModLoaded("syzzi.click_between_frames") ? " (CBF loaded)" : "");
+        // v2.39: CBF Extrapolate only changes what's drawn (a hidden player run ahead to "now"),
+        // never the real player's physics, so predictions aren't affected by it.
+        if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
+            text += "CBF Extrapolate loaded (visual only)\n";
+        }
+        text += "----\n";
+        for (auto const& line : exportLines) {
+            text += line;
+            text += '\n';
+        }
+
+        bool copied = geode::utils::clipboard::write(text);
+        std::error_code ec;
+        std::filesystem::create_directories(mod->getSaveDir(), ec);
+        std::ofstream(mod->getSaveDir() / "console-export.txt", std::ios::trunc) << text;
+        say("console {} ({} lines) + saved to console-export.txt", copied ? "copied to clipboard" : "NOT copied", exportLines.size());
     }
 
-    void onPresetNext(CCObject*) {
-        int p = currentPreset();
-        setPreset(p < 0 ? 2 : (p + 1) % PRESET_COUNT);
+    std::string stageText() {
+        if (!buf.enabled) {
+            return "Buffer: OFF";
+        }
+        return fmt::format("Buffer{}: {:g}f / wave {:g}f{}", STAGES[buf.stage].custom ? " (custom)" : "", buf.ticksAll * TICK,
+            buf.ticksWave * TICK, buf.train ? " [training]" : "");
     }
 
-    void onWaveStyle(CCObject*) {
-        int next = (g_waveMode + 1) % WAVE_MODE_COUNT;
-        Mod::get()->setSettingValue<std::string>("wave-mode", WAVE_NAMES[next]);
-        refresh();
+    void dropGhosts() {
+        for (auto** g : { &buf.ghost1, &buf.ghost2 }) {
+            if (*g) {
+                (*g)->removeFromParentAndCleanup(true);
+                (*g)->release();
+                *g = nullptr;
+            }
+        }
+        if (buf.ghostLayer) {
+            buf.ghostLayer->removeAllChildrenWithCleanup(true);
+            buf.ghostLayer->release();
+            buf.ghostLayer = nullptr;
+        }
+        // panel nodes are owned by the PlayLayer
+        buf.panel = nullptr;
+        buf.panelTitle = nullptr;
+        buf.panelLines.clear();
+        buf.pathNode = nullptr;
+        buf.autoTag = nullptr;
+        buf.watermark = nullptr;
+        buf.simulating = false;
+        buf.injecting = false;
+        buf.rapid = 0;
+        buf.autoReleased = false;
+        buf.recordPath = nullptr;
+        watched.clear();
+        drift.active = false;
+        resetPending();
     }
 
-    void onToggleDual(CCObject*) {
-        Mod::get()->setSettingValue<bool>("dual-mode", !g_dualEnabled);
-        refresh();
+    // PERF: v1 created ghosts with the PlayLayer as their parent layer and put them in
+    // the object layer. PlayerObject::init adds ~13 particle systems, 2 motion streaks,
+    // a wave trail and a ghost trail to that parent layer, so every frame the game was
+    // updating and drawing two invisible players' worth of effects (which also kept
+    // emitting wherever the ghost was last simulated). Ghosts now live in a detached
+    // layer that is never added to the scene: cocos never visits/draws it and its
+    // nodes' scheduled updates stay paused, so the ghosts cost nothing between clicks.
+    PlayerObject* makeGhost(PlayLayer* layer) {
+        if (!buf.ghostLayer) {
+            buf.ghostLayer = CCLayer::create();
+            buf.ghostLayer->retain();
+        }
+        auto* ghost = PlayerObject::create(1, 1, layer, buf.ghostLayer, true);
+        ghost->retain();
+        ghost->setPosition(CCPoint(0.f, 105.f));
+        ghost->setVisible(false);
+        buf.ghostLayer->addChild(ghost);
+        return ghost;
     }
 
-    void onToggleSections(CCObject*) {
-        auto m = Mod::get();
-        m->setSettingValue<bool>("sections", !m->getSettingValue<bool>("sections"));
-        refresh();
+    // v2.24: anything the ghosts left in their layer since they were made (trail fade-outs,
+    // effect nodes...) is removed with cleanup, which also takes it off the scheduler and
+    // the action manager. Without this every prediction left a few paused nodes behind,
+    // and the game iterates all of them every frame: the FPS sank a little with each save.
+    void sweepGhostLayer() {
+        if (!buf.ghostLayer) {
+            return;
+        }
+        auto* children = buf.ghostLayer->getChildren();
+        while (children && children->count() > buf.ghostLayerBase) {
+            auto* node = static_cast<CCNode*>(children->lastObject());
+            buf.ghostLayer->removeChild(node, true);
+        }
     }
 
-    void onAllSettings(CCObject*) { openSettingsPopup(Mod::get(), false); }
-    void onProfiles(CCObject*) { if (auto p = ProfilesPopup::create(m_levelID)) p->show(); }
-    void onSections(CCObject*) { openSectionsWindow(m_levelID); }
-
-    void onResetAll(CCObject*) {
-        applyProfileData(DEFAULT_PROFILE);
-        m_note->setString("Settings reset to defaults.");
-        this->build();
-        m_note->setString("Settings reset to defaults.");
-    }
-};
-
-$on_mod(Loaded) {
-    loadSettings();
-    restoreAfterLevel(); // undo a level profile left over from a crash
-    listenForSettingChanges<std::string>("stage", [](std::string) { loadSettings(); });
-    listenForSettingChanges<int64_t>("tps-value", [](int64_t) { loadSettings(); });
-    listenForSettingChanges<std::string>("wave-mode", [](std::string) { loadSettings(); });
-    for (auto key : MODE_KEYS) {
-        listenForSettingChanges<int64_t>(key, [](int64_t) { loadSettings(); });
-    }
-    listenForSettingChanges<bool>("debug", [](bool) { loadSettings(); });
-    listenForSettingChanges<bool>("dual-mode", [](bool) { loadSettings(); });
-    for (auto key : FLY_STYLE_KEYS) {
-        listenForSettingChanges<std::string>(key, [](std::string) { loadSettings(); });
+    void sendButton(PlayLayer* layer, bool down) {
+        buf.injecting = true;
+        buf.appliedInput = down;
+        layer->handleButton(down, 1, buf.isPlayer1);
+        buf.injecting = false;
     }
 
-    log::info("[InputBuffer] BufferMod loaded (v22: profiles + keybinds). Main: {}, TPS: {}, wave: {}, dual: {}",
-              STAGE_NAMES[g_stage], g_tps, waveModeName(), g_dualEnabled ? "ON" : "OFF");
-}
-
-$on_game(Loaded) {
-    for (int i = 0; i < KEYBIND_COUNT; i++) {
-        listenForKeybindSettingPresses(KEYBIND_SETTINGS[i], [i](Keybind const&, bool down, bool repeat, double) {
-            hotkeyPressed(i, down, repeat);
-        });
-    }
-}
-
-class $modify(BufferPause, PauseLayer) {
-    void customSetup() {
-        PauseLayer::customSetup();
-
-        auto menu = CCMenu::create();
-
-        auto spr = ButtonSprite::create("Buffer");
-        spr->setScale(0.7f);
-        auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(BufferPause::onBufferSettings));
-        menu->addChild(btn);
-
-        auto spr2 = ButtonSprite::create("Profiles");
-        spr2->setScale(0.7f);
-        auto btn2 = CCMenuItemSpriteExtra::create(spr2, this, menu_selector(BufferPause::onBufferProfiles));
-        btn2->setPosition({0.f, 30.f});
-        menu->addChild(btn2);
-
-        auto win = CCDirector::get()->getWinSize();
-        menu->setPosition({win.width - 60.f, 30.f});
-        this->addChild(menu);
+    void pressGhost(PlayerObject* ghost, bool down) {
+        (ghost == buf.ghost1 ? buf.held1 : buf.held2) = down;
+        if (down) {
+            ghost->pushButton(PlayerButton::Jump);
+        }
+        else {
+            ghost->releaseButton(PlayerButton::Jump);
+        }
     }
 
-    void onBufferSettings(CCObject*) {
-        if (auto popup = BufferPopup::create(currentLevelID())) popup->show();
-    }
-
-    void onBufferProfiles(CCObject*) {
-        if (auto popup = ProfilesPopup::create(currentLevelID())) popup->show();
-    }
-};
-
-// Raises the reset flag on death, restart and checkpoint loads. The buffer
-// layer clears its state on the next step.
-// Experimental iOS-safe prediction core. It runs the detached ghost against each
-// standard mode's press/release event, comparing immediate timing with delayed timings.
-// Mode-changing portals and unmodeled object interactions stop the prediction conservatively.
-struct PredictionGhostState {
-    PlayerObject* ghost = nullptr;
-    CCLayer* layer = nullptr;
-    PlayLayer* owner = nullptr;
-    unsigned layerBase = 0;
-    bool simulating = false;
-    bool died = false;
-    bool hitUnknownObject = false;
-};
-static PredictionGhostState g_prediction;
-
-static constexpr uint64_t predictionTypeBit(GameObjectType type) {
-    return 1ull << static_cast<int>(type);
-}
-static constexpr uint64_t PREDICTION_COLLIDERS =
-    predictionTypeBit(GameObjectType::Solid) |
-    predictionTypeBit(GameObjectType::Hazard) |
-    predictionTypeBit(GameObjectType::Slope) |
-    predictionTypeBit(GameObjectType::CollisionObject) |
-    predictionTypeBit(GameObjectType::AnimatedHazard);
-
-static void dropPredictionGhost() {
-    if (g_prediction.ghost) {
-        g_prediction.ghost->removeFromParentAndCleanup(true);
-        g_prediction.ghost->release();
-        g_prediction.ghost = nullptr;
-    }
-    if (g_prediction.layer) {
-        g_prediction.layer->removeAllChildrenWithCleanup(true);
-        g_prediction.layer->release();
-        g_prediction.layer = nullptr;
-    }
-    g_prediction.owner = nullptr;
-    g_prediction.layerBase = 0;
-    g_prediction.simulating = false;
-    g_prediction.died = false;
-    g_prediction.hitUnknownObject = false;
-}
-
-static bool createPredictionGhost(PlayLayer* owner) {
-    dropPredictionGhost();
-    if (!owner) return false;
-    g_prediction.layer = CCLayer::create();
-    if (!g_prediction.layer) return false;
-    g_prediction.layer->retain();
-    g_prediction.ghost = PlayerObject::create(1, 1, owner, g_prediction.layer, true);
-    if (!g_prediction.ghost) {
-        g_prediction.layer->release();
-        g_prediction.layer = nullptr;
-        return false;
-    }
-    g_prediction.ghost->retain();
-    g_prediction.ghost->setVisible(false);
-    g_prediction.layer->addChild(g_prediction.ghost);
-    g_prediction.layerBase = g_prediction.layer->getChildrenCount();
-    g_prediction.owner = owner;
-    return true;
-}
-
-static void sweepPredictionGhostLayer() {
-    if (!g_prediction.layer) return;
-    auto* children = g_prediction.layer->getChildren();
-    while (children && children->count() > g_prediction.layerBase) {
-        auto* node = static_cast<CCNode*>(children->lastObject());
-        g_prediction.layer->removeChild(node, true);
-    }
-}
-
-    static void copyPredictionState(PlayerObject* ghost, PlayerObject* real) {
+    void copyState(PlayerObject* ghost, PlayerObject* real) {
         ghost->setVisible(false);
         ghost->resetTouchedRings(true);
         ghost->copyAttributes(real);
@@ -1619,9 +722,19 @@ static void sweepPredictionGhostLayer() {
         ghost->m_playerSpeed = real->m_playerSpeed;
         ghost->m_isDashing = real->m_isDashing;
         ghost->m_lastActivatedPortal = real->m_lastActivatedPortal;
+        if (buf.ghostShiftX != 0.f) {
+            // v2.28 robustness check: start the ghost a little ahead of / behind you, the way a
+            // real run is a fraction of a tick off from the prediction.
+            CCPoint pos = real->getPosition();
+            pos.x += buf.ghostShiftX;
+            ghost->setPosition(pos);
+            ghost->m_position = pos;
+        }
 
-        // Reset input/jump state from the real player before every simulated run.
-        // Otherwise a previous ghost simulation can leave jumpBuffered/held state behind.
+        // Button / jump-buffer state. Without this the ghost keeps whatever button
+        // state the PREVIOUS simulation left it in (usually "held"), so on some clicks
+        // its pushButton() is a no-op or it auto-jumps from hold, and the prediction
+        // flips between right and wrong from click to click.
         ghost->m_holdingButtons = real->m_holdingButtons;
         ghost->m_jumpBuffered = real->m_jumpBuffered;
         ghost->m_wasJumpBuffered = real->m_wasJumpBuffered;
@@ -1632,8 +745,9 @@ static void sweepPredictionGhostLayer() {
         ghost->m_touchedRing = real->m_touchedRing;
         ghost->m_touchedPad = real->m_touchedPad;
         ghost->m_touchedGravityPortal = real->m_touchedGravityPortal;
-
-        // Copy the remaining physics fields too; copyAttributes alone is not sufficient for prediction.
+        if (!buf.fullState) {
+            return;
+        }
 
         // v2.8: everything else the physics step reads, so every mode matches the real
         // player: cube / ball / ufo / wave / robot / spider / swing, mini, upside down,
@@ -1746,794 +860,3666 @@ static void sweepPredictionGhostLayer() {
         ghost->m_maybeStateForce2 = real->m_maybeStateForce2;
     }
 
-struct PredictionResult {
-    int survived = 0;
-    bool safe = false;
-    bool diedBeforeInput = false;
-};
+    // Your recent input timings, so predictions model what you actually do instead of
+    // an infinite hold: cube taps (holding auto-re-jumps) and robot holds (they set the
+    // jump height).
+    constexpr int HOLD_SAMPLES = 8;
 
-// Learn the user's actual tap duration from recent press/release pairs.
-// The first prediction uses a 50 ms tap, like the upstream predictor.
-struct PredictionHoldWindow {
-    int samples[8] = {};
-    int count = 0;
-    int index = 0;
+    struct HoldStats {
+        int samples[HOLD_SAMPLES] = {};
+        int count = 0;
+        int index = 0;
 
-    int estimate(int fallback) const {
-        if (count == 0) return fallback;
-        int values[8] = {};
-        std::copy(samples, samples + count, values);
-        int middle = count / 2;
-        std::nth_element(values, values + middle, values + count);
-        return std::clamp(values[middle], 1, 240);
+        void add(int ticks) {
+            samples[index] = std::clamp(ticks, 1, 240);
+            index = (index + 1) % HOLD_SAMPLES;
+            count = std::min(count + 1, HOLD_SAMPLES);
+        }
+
+        // percentile of the recent samples, or `fallback` with no samples yet
+        int pick(int fallback, int percent) const {
+            if (count == 0) {
+                return fallback;
+            }
+            int tmp[HOLD_SAMPLES];
+            std::copy(samples, samples + count, tmp);
+            int at = std::min(count - 1, count * percent / 100);
+            std::nth_element(tmp, tmp + at, tmp + count);
+            return tmp[at];
+        }
+    };
+
+    HoldStats tapHold, robotHold;
+    int tickCount = 0;
+
+    enum class InputKind { Tap, Wave, Robot, Other };
+    int pressTick = -1;
+    InputKind pressKind = InputKind::Other;
+
+    // Cube / ball / ufo / spider / swing are tapped. Ship, wave and robot are held, and
+    // each keeps its own samples so long holds don't pollute the cube's tap length.
+    InputKind kindOf(PlayerObject* p) {
+        if (!p || p->m_isShip) {
+            return InputKind::Other;
+        }
+        if (p->m_isDart) {
+            return InputKind::Wave;
+        }
+        return p->m_isRobot ? InputKind::Robot : InputKind::Tap;
     }
 
-    void add(int ticks) {
-        samples[index] = std::clamp(ticks, 1, 240);
-        index = (index + 1) % 8;
-        count = std::min(count + 1, 8);
+    void recordRealInput(bool down, PlayerObject* p1) {
+        if (down) {
+            pressTick = tickCount;
+            pressKind = kindOf(p1);
+            return;
+        }
+        if (pressTick < 0) {
+            return;
+        }
+        int held = tickCount - pressTick;
+        pressTick = -1;
+        if (buf.autoReleased) {
+            return;  // the game already let go earlier; this length isn't a real hold
+        }
+        switch (pressKind) {
+            case InputKind::Tap: tapHold.add(held); break;
+            case InputKind::Robot: robotHold.add(held); break;
+            default: break;
+        }
     }
-};
 
-static PredictionHoldWindow g_tapHold;
-static PredictionHoldWindow g_robotHold;
-
-static int predictionHoldEstimate(bool robot = false) {
-    return robot ? g_robotHold.estimate(20) : g_tapHold.estimate(12);
-}
-
-static void recordPredictionHold(int ticks, bool robot) {
-    (robot ? g_robotHold : g_tapHold).add(ticks);
-}
-
-static PredictionResult simulatePredictionInput(
-    PlayLayer* layer, PlayerObject* real, int delay, bool inputDown, int horizon, int holdTicks,
-    bool continuousHold, int recoveryTick = -1
-) {
-    PredictionResult result;
-    if (!layer || !real || !g_prediction.ghost || g_prediction.owner != layer || g_prediction.simulating) {
-        result.safe = true;
-        result.survived = horizon;
-        return result;
+    // A hold that spans a death / restart / new level isn't a real tap length.
+    void forgetPress() {
+        pressTick = -1;
     }
-    auto* ghost = g_prediction.ghost;
-    g_prediction.died = false;
-    g_prediction.hitUnknownObject = false;
-    copyPredictionState(ghost, real);
-    ghost->setVisible(false);
-    ghost->m_isDead = false;
-    g_prediction.simulating = true;
 
-    constexpr float SIM_DT = 0.25f;
-    const bool landingScored = !(real->m_isShip || real->m_isDart || real->m_isSwing);
-    bool sawAir = false;
-    int groundedAfterAir = 0;
-    const int total = delay + horizon;
-    for (int tick = 0; tick < total; ++tick) {
-        if (tick == delay) {
-            if (inputDown) ghost->pushButton(PlayerButton::Jump);
-            else ghost->releaseButton(PlayerButton::Jump);
+    int holdEstimate() {
+        return tapHold.pick(st(12), 50);  // ~50 ms, a typical tap
+    }
+
+    // v2.4 moving-object guard: objects the ghost collided with are watched every tick,
+    // and any that moved recently make the decision "don't buffer" (the ghost sees the
+    // level frozen at the click, so it tests them in the wrong place).
+    void watchObject(GameObject* object) {
+        auto [it, added] = watched.try_emplace(object, Watched { object->m_positionX, object->m_positionY, -MOVER_TICKS });
+        if (added) {
+            it->second.rot = object->getRotation();
         }
-        if (inputDown && !continuousHold && holdTicks >= 0 && tick == delay + holdTicks) {
-            ghost->releaseButton(PlayerButton::Jump);
+        if (!added && tickCount - it->second.movedTick < st(MOVER_TICKS)) {
+            buf.sawMover = true;
         }
-        if (recoveryTick >= 0 && tick == delay + recoveryTick) {
-            if (inputDown) ghost->releaseButton(PlayerButton::Jump);
-            else ghost->pushButton(PlayerButton::Jump);
+    }
+
+    // v2.41: objects that moved on the last step, so predictions don't have to search the
+    // whole watch list for them.
+    std::vector<GameObject*> movingNow;
+
+    void updateWatched() {
+        if (watched.size() > WATCH_LIMIT) {
+            watched.clear();
+        }
+        movingNow.clear();
+        // v2.41: objects far from you (passed long ago, or far ahead) are dropped instead of
+        // being checked every step; predictions never reach further than ~300 units.
+        double px = 0.0;
+        bool prune = false;
+        if (auto* layer = GameManager::get()->m_playLayer; layer && layer->m_player1) {
+            px = layer->m_player1->getPosition().x;
+            prune = true;
+        }
+        for (auto it = watched.begin(); it != watched.end();) {
+            auto* object = it->first;
+            auto& w = it->second;
+            if (prune && std::abs(object->m_positionX - px) > 800.0) {
+                it = watched.erase(it);
+                continue;
+            }
+            double rot = object->getRotation();
+            if (object->m_positionX != w.x || object->m_positionY != w.y || rot != w.rot) {
+                // called every step, so the change is the movement per step
+                bool consecutive = tickCount - w.movedTick == 1;
+                w.pvx = consecutive ? w.vx : 0.0;
+                w.pvy = consecutive ? w.vy : 0.0;
+                w.vx = object->m_positionX - w.x;
+                w.vy = object->m_positionY - w.y;
+                double dr = rot - w.rot;
+                w.vrot = std::remainder(dr, 360.0);
+                w.x = object->m_positionX;
+                w.y = object->m_positionY;
+                w.rot = rot;
+                w.movedTick = tickCount;
+                movingNow.push_back(object);
+            }
+            else if (tickCount - w.movedTick > 1) {
+                w.vx = w.vy = w.pvx = w.pvy = w.vrot = 0.0;  // stopped
+            }
+            ++it;
+        }
+    }
+
+    // v2.27 moving-object prediction. Objects near your path that are moving right now are
+    // moved along their current motion during a prediction (where they'll be k steps
+    // later), and put back exactly afterwards. Straight-line movement only: easing,
+    // rotation and toggles still aren't predicted.
+    // v2.68: also curved paths (rotate triggers move objects around a center, Orbit's saws):
+    // when the direction of motion turned between the last two steps, it keeps turning by the
+    // same angle each step, and objects that spin keep spinning. Still put back exactly after.
+    struct Mover {
+        GameObject* object;
+        double x, y, vx, vy;
+        double turn = 0.0;  // radians the motion direction turns per step (0 = straight)
+        double rotX = 0.0, rotY = 0.0, vrot = 0.0;  // both axes kept as they were (skewed objects)
+        double ax = 0.0, ay = 0.0;  // v2.75: speeding up / slowing down (easing), per step
+        int accelSteps = 0;         // v2.75: how long the easing is followed (until it would stop / over 3x speed)
+    };
+    std::vector<Mover> movers;
+
+    void collectMovers() {
+        movers.clear();
+        if (!buf.predictMovers) {
+            return;
+        }
+        for (auto* object : movingNow) {
+            auto it = watched.find(object);
+            if (it == watched.end()) {
+                continue;
+            }
+            auto const& w = it->second;
+            if ((w.vx != 0.0 || w.vy != 0.0 || w.vrot != 0.0) && tickCount - w.movedTick <= 1) {
+                Mover m { object, object->m_positionX, object->m_positionY, w.vx, w.vy };
+                double speed = std::hypot(w.vx, w.vy);
+                double prev = std::hypot(w.pvx, w.pvy);
+                if (speed > 1e-6 && prev > 1e-6) {
+                    double turn = std::remainder(std::atan2(w.vy, w.vx) - std::atan2(w.pvy, w.pvx), 6.283185307179586);
+                    double ratio = speed / prev;
+                    // a steady turn at a steady speed; anything wilder stays a straight line
+                    if (std::abs(turn) > 1e-4 && std::abs(turn) < 0.5 && ratio > 0.8 && ratio < 1.25) {
+                        m.turn = turn;
+                    }
+                    // v2.75: straight, but faster or slower than the step before: eased movement
+                    else if (std::abs(turn) <= 1e-4 && std::abs(ratio - 1.0) > 1e-3 && ratio > 0.5 && ratio < 2.0) {
+                        m.ax = w.vx - w.pvx;
+                        m.ay = w.vy - w.pvy;
+                        double along = (m.ax * w.vx + m.ay * w.vy) / speed;  // + speeding up, - slowing down
+                        double steps = along < 0.0 ? speed / -along : 2.0 * speed / along;
+                        m.accelSteps = static_cast<int>(std::min(steps, 1000.0));
+                    }
+                }
+                m.rotX = object->getRotationX();
+                m.rotY = object->getRotationY();
+                m.vrot = w.vrot;
+                movers.push_back(m);
+            }
+        }
+    }
+
+    void placeMovers(int steps) {
+        for (auto const& m : movers) {
+            double x = m.x + m.vx * steps;
+            double y = m.y + m.vy * steps;
+            if (m.accelSteps > 0 && steps > 0) {
+                // eased: the speed keeps changing the same way, then stays (stopped or at 3x)
+                int n = std::min(steps, m.accelSteps);
+                double grow = 0.5 * n * (n + 1);
+                x = m.x + m.vx * steps + m.ax * (grow + static_cast<double>(n) * (steps - n));
+                y = m.y + m.vy * steps + m.ay * (grow + static_cast<double>(n) * (steps - n));
+            }
+            if (m.turn != 0.0 && steps > 0) {
+                // sum of the step vector turned by `turn` once more every step
+                std::complex<double> v { m.vx, m.vy };
+                auto rho = std::polar(1.0, m.turn);
+                auto moved = v * rho * (1.0 - std::pow(rho, steps)) / (1.0 - rho);
+                x = m.x + moved.real();
+                y = m.y + moved.imag();
+            }
+            if (m.vrot != 0.0) {
+                double spun = steps == 0 ? 0.0 : m.vrot * steps;
+                m.object->setRotationX(static_cast<float>(m.rotX + spun));
+                m.object->setRotationY(static_cast<float>(m.rotY + spun));
+            }
+            m.object->setPosition({ static_cast<float>(x), static_cast<float>(y) });
+            m.object->m_positionX = x;
+            m.object->m_positionY = y;
+            m.object->setObjectRectDirty(true);
+            m.object->m_isOrientedBoxDirty = true;
+        }
+    }
+
+    // v2.4 drift check: the ghost run for the input you actually made is recorded, then
+    // compared tick by tick with where the real player goes, until your next input.
+    void finishDrift(char const* why) {
+        if (!drift.active) {
+            return;
+        }
+        drift.active = false;
+        if (drift.compared >= 8) {
+            say("drift {:.1f}u max at t{} over {}t{}", drift.maxErr, drift.maxAt, drift.compared, why);
+        }
+    }
+
+    void driftStep(PlayerObject* real) {
+        if (!drift.active) {
+            return;
+        }
+        if (drift.index >= 0) {
+            if (drift.index >= static_cast<int>(drift.path.size())) {
+                finishDrift("");
+                return;
+            }
+            float err = ccpDistance(real->getPosition(), drift.path[drift.index]);
+            if (err > drift.maxErr) {
+                drift.maxErr = err;
+                drift.maxAt = drift.index;
+            }
+            ++drift.compared;
+        }
+        ++drift.index;
+    }
+
+    // v2.13 level memory. Each level is cut into half-block slices along x. Every buffer
+    // decision is remembered at the slice where it was made, and ~0.4 s later it is
+    // scored: still alive = it worked, died = it didn't. Over your runs this learns, per
+    // spot, which delays work there, where saves keep failing (the ghost doesn't match
+    // the level there: triggers, moving objects) and where you keep dying. Stored per
+    // level in the mod's save folder, so it carries over between sessions.
+    constexpr float SLICE = 15.f;          // half a block
+    constexpr int OUTCOME_TICKS = 90;      // alive this long after a decision = it worked
+
+    struct Spot {
+        uint32_t ok = 0;        // saves here that you survived
+        uint32_t bad = 0;       // saves here followed by a death
+        uint32_t deaths = 0;    // deaths after any decision here
+        uint32_t delaySum = 0;  // sum of the delays of the saves that worked
+    };
+
+    std::unordered_map<int, Spot> memory;
+    std::string memoryKey;
+    bool memoryDirty = false;
+    int memoryUpdates = 0;
+
+    struct PendingOutcome {
+        bool active = false;
+        int slice = 0;
+        int tick = 0;
+        int delay = 0;
+        bool skipped = false;  // v2.64: a save was held back here because of memory
+    } pending;
+
+    int sliceOf(PlayerObject* p) {
+        return static_cast<int>(std::floor(p->getPosition().x / SLICE));
+    }
+
+    // A spot plus its two neighbours: the same gap is never hit at exactly the same x.
+    Spot spotAround(int slice) {
+        Spot sum;
+        for (int s = slice - 1; s <= slice + 1; ++s) {
+            auto it = memory.find(s);
+            if (it == memory.end()) {
+                continue;
+            }
+            sum.ok += it->second.ok;
+            sum.bad += it->second.bad;
+            sum.deaths += it->second.deaths;
+            sum.delaySum += it->second.delaySum;
+        }
+        return sum;
+    }
+
+    std::filesystem::path memoryFile() {
+        // v2.37: slices keyed by the real position. v2.75: _v3, a fresh start after the
+        // prediction fixes of v2.61-v2.74 (old files learned from the buggy versions)
+        return Mod::get()->getSaveDir() / "memory" / (memoryKey + "_v3.txt");
+    }
+
+    size_t memorySpots() {
+        return memory.size();
+    }
+
+    void saveMemory() {
+        if (!memoryDirty || memoryKey.empty()) {
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(memoryFile().parent_path(), ec);
+        std::ofstream out(memoryFile(), std::ios::trunc);
+        for (auto const& [slice, spot] : memory) {
+            out << slice << ' ' << spot.ok << ' ' << spot.bad << ' ' << spot.deaths << ' ' << spot.delaySum << '\n';
+        }
+        memoryDirty = false;
+    }
+
+    void loadMemory(GJGameLevel* level) {
+        memory.clear();
+        memoryDirty = false;
+        memoryUpdates = 0;
+        pending.active = false;
+        memoryKey.clear();
+        if (!level) {
+            return;
+        }
+        int id = level->m_levelID.value();
+        if (id > 0) {
+            memoryKey = fmt::format("level_{}", id);
+        }
+        else {
+            std::string name = level->m_levelName;
+            for (auto& c : name) {
+                if (!std::isalnum(static_cast<unsigned char>(c))) {
+                    c = '_';
+                }
+            }
+            memoryKey = "local_" + name;
+        }
+        std::ifstream in(memoryFile());
+        int slice;
+        Spot spot;
+        while (in >> slice >> spot.ok >> spot.bad >> spot.deaths >> spot.delaySum) {
+            memory[slice] = spot;
+        }
+        // v2.75: memory fades. Opened again more than 12 hours later, everything learned counts
+        // a quarter less (the average delay at a spot stays the same), so old mistakes and
+        // old death spots don't stick forever.
+        std::error_code ec;
+        auto written = std::filesystem::last_write_time(memoryFile(), ec);
+        if (!ec && std::filesystem::file_time_type::clock::now() - written > std::chrono::hours(12)) {
+            for (auto it = memory.begin(); it != memory.end();) {
+                auto& s = it->second;
+                uint32_t ok = s.ok * 3 / 4;
+                s.delaySum = s.ok > 0 ? static_cast<uint32_t>(static_cast<uint64_t>(s.delaySum) * ok / s.ok) : 0;
+                s.ok = ok;
+                s.bad = s.bad * 3 / 4;
+                s.deaths = s.deaths * 3 / 4;
+                it = (s.ok | s.bad | s.deaths) == 0 ? memory.erase(it) : std::next(it);
+            }
+            memoryDirty = true;
+            saveMemory();
+        }
+        if (!memory.empty()) {
+            say("memory: {} spots learned on this level", memory.size());
+        }
+    }
+
+    void memoryChanged() {
+        memoryDirty = true;
+        if (++memoryUpdates % 10 == 0) {
+            saveMemory();
+        }
+    }
+
+    void creditPending() {
+        if (!pending.active) {
+            return;
+        }
+        pending.active = false;
+        if (pending.delay > 0) {
+            auto& spot = memory[pending.slice];
+            ++spot.ok;
+            spot.delaySum += static_cast<uint32_t>(std::lround(pending.delay / stepScale()));  // stored at 240/s
+            memoryChanged();
+        }
+    }
+
+    // Called for every decision: remembers it until it can be scored.
+    void memoryNote(PlayerObject* p1, int delay) {
+        if (!buf.learn || memoryKey.empty()) {
+            return;
+        }
+        // A decision that lived long enough before the next one counts as having worked.
+        if (pending.active && tickCount - pending.tick >= st(30)) {
+            creditPending();
+        }
+        pending = { true, sliceOf(p1), tickCount, delay, false };
+    }
+
+    void memoryTick() {
+        if (pending.active && tickCount - pending.tick >= st(OUTCOME_TICKS)) {
+            creditPending();
+        }
+    }
+
+    bool memorySaysSkip(int slice);
+
+    void memoryDeath() {
+        if (!pending.active) {
+            return;
+        }
+        pending.active = false;
+        auto& spot = memory[pending.slice];
+        ++spot.deaths;
+        if (pending.delay > 0) {
+            ++spot.bad;
+        }
+        // v2.64: memory held a save back and you died anyway, so leaving the input alone
+        // isn't working either: take back one failed save, so after a death or two the mod
+        // tries saving here again instead of skipping this spot forever (first jump of
+        // Slaughterhouse, after older versions' bad saves there).
+        if (pending.skipped) {
+            int worst = pending.slice;
+            for (int s = pending.slice - 1; s <= pending.slice + 1; ++s) {
+                auto it = memory.find(s);
+                if (it != memory.end() && it->second.bad > memory[worst].bad) {
+                    worst = s;
+                }
+            }
+            if (memory[worst].bad > 0) {
+                --memory[worst].bad;
+            }
+            if (!memorySaysSkip(pending.slice)) {
+                say("memory: died with the input left alone, saves will be tried here again");
+            }
+        }
+        memoryChanged();
+    }
+
+    // Saves made here keep ending in deaths: the ghost is wrong at this spot, leave it alone.
+    bool memorySaysSkip(int slice) {
+        if (!buf.learn) {
+            return false;
+        }
+        auto spot = spotAround(slice);
+        return spot.bad >= 2 && spot.bad > spot.ok;
+    }
+
+    // The delay that has worked here before (average of the saves you survived), or 0.
+    int memoryDelay(int slice) {
+        if (!buf.learn) {
+            return 0;
+        }
+        auto spot = spotAround(slice);
+        if (spot.ok < 2) {
+            return 0;
+        }
+        return st(static_cast<int>(std::lround(static_cast<double>(spot.delaySum) / spot.ok)));
+    }
+
+    bool memoryRisky(int slice) {
+        auto spot = spotAround(slice);
+        return spot.deaths >= 3;
+    }
+
+    void snapshotObject(GameObject* object) {
+        if (!object || buf.simUsed.contains(object)) {
+            return;
+        }
+        buf.simUsed.insert(object);
+        ObjSnapshot s { object, object->m_isActivated, nullptr, false, false, false };
+        if (auto* effect = typeinfo_cast<EffectGameObject*>(object)) {
+            s.effect = effect;
+            s.activated = effect->m_activated;
+            s.byP1 = effect->m_activatedByPlayer1;
+            s.byP2 = effect->m_activatedByPlayer2;
+        }
+        buf.snapshots.push_back(s);
+    }
+
+    void restoreObjects() {
+        for (auto const& s : buf.snapshots) {
+            s.object->m_isActivated = s.isActivated;
+            if (s.effect) {
+                s.effect->m_activated = s.activated;
+                s.effect->m_activatedByPlayer1 = s.byP1;
+                s.effect->m_activatedByPlayer2 = s.byP2;
+            }
+        }
+        buf.snapshots.clear();
+        buf.simUsed.clear();
+        buf.orbsUsed.clear();
+        buf.simDisabled.clear();
+    }
+
+    void advanceGhost(PlayerObject* ghost, float dt) {
+        ghost->update(dt);
+        ghost->updateRotation(dt);
+    }
+
+    void checkGhost(PlayLayer* layer, PlayerObject* ghost, float dt) {
+        ghost->m_collisionLogTop->removeAllObjects();
+        ghost->m_collisionLogBottom->removeAllObjects();
+        ghost->m_collisionLogLeft->removeAllObjects();
+        ghost->m_collisionLogRight->removeAllObjects();
+        layer->checkCollisions(ghost, dt, false);
+    }
+
+    bool isFlying(PlayerObject* player) {
+        return player->m_isDart || player->m_isBird || player->m_isSwing || player->m_isShip;
+    }
+
+    // Orb auto-clicks last one ghost update, then let go (unless the test itself is holding).
+    void releaseAutoClicks() {
+        if (buf.auto1) {
+            if (!buf.held1 && buf.ghost1) {
+                buf.ghost1->releaseButton(PlayerButton::Jump);
+            }
+            buf.auto1 = false;
+        }
+        if (buf.auto2) {
+            if (!buf.held2 && buf.ghost2) {
+                buf.ghost2->releaseButton(PlayerButton::Jump);
+            }
+            buf.auto2 = false;
+        }
+    }
+
+    enum class SimEnd { Ok, StopSearch };
+
+    // Returns ticks survived after the input (horizon = fully safe).
+    // releaseAfter: ticks after the input at which the ghost does the opposite (-1 = never).
+    // stopAt: stop as soon as this many ticks were survived (the caller already knows
+    // that's good enough), instead of always running the full horizon.
+    int simulate(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter,
+        int stopAt, SimEnd* end) {
+        *end = SimEnd::Ok;
+        if (!buf.ghost1) {
+            return horizon;
+        }
+        buf.simulating = true;
+        buf.ghostDied = false;
+        buf.ghostHitPortal = false;
+        buf.firstOrbTick = -1;
+        buf.orbUsedTick = -1;
+
+        bool second = dual && buf.ghost2 && p2;
+        buf.haveRealRect = buf.ignoreTouching;
+        buf.harmless.clear();
+        if (buf.haveRealRect) {
+            buf.realRect1 = p1->getObjectRect();
+            buf.realRect2 = second ? p2->getObjectRect() : buf.realRect1;
+        }
+        copyState(buf.ghost1, p1);
+        if (second) {
+            copyState(buf.ghost2, p2);
+        }
+        buf.held1 = buf.held2 = buf.appliedInput;
+        buf.auto1 = buf.auto2 = false;
+        buf.autoAt1 = buf.autoAt2 = -1;
+
+        // v4.6 wave: before a delayed input fires, the ghost is in the opposite state
+        // (holding before a delayed release, released before a delayed press).
+        bool waveRun = p1->m_isDart || (second && p2->m_isDart);
+        if (buf.waveV46 && waveRun && delay > 0 && !buf.skipPress) {
+            pressGhost(buf.ghost1, !down);
+            if (second) {
+                pressGhost(buf.ghost2, !down);
+            }
         }
 
-        if (ghost->m_collisionLogTop) ghost->m_collisionLogTop->removeAllObjects();
-        if (ghost->m_collisionLogBottom) ghost->m_collisionLogBottom->removeAllObjects();
-        if (ghost->m_collisionLogLeft) ghost->m_collisionLogLeft->removeAllObjects();
-        if (ghost->m_collisionLogRight) ghost->m_collisionLogRight->removeAllObjects();
-
-        ghost->update(SIM_DT);
-        ghost->updateRotation(SIM_DT);
-        layer->checkCollisions(ghost, SIM_DT, false);
-
-        if (g_prediction.died || ghost->m_isDead) {
-            result.diedBeforeInput = tick < delay;
-            result.survived = std::max(0, tick - delay);
-            break;
+        float dt = buf.tickLength;
+        if (!(dt > 0.001f && dt < 2.0f)) {
+            dt = TICK;
         }
-        if (g_prediction.hitUnknownObject) {
-            // This simulator does not model the object's effect, so neither the baseline nor
-            // a delayed candidate may claim safety from a trajectory that reaches it.
-            result.diedBeforeInput = true;
-            result.safe = false;
-            result.survived = 0;
-            break;
-        }
-        if (tick < delay) continue;
 
-        if (landingScored) {
-            if (!ghost->m_isOnGround) {
-                sawAir = true;
-                groundedAfterAir = 0;
-            } else if (sawAir) {
-                if (++groundedAfterAir >= 3) {
-                    result.safe = true;
-                    result.survived = horizon;
+        // (v1 forced a fake !down button event here for delay > 0, which made delayed
+        //  runs start from a different jump-buffer state than the "press now" run.
+        //  The ghost now simply mirrors the real player's button state, except in wave,
+        //  which keeps the v4.6 behaviour above.)
+
+        bool flying = isFlying(p1) || (dual && p2 && isFlying(p2));
+        bool spiderRun = buf.spiderSmart && (p1->m_isSpider || (second && p2->m_isSpider));
+        // v2.40: a UFO that lands on something has finished its flap, like a cube jump
+        bool ufoRun = buf.ufoSmart && (p1->m_isBird || (second && p2->m_isBird));
+        // v2.45 ball: a flip in a tight corridor can land after only a few ticks, and a ball
+        // often lands right next to a spike on the new surface, so short flips count as
+        // landings and the landing has to last longer before the flip is called safe.
+        bool ballRun = buf.ballSmart && (p1->m_isBall || (second && p2->m_isBall));
+        int total = delay + horizon;
+        int survived = 0;
+        int airTicks = 0;
+        int groundTicks = 0;
+        int tick = 0;
+        bool died = false;
+        bool safe = false;
+
+        collectMovers();
+        for (; tick < total; ++tick) {
+            if (!movers.empty()) {
+                placeMovers(tick + 1);  // where they'll be after this step
+            }
+            buf.simTick = tick;
+            // v2.26: orb auto-clicks that wait a few ticks into the orb fire here, if the
+            // ghost is still inside an orb by then.
+            if (buf.autoAt1 >= 0 && tick >= buf.autoAt1) {
+                if (!buf.held1 && buf.ghost1->m_touchingRings->count() > 0) {
+                    buf.ghost1->pushButton(PlayerButton::Jump);
+                    buf.auto1 = true;
+                }
+                buf.autoAt1 = -2;
+            }
+            if (second && buf.autoAt2 >= 0 && tick >= buf.autoAt2) {
+                if (!buf.held2 && buf.ghost2->m_touchingRings->count() > 0) {
+                    buf.ghost2->pushButton(PlayerButton::Jump);
+                    buf.auto2 = true;
+                }
+                buf.autoAt2 = -2;
+            }
+            if (tick == delay && !buf.skipPress) {
+                pressGhost(buf.ghost1, down);
+                if (second) {
+                    pressGhost(buf.ghost2, down);
+                }
+            }
+            if (buf.retapAt >= 0) {
+                // v2.15: a second tap (let go, press, let go): "flip back" for the spider
+                int t = tick - delay - buf.retapAt;
+                if (t == 0 || t == 1 || t == 5) {
+                    pressGhost(buf.ghost1, t == 1);
+                    if (second) {
+                        pressGhost(buf.ghost2, t == 1);
+                    }
+                }
+            }
+            // v2.16: a dash lasts as long as you hold, so the ghost doesn't let go mid-dash.
+            if (down && releaseAfter >= 0 && tick == delay + releaseAfter && buf.ghost1->m_isDashing) {
+                ++releaseAfter;
+            }
+            if (releaseAfter >= 0 && tick == delay + releaseAfter) {
+                // let go of a press (or, for a wave release, press again: the turn back)
+                pressGhost(buf.ghost1, !down);
+                if (second) {
+                    pressGhost(buf.ghost2, !down);
+                }
+            }
+
+            // v2.18: with CBF the click lands partway through a tick, so the ghost's first
+            // step is only the rest of that tick; after it, ghost and game are on the same
+            // tick boundaries again.
+            float stepDt = tick == 0 ? dt * buf.firstStep : dt;
+            advanceGhost(buf.ghost1, stepDt);
+            if (second) {
+                advanceGhost(buf.ghost2, stepDt);
+            }
+            releaseAutoClicks();
+            if (buf.ghostDied) {
+                died = true;
+                break;
+            }
+
+            // v2.36: after a mid-tick (CBF) click the game finishes the tick and then runs its
+            // normal collision check with the full step, so the ghost does the same.
+            checkGhost(layer, buf.ghost1, dt);
+            if (!buf.ghostDied && second) {
+                checkGhost(layer, buf.ghost2, dt);
+            }
+            if (buf.ghostDied) {
+                died = true;
+                break;
+            }
+            if (buf.recordPath) {
+                buf.recordPath->push_back(buf.ghost1->getPosition());
+            }
+            if (buf.ghostHitPortal) {
+                safe = tick >= delay;
+                break;
+            }
+
+            if (tick < delay) {
+                continue;
+            }
+            ++survived;
+            if (survived >= stopAt) {
+                break;
+            }
+            if (flying && !ufoRun) {
+                continue;
+            }
+
+            bool grounded = buf.ghost1->m_isOnGround && (!second || buf.ghost2->m_isOnGround);
+            if (grounded && airTicks > 0 && buf.captureKiller) {
+                buf.baseTouchedDown = true;
+            }
+            if (!grounded) {
+                ++airTicks;
+                groundTicks = 0;
+                continue;
+            }
+            // v2.15 spider: a flip is a teleport with no air time, so the cube's "was in the
+            // air, then landed" never happened and every spider run went the full 130 ticks
+            // into obstacles that need your next click. Now: standing on a surface for
+            // SPIDER_LAND ticks after the input = the flip is done and safe.
+            if (spiderRun) {
+                if (++groundTicks >= st(SPIDER_LAND)) {
+                    safe = true;
+                    break;
+                }
+                continue;
+            }
+            if (airTicks < st(ballRun ? 2 : 6)) {
+                continue;
+            }
+            if (groundTicks > st(ballRun ? 8 : 2)) {
+                safe = true;
+                break;
+            }
+            ++groundTicks;
+        }
+
+        if (!movers.empty()) {
+            placeMovers(0);  // back exactly where they were
+            movers.clear();
+        }
+        ++buf.simRuns;
+        buf.simTicks += tick + 1;
+
+        // Died or hit an unsimulated portal before the delayed input even fired:
+        // longer delays can't do better, stop searching.
+        if ((died || buf.ghostHitPortal) && tick < delay) {
+            *end = SimEnd::StopSearch;
+        }
+        restoreObjects();
+        buf.ghost1->stopAllActions();
+        if (buf.ghost2) {
+            buf.ghost2->stopAllActions();
+        }
+        buf.simulating = false;
+        return safe ? horizon : survived;
+    }
+
+    // v2.4: simulate() with the orb setting; if that run touched an orb and didn't make
+    // it, also try the other choice (click it / skip it) and keep whichever lives longer,
+    // like a player who only clicks the orb when they need it.
+    int simulateOrbs(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter,
+        int stopAt, SimEnd* end) {
+        buf.orbClick = buf.assumeOrbs;
+        buf.touchedOrb = false;
+        int first = simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, stopAt, end);
+        if (!buf.tryBothOrbs || !buf.smart || !buf.touchedOrb || first >= stopAt) {
+            return first;
+        }
+        SimEnd firstEnd = *end;
+        buf.orbClick = !buf.assumeOrbs;
+        int second = simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, stopAt, end);
+        buf.orbClick = buf.assumeOrbs;
+        if (firstEnd != SimEnd::StopSearch) {
+            *end = SimEnd::Ok;
+        }
+        int best = std::max(first, second);
+        // v2.26: some orbs only work when clicked at a specific moment inside them (levels
+        // like Orbit). The ghost's orb clicks are also tried 3 and 6 ticks into the orb.
+        if (buf.orbTiming && best < stopAt) {
+            for (int late : { 3, 6 }) {
+                buf.orbClick = true;
+                buf.orbClickDelay = st(late);
+                SimEnd lateEnd;
+                int ret = simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, stopAt, &lateEnd);
+                buf.orbClickDelay = 0;
+                buf.orbClick = buf.assumeOrbs;
+                best = std::max(best, ret);
+                if (best >= stopAt) {
                     break;
                 }
             }
         }
-        result.survived = std::min(horizon, tick - delay + 1);
-        if (result.survived >= horizon) {
-            result.safe = true;
-            break;
+        return best;
+    }
+
+    // Ghost 1's position after every tick of one run (until it dies or is safe).
+    std::vector<CCPoint> recordRun(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon,
+        int releaseAfter, bool* died = nullptr) {
+        std::vector<CCPoint> path;
+        buf.recordPath = &path;
+        buf.orbClick = buf.assumeOrbs;
+        SimEnd end;
+        simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, delay + horizon, &end);
+        buf.recordPath = nullptr;
+        if (died) {
+            *died = buf.ghostDied;
+        }
+        return path;
+    }
+
+    // v2.11 path view (F10): red = what your input would have done right now, green = what
+    // the game actually gets. A dot marks where a delayed input fires, a red dot a crash.
+    void drawPath(std::vector<CCPoint> const& path, int delay, ccColor4F color, bool died) {
+        for (size_t i = 1; i < path.size(); ++i) {
+            buf.pathNode->drawSegment(path[i - 1], path[i], 1.2f, color);
+        }
+        if (delay > 0 && delay <= static_cast<int>(path.size())) {
+            buf.pathNode->drawDot(path[delay - 1], 3.f, { 1.f, 1.f, 1.f, 0.9f });
+        }
+        if (died && !path.empty()) {
+            buf.pathNode->drawDot(path.back(), 4.f, { 1.f, 0.2f, 0.2f, 1.f });
         }
     }
-    g_prediction.simulating = false;
-    sweepPredictionGhostLayer();
-    return result;
-}
 
-// All standard modes share the ghost physics core, but use different safety horizons.
-// Wave and ship also try a late inverse input, following the upstream predictor's recovery idea.
-static int findPredictiveDelay(PlayLayer* layer, PlayerObject* player, int maxDelay, bool inputDown) {
-    if (!layer || !player || !g_prediction.ghost || maxDelay <= 0 || player->m_isDead) return 0;
-
-    const bool isShip = player->m_isShip;
-    const bool isWave = player->m_isDart;
-    const bool isSwing = player->m_isSwing;
-    const bool isUfo = player->m_isBird;
-    const bool continuousHold = isShip || isWave;
-    const bool landingScored = !(isShip || isWave || isSwing);
-    if (!inputDown && landingScored && !isUfo) return 0;
-
-    const int horizon = (isShip || isWave || isSwing || isUfo)
-        ? std::clamp(maxDelay * 6, 36, 72)
-        : std::clamp(maxDelay * 8, 48, 144);
-    const int holdTicks = continuousHold ? -1 : predictionHoldEstimate(player->m_isRobot);
-    using clock = std::chrono::steady_clock;
-    const auto started = clock::now();
-    constexpr double budgetMs = 6.0;
-    auto overBudget = [&] {
-        return std::chrono::duration<double, std::milli>(clock::now() - started).count() > budgetMs;
-    };
-    auto score = [&](int delay, int recovery = -1) {
-        return simulatePredictionInput(layer, player, delay, inputDown, horizon, holdTicks, continuousHold, recovery);
-    };
-
-    auto base = score(0);
-    if (overBudget()) {
-        DBG("[InputBuffer] prediction baseline exceeded 6ms budget; input passed through");
-        return 0;
-    }
-    if (base.safe || base.diedBeforeInput) return 0;
-
-    for (int delay = 1; delay <= maxDelay; ++delay) {
-        auto candidate = score(delay);
-        if (overBudget()) {
-            DBG("[InputBuffer] prediction search exceeded 6ms budget; input passed through");
-            return 0;
-        }
-        if (candidate.diedBeforeInput) break;
-        if (candidate.safe) {
-            log::info("[InputBuffer] PREDICT: {} survived {} steps now; delay {} predicted safe (mode {}, horizon {}).",
-                inputDown ? "press" : "release", base.survived, delay, modeName(player), horizon);
-            return delay;
-        }
-        if (isWave || isShip) {
-            for (int margin : {4, 8, 12}) {
-                int recovery = candidate.survived - margin;
-                if (recovery < 4) continue;
-                auto recovered = score(delay, recovery);
-                if (overBudget()) {
-                    DBG("[InputBuffer] prediction recovery search exceeded 6ms budget; input passed through");
-                    return 0;
-                }
-                if (recovered.safe) {
-                    log::info("[InputBuffer] PREDICT: {} delay {} with recovery {} predicted safe [{}].",
-                        inputDown ? "press" : "release", delay, recovery, modeName(player));
-                    return delay;
-                }
-            }
-        }
-    }
-    DBG("[InputBuffer] prediction found no safer {} for mode {}; input passed through",
-        inputDown ? "press" : "release", modeName(player));
-    return 0;
-}
-
-
-class $modify(BufferReset, PlayLayer) {
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        if (!createPredictionGhost(this)) {
-            log::warn("[InputBuffer] prediction ghost creation failed; predictive mode will pass inputs through");
-        }
-        return true;
-    }
-
-    void resetLevel() {
-        PlayLayer::resetLevel();
-        g_resetEpoch++;
-    }
-
-    void resetLevelFromStart() {
-        PlayLayer::resetLevelFromStart();
-        g_resetEpoch++;
-    }
-
-    void loadFromCheckpoint(CheckpointObject* object) {
-        PlayLayer::loadFromCheckpoint(object);
-        g_resetEpoch++;
-    }
-
-    void destroyPlayer(PlayerObject* player, GameObject* object) {
-        // A predicted ghost death is only a simulation result, never a real death.
-        if (g_prediction.simulating && player == g_prediction.ghost) {
-            g_prediction.died = true;
-            player->m_isDead = true;
+    void showPaths(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int chosen, bool down, int horizon, int releaseAfter) {
+        if (!buf.showPath || !buf.pathNode) {
             return;
         }
-        PlayLayer::destroyPlayer(player, object);
-        g_resetEpoch++;
-        g_lastDeathPct = this->getCurrentPercent();
-    }
-
-    // Switches settings when the player moves into a different section.
-    void postUpdate(float dt) {
-        PlayLayer::postUpdate(dt);
-        if (!g_secActive) return;
-        if (m_level && m_level->isPlatformer()) return;
-        std::string tok = sectionToken(this->getCurrentPercent());
-        if (tok == g_secToken) return;
-        g_secToken = tok;
-        applyToken(tok, levelKeyFor(m_level));
-        g_resetEpoch++; // start the new section with clean input state
-        DBG("[InputBuffer] Section -> {}", tok);
-    }
-
-    // Leaving the level puts the player's own settings back.
-    void onExit() {
-        dropPredictionGhost();
-        PlayLayer::onExit();
-        g_secActive = false;
-        g_secToken.clear();
-        restoreAfterLevel();
-    }
-
-    // Applies the profile linked to this level, if there is one.
-    void setupHasCompleted() {
-        PlayLayer::setupHasCompleted();
-        if (!m_level) return;
-        int id = levelKeyFor(m_level);
-        if (id == 0) return;
-        std::string name = levelProfileFor(id);
-        g_secActive = false;
-        g_secToken.clear();
-        LevelSections ls = loadLevelSections(id);
-        bool useSections = Mod::get()->getSettingValue<bool>("sections") && !ls.secs.empty();
-        if (name.empty() && !useSections) return;
-        // Remember the player's own settings so they can be restored on exit.
-        ensureSnapshot();
-        if (!name.empty() && applyProfileByName(name)) {
-            log::info("[InputBuffer] Applied profile '{}' for level {}", name, id);
-            std::string msg = "Input Buffer profile: " + name;
-            Notification::create(msg.c_str(), NotificationIcon::Success, 1.5f)->show();
+        buf.pathNode->clear();
+        buf.pathHoldUntil = tickCount + st(45);
+        bool nowDied = false;
+        auto now = recordRun(layer, p1, p2, dual, 0, down, horizon, releaseAfter, &nowDied);
+        ccColor4F red { 1.f, 0.3f, 0.3f, 0.85f };
+        ccColor4F green { 0.3f, 1.f, 0.5f, 0.9f };
+        drawPath(now, 0, chosen > 0 ? red : (nowDied ? red : green), nowDied);
+        if (chosen > 0) {
+            bool died = false;
+            auto delayed = recordRun(layer, p1, p2, dual, chosen, down, horizon, releaseAfter, &died);
+            drawPath(delayed, chosen, green, died);
         }
-        if (useSections) {
-            sortSections(ls);
-            g_sec = ls;
-            g_secActive = true;
-            log::info("[InputBuffer] {} sections active for level {}", ls.secs.size(), id);
-        }
-    }
-};
-
-
-struct PState {
-    bool held = false;
-    bool pending = false;
-    int pendingStart = 0;
-    int lastRingCount = 0;
-    bool releaseNext = false;
-
-    int pressStep = -1;
-    bool delayedRelease = false;
-    int releaseAt = 0;
-
-    std::vector<std::pair<bool, int>> waveQueue;
-    // Predictive-input event queue and persistent shift: press/release timing is shifted
-    // together so a tap is not swallowed or converted into a stuck hold.
-    std::vector<std::pair<bool, int>> predictionQueue;
-    int predictionShift = 0;
-    int lastReleaseStep = -1000000;
-};
-
-class $modify(BufferLayer, GJBaseGameLayer) {
-    struct Fields {
-        int step = 0;
-        int epoch = 0;
-        int graceUntil = 0;
-        PState ps[2];
-    };
-
-    // True in a one-player level with a dual portal: a single click is sent
-    // as player 1 and the game applies it to both icons.
-    bool sharedDualInput() {
-        return m_gameState.m_isDualMode && m_levelSettings && !m_levelSettings->m_twoPlayerMode;
-    }
-
-    // Press or release for one icon. In a dual section each icon has its own
-    // state and decides for itself, so nothing is mirrored here.
-    void sendInput(PlayerObject* p, bool down) {
-        if (down) p->pushButton(PlayerButton::Jump);
-        else p->releaseButton(PlayerButton::Jump);
-    }
-
-    // When experimental dual support is off, nothing may stay held back from
-    // an earlier section: deliver what is queued and drop pending rescues.
-    void bypassCleanup() {
-        auto f = m_fields.operator->();
-        PlayerObject* players[2] = {m_player1, m_player2};
-        for (int i = 0; i < 2; i++) {
-            auto p = players[i];
-            auto& s = f->ps[i];
-            if (!p) { s = PState(); continue; }
-            if (!s.waveQueue.empty()) flushWaveQueue(p, s, i);
-            for (auto const& ev : s.predictionQueue) sendInput(p, ev.first);
-            s.predictionQueue.clear();
-            s.predictionShift = 0;
-            if (s.delayedRelease) {
-                s.delayedRelease = false;
-                s.held = false;
-                sendInput(p, false);
-            }
-            if (s.releaseNext) {
-                s.releaseNext = false;
-                if (!s.held) sendInput(p, false);
-            }
-            s.pending = false;
-        }
-    }
-
-    // Clears our state after a death / restart / checkpoint load.
-    void syncState() {
-        auto f = m_fields.operator->();
-        if (f->epoch == g_resetEpoch) return;
-        f->epoch = g_resetEpoch;
-
-        bool inconsistent = false;
-        for (auto& s : f->ps) {
-            if (s.delayedRelease || s.releaseNext || !s.waveQueue.empty() ||
-                !s.predictionQueue.empty() || s.predictionShift > 0) {
-                inconsistent = true;
-            }
-            s = PState();
-        }
-
-        // Wave Grid / Min Gap are skipped briefly after a spawn so the first
-        // clicks go straight through.
-        f->graceUntil = f->step + spawnGraceSteps();
-
-        // We may have held back a release the game never saw. Releasing a
-        // button that is not held is harmless, so make sure nothing is stuck.
-        if (inconsistent) {
-            if (m_player1) m_player1->releaseButton(PlayerButton::Jump);
-            if (m_player2) m_player2->releaseButton(PlayerButton::Jump);
-        }
-        DBG("[InputBuffer] state reset (death/restart), spawn grace until step {}{}",
-            f->graceUntil, inconsistent ? ", released stuck button" : "");
-    }
-
-    void flushWaveQueue(PlayerObject* p, PState& s, int idx) {
-        for (auto const& ev : s.waveQueue) {
-            sendInput(p, ev.first);
-        }
-        s.waveQueue.clear();
-    }
-
-    void stepPlayer(PlayerObject* p, PState& s, int idx) {
-        int step = m_fields->step;
-        char const* tag = idx == 0 ? "P1" : "P2";
-
-        if (!s.waveQueue.empty()) {
-            if (!isFlyMode(p)) {
-                flushWaveQueue(p, s, idx);
-            } else {
-                size_t applied = 0;
-                while (applied < s.waveQueue.size() &&
-                       step >= s.waveQueue[applied].second) {
-                    auto ev = s.waveQueue[applied];
-                    sendInput(p, ev.first);
-                    DBG("[InputBuffer] {} {} {} {} applied at step {}",
-                        tag, modeName(p), WAVE_NAMES[styleFor(p)], ev.first ? "PRESS" : "RELEASE", step);
-                    applied++;
+        // v2.13: spots on this path where the memory has seen you die a lot.
+        if (buf.learn && !memory.empty()) {
+            int last = INT_MIN;
+            for (auto const& point : now) {
+                int slice = static_cast<int>(std::floor(point.x / SLICE));
+                if (slice != last && memoryRisky(slice)) {
+                    buf.pathNode->drawDot(point, 3.5f, { 1.f, 0.6f, 0.1f, 0.95f });
                 }
-                s.waveQueue.erase(s.waveQueue.begin(), s.waveQueue.begin() + applied);
+                last = slice;
             }
         }
+    }
 
-        if (!s.predictionQueue.empty()) {
-            size_t applied = 0;
-            while (applied < s.predictionQueue.size() &&
-                   step >= s.predictionQueue[applied].second) {
-                auto ev = s.predictionQueue[applied];
-                sendInput(p, ev.first);
-                DBG("[InputBuffer] {} PREDICT {} applied at step {}", tag, ev.first ? "PRESS" : "RELEASE", step);
-                ++applied;
-                if (!ev.first && applied == s.predictionQueue.size()) {
-                    s.predictionShift = 0;
-                }
-            }
-            s.predictionQueue.erase(s.predictionQueue.begin(), s.predictionQueue.begin() + applied);
-            if (s.predictionQueue.empty() && !s.held) s.predictionShift = 0;
-        }
-
-        if (s.delayedRelease) {
-            if (!isFlyMode(p) || step >= s.releaseAt) {
-                s.delayedRelease = false;
-                s.held = false;
-                sendInput(p, false);
-                DBG("[InputBuffer] {} MIN-HOLD release applied at step {} [{}]",
-                    tag, step, modeName(p));
-            }
-        }
-
-        if (s.releaseNext) {
-            s.releaseNext = false;
-            if (!s.held) sendInput(p, false);
-        }
-
-        if (!s.pending) return;
-
-        int waited = step - s.pendingStart;
-        int limit = modeLimitSteps(p);
-
-        if (limit <= 0 || waited > limit || !isGroundMode(p)) {
-            DBG("[InputBuffer] {} pending EXPIRED waited={} limit={} mode={}",
-                tag, waited, limit, modeName(p));
-            s.pending = false;
-
-            // The early press was intercepted, so it must not disappear when the
-            // landing window expires. Deliver it now and preserve tap/hold state.
-            sendInput(p, true);
-            if (!s.held) s.releaseNext = true;
-            DBG("[InputBuffer] {} pending fallback PRESS after expiry [{}]",
-                tag, modeName(p));
+    // v2.4: record the ghost run for the input that was actually made (drift check).
+    void startDrift(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter) {
+        finishDrift("");
+        if (!buf.driftCheck) {
             return;
         }
-
-        int rings = ringsTouching(p);
-        if (rings != s.lastRingCount) {
-            DBG("[InputBuffer] {} ring overlap count {} -> {} (waited {})",
-                tag, s.lastRingCount, rings, waited);
-            s.lastRingCount = rings;
-        }
-
-        bool onGround = p->m_isOnGround;
-        bool onRing = rings > 0;
-
-        if (onGround || onRing) {
-            s.pending = false;
-            float ticksSaved = waited / stepsPerTick();
-            char const* what = onRing ? "RING" : "GROUND";
-
-            // The original early press was swallowed. Start it at the opening,
-            // whether the player is still holding or already released. A tap
-            // released before the opening is ended on the next physics step.
-            sendInput(p, true);
-            if (!s.held) s.releaseNext = true;
-            DBG("[InputBuffer] *** SAVED +{:.1f} TICKS ({:.2f} frames @ 60fps) PRESS! [{} {} {}] (Step0: {} -> Delayed: {}) [Limit: {} steps]{} ***",
-                ticksSaved, ticksSaved / 4.0f, tag, modeName(p), what,
-                s.pendingStart, step, limit,
-                s.held ? " (preserving held input)" : " (tap; release next step)");
-        }
+        drift.path = recordRun(layer, p1, p2, dual, delay, down, horizon, releaseAfter);
+        drift.active = !drift.path.empty();
+        // v2.38: a normal click is handled before the tick runs, so the first comparison is
+        // one update later. A mid-tick (CBF) click is handled inside the tick, so the ghost's
+        // first (partial) step ends at the very next tick start: compare from there.
+        drift.index = buf.firstStep < 1.f ? 0 : -1;
+        drift.compared = 0;
+        drift.maxErr = 0.f;
+        drift.maxAt = 0;
     }
 
-    bool inputPlayer(PlayerObject* p, PState& s, int idx, bool down) {
-        int step = m_fields->step;
-        char const* tag = idx == 0 ? "P1" : "P2";
+    // After every buffer decision: drift check + path view for the input the game gets.
+    // v2.70: when the current click started being processed; the extras after the search
+    // (robust check, drift check, path view) are skipped once the click has used up its
+    // time, so one click can't stall a frame for long. The search itself keeps its budget.
+    std::chrono::steady_clock::time_point clickStart;
 
-        // Finish any already-delayed input even if a mode portal is crossed before
-        // its release arrives. Press and release must stay on the same shifted timeline.
-        if (s.predictionShift > 0 || !s.predictionQueue.empty()) {
-            if (down && !s.held) {
-                s.pressStep = step;
-            } else if (!down && s.pressStep >= 0) {
-                if (p->m_isRobot) {
-                    recordPredictionHold(step - s.pressStep, true);
-                } else if (!p->m_isShip && !p->m_isDart && !p->m_isRobot &&
-                           !p->m_isBall && !p->m_isSpider) {
-                    recordPredictionHold(step - s.pressStep, false);
-                }
-                s.pressStep = -1;
+    double clickMs() {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count();
+    }
+
+    void decided(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter) {
+        memoryNote(p1, delay);
+        if (clickMs() > buf.budgetMs * 1.5) {
+            finishDrift("");  // no time left for the debug runs this click
+            return;
+        }
+        startDrift(layer, p1, p2, dual, delay, down, horizon, releaseAfter);
+        showPaths(layer, p1, p2, dual, delay, down, horizon, releaseAfter);
+    }
+
+    // Full wave look-ahead from the setting (mini = 15 less).
+    int fullWaveHorizon(bool mini) {
+        int wh = std::clamp(buf.waveHorizon, 20, 160);
+        return st(mini ? std::max(20, wh - 15) : wh);  // v4.6: 65 normal / 50 mini
+    }
+
+    // v2.6 orb alignment: a press made a little before reaching an orb would be wasted
+    // (or jump off the ground instead). Find the delay that lands the press inside the
+    // orb, like the cube buffer does for jumps. Returns that delay, or 0.
+    int alignOrb(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int horizon, int releaseAfter, int learned, int* landed) {
+        int window = st(std::clamp(buf.orbWindow, 1, 64));
+        int found = 0;
+        SimEnd end;
+        buf.orbClick = false;  // the press being tested is the orb click
+        buf.orbWasTiming = false;
+
+        // v2.26: the orb timing that worked at this spot on earlier runs is tried first.
+        if (learned > 0 && learned <= window) {
+            int ret = simulate(layer, p1, p2, dual, learned, true, horizon, releaseAfter, horizon, &end);
+            if (buf.orbUsedTick >= 0 && ret >= horizon) {
+                *landed = ret;
+                buf.orbClick = buf.assumeOrbs;
+                return learned;
             }
-            s.held = down;
-            int target = step + s.predictionShift;
-            if (!s.predictionQueue.empty() && target <= s.predictionQueue.back().second) {
-                target = s.predictionQueue.back().second + 1;
-            }
-            s.predictionQueue.emplace_back(down, target);
-            DBG("[InputBuffer] {} PREDICT {} queued at step {} -> {} (shift {})",
-                tag, down ? "PRESS" : "RELEASE", step, target, s.predictionShift);
-            return true;
         }
 
-        // All-mode predictive path: cube, ball, robot, spider, ship, UFO, wave and swing.
-        // Practice-only until the first on-device validation is complete.
-        auto* currentLayer = PlayLayer::get();
-        bool supportedPredictionMode = p && (p->m_isShip || p->m_isBird || p->m_isBall ||
-            p->m_isDart || p->m_isRobot || p->m_isSpider || p->m_isSwing ||
-            (!p->m_isShip && !p->m_isBird && !p->m_isBall && !p->m_isDart &&
-             !p->m_isRobot && !p->m_isSpider && !p->m_isSwing));
-        if (supportedPredictionMode && currentLayer && currentLayer->m_isPracticeMode &&
-            !currentLayer->m_isPlatformer && !sharedDualInput() &&
-            !(m_levelSettings && m_levelSettings->m_twoPlayerMode)) {
-            bool wasHeld = s.held;
-            if (down && !wasHeld) {
-                s.pressStep = step;
-            } else if (!down && s.pressStep >= 0) {
-                if (p->m_isRobot) {
-                    recordPredictionHold(step - s.pressStep, true);
-                } else if (!p->m_isShip && !p->m_isDart && !p->m_isRobot &&
-                           !p->m_isBall && !p->m_isSpider) {
-                    recordPredictionHold(step - s.pressStep, false);
-                }
-                s.pressStep = -1;
-            }
-            s.held = down;
-            s.pending = false;
-            if (down != wasHeld || isFlyMode(p)) {
-                int maxDelay = modeLimitSteps(p);
-                int delay = findPredictiveDelay(currentLayer, p, maxDelay, down);
-                if (delay > 0) {
-                    s.predictionShift = delay;
-                    s.predictionQueue.emplace_back(down, step + delay);
-                    DBG("[InputBuffer] {} PREDICT selected {} +{} steps [{}]",
-                        tag, down ? "PRESS" : "RELEASE", delay, modeName(p));
-                    return true;
-                }
-            }
-            return false;
-        }
+        // 1. Cheap probe: without pressing, does the ghost reach an orb soon?
+        buf.skipPress = true;
+        simulate(layer, p1, p2, dual, 0, true, window + 2, -1, window + 2, &end);
+        buf.skipPress = false;
+        int touch = buf.firstOrbTick;
+        std::string trace;  // v2.42: what was tried, for the explain log
 
-        if (!isFlyMode(p) && !s.waveQueue.empty()) {
-            flushWaveQueue(p, s, idx);
-        }
-
-        int n = modeLimitSteps(p);
-        int style = styleFor(p);
-        bool inGrace = step < m_fields->graceUntil;
-        if (isFlyMode(p) && inGrace && n > 0 && style != WAVE_HOLD) {
-            DBG("[InputBuffer] {} {} {} {} passed through (spawn grace) at step {}",
-                tag, modeName(p), WAVE_NAMES[style], down ? "PRESS" : "RELEASE", step);
-        }
-
-        if (isFlyMode(p) && n > 0 && style != WAVE_HOLD && !inGrace) {
-            int target;
-            if (style == WAVE_GRID) {
-                target = ((step + n - 1) / n) * n;
-                if (!s.waveQueue.empty()) {
-                    auto const& last = s.waveQueue.back();
-                    target = std::max(target, last.second);
-                    // A tap must hold for at least one grid cell, or the
-                    // press and release would cancel out in the same step.
-                    if (!down && last.first) {
-                        target = std::max(target, last.second + n);
+        if (touch >= 0 && touch <= window) {
+            // 2. Pressing now already uses an orb (e.g. held into it).
+            int now = simulate(layer, p1, p2, dual, 0, true, horizon, releaseAfter, horizon, &end);
+            bool nowUses = buf.orbUsedTick >= 0;
+            if (nowUses && now < horizon && buf.orbTiming) {
+                // v2.26: ...but crashes. Where in the orb you click changes where it sends
+                // you, so try clicking 1 to 6 ticks later, still inside the orb; the run
+                // that lives longest (and clearly longer than now) wins.
+                int bestRet = -1;
+                for (int k = 1; k <= std::min(window, st(6)); ++k) {
+                    int ret = simulate(layer, p1, p2, dual, k, true, horizon, releaseAfter, horizon, &end);
+                    if (buf.explain) {
+                        trace += fmt::format(" +{}:{}{}", k, ret, buf.orbUsedTick >= 0 ? "o" : "-");
+                    }
+                    if (end == SimEnd::StopSearch) {
+                        break;
+                    }
+                    if (buf.orbUsedTick < 0 || ret < std::min(horizon, now + st(12)) || ret <= bestRet) {
+                        continue;
+                    }
+                    bestRet = ret;
+                    found = k;
+                    *landed = ret;
+                    buf.orbWasTiming = true;
+                    if (ret >= horizon) {
+                        break;
                     }
                 }
-            } else { // WAVE_GAP
-                target = step;
-                if (!s.waveQueue.empty()) {
-                    target = std::max(target, s.waveQueue.back().second);
-                }
-                if (down) {
-                    target = std::max(target, s.lastReleaseStep + n);
-                } else {
-                    s.lastReleaseStep = target;
-                }
-                if (target == step && s.waveQueue.empty()) {
-                    s.held = down;
-                    return false;
+            }
+            else if (!nowUses) {
+                // 3. Every delay while you're inside the orb whose press really uses it and
+                //    doesn't crash sooner than missing it would. v2.16: the one that lives
+                //    longest wins (earliest on a tie), instead of simply the first that hits
+                //    the orb: where in the orb you click changes where the orb sends you.
+                int bestRet = -1;
+                for (int k = std::max(1, touch - 1); k <= std::min(window, touch + st(6)); ++k) {
+                    int ret = simulate(layer, p1, p2, dual, k, true, horizon, releaseAfter, horizon, &end);
+                    if (buf.explain) {
+                        trace += fmt::format(" +{}:{}{}", k, ret, buf.orbUsedTick >= 0 ? "o" : "-");
+                    }
+                    if (end == SimEnd::StopSearch) {
+                        break;
+                    }
+                    if (buf.orbUsedTick < 0 || ret < std::min(now, horizon)) {
+                        continue;
+                    }
+                    if (ret > bestRet) {
+                        bestRet = ret;
+                        found = k;
+                        *landed = ret;
+                    }
+                    if (ret >= horizon) {
+                        break;  // fully safe: a later tick can't beat it
+                    }
                 }
             }
+            // v2.42 explain: "+k:ret o" = press k ticks later lives ret ticks and used the orb
+            // ("-" = missed it); a pick needs to use the orb and live at least as long as now.
+            if (buf.explain) {
+                say("orb: touch at t{}, press now {} -> {}t |{} => {}", touch, nowUses ? "uses it" : "misses it", now,
+                    trace.empty() ? " (nothing to try)" : trace, found > 0 ? fmt::format("+{}t", found) : std::string("no pick"));
+            }
+        }
+        buf.orbClick = buf.assumeOrbs;
+        return found;
+    }
 
-            s.held = down;
-            s.waveQueue.emplace_back(down, target);
-            DBG("[InputBuffer] {} {} {} {} queued at step {} -> {} ({} steps)",
-                tag, modeName(p), WAVE_NAMES[style], down ? "PRESS" : "RELEASE", step, target, n);
+    // v2.1: best delayed run seen by the last search (shown in the "no save" log line)
+    int dbgBestK = 0;
+    int dbgBestRet = -1;
+
+    // v2.7 wave scoring, the wave version of the cube's "landed safely". A wave never
+    // lands, so a run that keeps going one way eventually hits a wall even in a normal
+    // corridor, where you'd simply turn. So: if the run crashes, try turning back a bit
+    // before the crash; if that turn survives, you had time to react and the run counts
+    // as safe. Only crashes you couldn't have turned away from count as deaths.
+    // v2.10: three turn points are tried (4, 8 and 12 ticks before the crash) instead of
+    // one, so "you could have turned away" is found whenever it's true.
+    constexpr int WAVE_TURN_MARGINS[] = { 4, 8, 12 };
+    constexpr int WAVE_MIN_TURN = 6;      // a turn sooner than this after the input is too fast to count
+    constexpr int WAVE_ESCAPE = 16;       // the turn must then survive this many ticks
+
+    // `target`: surviving this long is already good enough, so the run stops there and the
+    // turn-away checks are skipped (v2.10: saves most of the work in the search).
+    int waveScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int target,
+        SimEnd* end) {
+        int ret = simulateOrbs(layer, p1, p2, dual, delay, down, horizon, -1, target, end);
+        if (ret >= target || *end == SimEnd::StopSearch) {
+            return ret;
+        }
+        for (int margin : WAVE_TURN_MARGINS) {
+            int turnAt = ret - st(margin);
+            if (turnAt < st(WAVE_MIN_TURN)) {
+                break;
+            }
+            int length = std::min(horizon, turnAt + st(WAVE_ESCAPE));
+            SimEnd turnEnd;
+            int turned = simulateOrbs(layer, p1, p2, dual, delay, down, length, turnAt, length, &turnEnd);
+            if (turned >= length) {
+                if (buf.captureKiller && buf.baseEscape < 0) {
+                    buf.baseEscape = turnAt;
+                    buf.baseCrash = ret;
+                }
+                return horizon;
+            }
+        }
+        return ret;
+    }
+
+    // v2.7 wave search, same rules as the cube: the smallest delay that is safe (or
+    // clearly better than now) wins, so turns are only held back as long as needed.
+    // v2.12 robot scoring. A robot press is a jump whose height you set by when you let go,
+    // so "pressing now crashes" only if NO release time saves it. Your usual hold is tried
+    // first, then short to long holds. (Before, only your usual hold was tested, so a press
+    // that needed a shorter or longer hold looked like a death and got delayed for nothing.)
+    constexpr int ROBOT_HOLDS[] = { 6, 14, 26, 45 };
+    int robotUsedHold = -1;   // hold length that made the last robot run survive
+
+    // v2.73: quick pass of a robot / UFO / spider search: only the plain run per delay (your
+    // usual robot hold, no extra flap / flip). Those modes tried up to 5x more runs per
+    // delay, so the search ran out of time after 2-10 delays and missed saves further out.
+    bool quickScore = false;
+
+    int robotScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, int horizon, int target, SimEnd* end) {
+        int usual = robotHold.pick(st(20), 50);
+        int best = simulateOrbs(layer, p1, p2, dual, delay, true, horizon, usual, target, end);
+        robotUsedHold = usual;
+        if (best >= target || *end == SimEnd::StopSearch || quickScore) {
+            return best;
+        }
+        for (int hold : ROBOT_HOLDS) {
+            if (std::abs(st(hold) - usual) < st(3)) {
+                continue;
+            }
+            SimEnd e;
+            int ret = simulateOrbs(layer, p1, p2, dual, delay, true, horizon, st(hold), target, &e);
+            if (ret > best) {
+                best = ret;
+                robotUsedHold = st(hold);
+            }
+            if (best >= target) {
+                break;
+            }
+        }
+        return best;
+    }
+
+    // v2.15 spider scoring, like the wave's: if the run crashes, tap again (flip back) a
+    // little before the crash; if that survives, you could have reacted, so it's safe.
+    constexpr int SPIDER_RETAP[] = { 4, 8, 12 };
+    constexpr int SPIDER_MIN_RETAP = 4;
+
+    int spiderScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, int horizon, int releaseAfter, int target,
+        SimEnd* end) {
+        int ret = simulateOrbs(layer, p1, p2, dual, delay, true, horizon, releaseAfter, target, end);
+        if (ret >= target || *end == SimEnd::StopSearch || quickScore) {
+            return ret;
+        }
+        for (int margin : SPIDER_RETAP) {
+            int at = ret - st(margin);
+            if (at < st(SPIDER_MIN_RETAP)) {
+                break;
+            }
+            int length = std::min(horizon, at + st(16));
+            buf.retapAt = at;
+            SimEnd e;
+            int retapped = simulateOrbs(layer, p1, p2, dual, delay, true, length, releaseAfter, length, &e);
+            buf.retapAt = -1;
+            if (retapped >= length) {
+                if (buf.captureKiller && buf.baseEscape < 0) {
+                    buf.baseEscape = at;
+                    buf.baseCrash = ret;
+                }
+                return horizon;
+            }
+        }
+        return ret;
+    }
+
+    // Same rules as the cube: the smallest delay that is safe (or clearly better) wins.
+    // v2.72: the crash happens at the same moment however late the input comes (delay k
+    // dies k ticks sooner, for the first SAME_CRASH_TRIES delays): it's the next obstacle's,
+    // not this input's, so the rest of the search can't help. Robot and UFO searches spent
+    // their whole time budget on exactly that, on almost every input.
+    constexpr int SAME_CRASH_TRIES = 4;
+    bool crashFixed = false;  // the last search stopped for that reason
+
+    bool sameCrash(int k, int ret, int base, int& streak) {
+        if (streak >= 0 && std::abs(k + ret - base) <= 1) {
+            ++streak;
+        }
+        else {
+            streak = -1;
+        }
+        if (streak >= SAME_CRASH_TRIES) {
+            crashFixed = true;
             return true;
-        }
-
-        if (down && s.delayedRelease) {
-            s.delayedRelease = false;
-            s.held = false;
-            sendInput(p, false);
-        }
-
-        if (!down && isFlyMode(p) && s.pressStep >= 0) {
-            int minHold = modeLimitSteps(p);
-            int heldFor = step - s.pressStep;
-            if (minHold > 0 && heldFor < minHold) {
-                s.delayedRelease = true;
-                s.releaseAt = s.pressStep + minHold;
-                DBG("[InputBuffer] {} MIN-HOLD delaying release: held {} < {} steps [{}]",
-                    tag, heldFor, minHold, modeName(p));
-                return true;
-            }
-        }
-
-        s.held = down;
-
-        // Once a ground-mode press is pending, swallow its release too. The
-        // corresponding press/release pair will be replayed at the opening.
-        if (!down && isGroundMode(p) && s.pending) {
-            DBG("[InputBuffer] {} buffered RELEASE while waiting for ground/ring [{}]",
-                tag, modeName(p));
-            return true;
-        }
-
-        if (down) {
-            s.pressStep = isFlyMode(p) ? step : -1;
-
-            bool early = isGroundMode(p) && !p->m_isOnGround && ringsTouching(p) == 0;
-            if (early && modeLimitSteps(p) > 0) {
-                s.pending = true;
-                s.pendingStart = step;
-                s.lastRingCount = 0;
-                DBG("[InputBuffer] {} buffered early PRESS at step {} [{}]",
-                    tag, step, modeName(p));
-                return true; // Do not let the original early press reach the game.
-            } else {
-                s.pending = false;
-            }
         }
         return false;
     }
 
+    int searchSmallest(int horizon, int maxDelay, int base, int* landed, std::function<int(int, int, SimEnd*)> const& score,
+        double budget = -1.0, bool quiet = false, bool needFull = false) {
+        if (budget < 0.0) {
+            budget = buf.budgetMs;
+        }
+        using clock = std::chrono::steady_clock;
+        auto start = clock::now();
+        int target = needFull ? horizon : std::min(horizon, base + st(12));
+        dbgBestK = 0;
+        dbgBestRet = -1;
+        int streak = 0;
+        for (int k = 1; k <= maxDelay; ++k) {
+            SimEnd end;
+            int ret = score(k, target, &end);
+            if (ret > dbgBestRet) {
+                dbgBestRet = ret;
+                dbgBestK = k;
+            }
+            if (end == SimEnd::StopSearch) {
+                return 0;
+            }
+            if (ret >= target) {
+                *landed = ret;
+                return k;
+            }
+            if (sameCrash(k, ret, base, streak)) {
+                return 0;
+            }
+            if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > budget) {
+                if (!quiet) {
+                    say("prediction budget hit at +{} ticks", k);
+                }
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    // v2.73: quick pass over every delay first (half the budget), then the full scoring with
+    // whatever time is left.
+    int searchTwoPass(int horizon, int maxDelay, int base, int* landed, std::function<int(int, int, SimEnd*)> const& score,
+        bool needFull = false) {
+        quickScore = true;
+        int k = searchSmallest(horizon, maxDelay, base, landed, score, buf.budgetMs * 0.5, true, needFull);
+        quickScore = false;
+        if (k > 0) {
+            return k;
+        }
+        crashFixed = false;
+        double left = buf.budgetMs - clickMs();
+        if (left < 0.5) {
+            say("prediction budget hit (quick pass only)");
+            return 0;
+        }
+        return searchSmallest(horizon, maxDelay, base, landed, score, left, false, needFull);
+    }
+
+    // v2.25 ship scoring. Like the wave: a crash only counts if you couldn't have recovered.
+    // Ship has momentum, so recovery (the opposite input) is tried earlier before the crash:
+    // 8, 16 and 24 ticks.
+    constexpr int SHIP_RECOVER[] = { 8, 16, 24 };
+
+    int shipScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int target,
+        SimEnd* end) {
+        int ret = simulateOrbs(layer, p1, p2, dual, delay, down, horizon, -1, target, end);
+        if (ret >= target || *end == SimEnd::StopSearch) {
+            return ret;
+        }
+        for (int margin : SHIP_RECOVER) {
+            int turnAt = ret - st(margin);
+            if (turnAt < st(WAVE_MIN_TURN)) {
+                break;
+            }
+            int length = std::min(horizon, turnAt + st(WAVE_ESCAPE));
+            SimEnd turnEnd;
+            int turned = simulateOrbs(layer, p1, p2, dual, delay, down, length, turnAt, length, &turnEnd);
+            if (turned >= length) {
+                if (buf.captureKiller && buf.baseEscape < 0) {
+                    buf.baseEscape = turnAt;
+                    buf.baseCrash = ret;
+                }
+                return horizon;
+            }
+        }
+        return ret;
+    }
+
+    // v2.40 UFO scoring. One flap and then nothing falls for the whole look-ahead into
+    // whatever is below, which your next flap would have avoided. So if the run crashes,
+    // try one more flap 6 / 12 / 18 ticks before the crash; if that survives, you could have
+    // flapped, so the click counts as safe. Crashing up into something can't be fixed by
+    // flapping, so those stay real crashes.
+    constexpr int UFO_REFLAP[] = { 6, 12, 18 };
+
+    int ufoScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, int horizon, int releaseAfter, int target,
+        SimEnd* end) {
+        int ret = simulateOrbs(layer, p1, p2, dual, delay, true, horizon, releaseAfter, target, end);
+        if (ret >= target || *end == SimEnd::StopSearch || quickScore) {
+            return ret;
+        }
+        for (int margin : UFO_REFLAP) {
+            int at = ret - st(margin);
+            if (at < st(4)) {
+                break;
+            }
+            int length = std::min(horizon, at + st(20));
+            buf.retapAt = at;
+            SimEnd e;
+            int reflapped = simulateOrbs(layer, p1, p2, dual, delay, true, length, releaseAfter, length, &e);
+            buf.retapAt = -1;
+            if (reflapped >= length) {
+                if (buf.captureKiller && buf.baseEscape < 0) {
+                    buf.baseEscape = at;
+                    buf.baseCrash = ret;
+                }
+                return horizon;
+            }
+        }
+        return ret;
+    }
+
+    bool marginUsed = false;  // the last wave save took the +1 tick safety margin
+
+    int searchWave(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool down, int horizon, int maxDelay, int base,
+        int* landed) {
+        marginUsed = false;
+        using clock = std::chrono::steady_clock;
+        auto start = clock::now();
+        int target = std::min(horizon, base + st(12));
+        dbgBestK = 0;
+        dbgBestRet = -1;
+        for (int k = 1; k <= maxDelay; ++k) {
+            SimEnd end;
+            int ret = waveScore(layer, p1, p2, dual, k, down, horizon, target, &end);
+            if (ret > dbgBestRet) {
+                dbgBestRet = ret;
+                dbgBestK = k;
+            }
+            if (end == SimEnd::StopSearch) {
+                return 0;
+            }
+            if (ret >= target) {
+                *landed = ret;
+                // v2.10 safety margin: the first safe delay is the one that only just clears
+                // the spike corner, so a pixel of difference in the real run can still clip
+                // it. If the next two delays are safe too, take the middle one: a tick of
+                // room on both sides.
+                if (buf.waveMargin && k + 2 <= maxDelay) {
+                    SimEnd e1, e2;
+                    if (waveScore(layer, p1, p2, dual, k + 1, down, horizon, target, &e1) >= target &&
+                        waveScore(layer, p1, p2, dual, k + 2, down, horizon, target, &e2) >= target) {
+                        marginUsed = true;
+                        return k + 1;
+                    }
+                }
+                return k;
+            }
+            if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > buf.budgetMs) {
+                say("prediction budget hit at +{} ticks", k);
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    // Find the smallest delay that clearly beats pressing now. 0 = don't buffer.
+    int searchDelay(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool down, bool anyWave, int horizon, int maxDelay,
+        int releaseAfter, int base, int* landed, bool needFull = false) {
+        using clock = std::chrono::steady_clock;
+        auto start = clock::now();
+        auto overBudget = [&] {
+            return std::chrono::duration<double, std::milli>(clock::now() - start).count() > buf.budgetMs;
+        };
+
+        int target = needFull ? horizon : std::min(horizon, base + st(12));
+        dbgBestK = 0;
+        dbgBestRet = -1;
+        int sameStreak = 0;
+        int waveBestK = 0;
+        int waveBestRet = base;
+        for (int k = 1; k <= maxDelay; ++k) {
+            SimEnd end;
+            // Wave needs the full run to compare gains; elsewhere reaching `target` is enough.
+            int ret = simulateOrbs(layer, p1, p2, dual, k, down, horizon, releaseAfter, anyWave ? horizon : target, &end);
+            if (ret > dbgBestRet) {
+                dbgBestRet = ret;
+                dbgBestK = k;
+            }
+            if (end == SimEnd::StopSearch) {
+                break;
+            }
+            if (anyWave) {
+                // v4.6 wave rule: delaying a turn in a flat corridor naturally adds ~2 ticks
+                // per tick of delay against the opposite wall, so only buffer when the delayed
+                // run clearly clears a spike, saw or corner. A fully safe run needs
+                // 2*k+6 extra ticks and ends the search; otherwise keep the best run that
+                // gains at least 2*k+10 and beats the previous best by more than 2.
+                if (ret >= horizon && ret - base >= k * 2 + 6) {
+                    waveBestK = k;
+                    waveBestRet = ret;
+                    break;
+                }
+                if (ret >= base + k * 2 + 10 && ret > waveBestRet + 2) {
+                    waveBestK = k;
+                    waveBestRet = ret;
+                    if (ret >= horizon) {
+                        break;
+                    }
+                }
+            }
+            else if (ret < target && sameCrash(k, ret, base, sameStreak)) {
+                break;
+            }
+            else if (ret >= target) {
+                // v2.63: a delay that only lives 12 ticks longer can still crash later in the same
+                // jump (Acheron's first jump: saved, then died on landing). Prefer the smallest
+                // delay whose jump lands safely; if none does, keep this one.
+                SimEnd full;
+                if (ret < horizon && simulateOrbs(layer, p1, p2, dual, k, down, horizon, releaseAfter, horizon, &full) < horizon) {
+                    for (int j = k + 1; j <= maxDelay && !overBudget(); ++j) {
+                        SimEnd e;
+                        int r = simulateOrbs(layer, p1, p2, dual, j, down, horizon, releaseAfter, horizon, &e);
+                        if (e == SimEnd::StopSearch) {
+                            break;
+                        }
+                        if (r >= horizon) {
+                            *landed = r;
+                            return j;
+                        }
+                    }
+                }
+                *landed = ret;
+                return k;
+            }
+            if (overBudget()) {
+                say("prediction budget hit at +{} ticks", k);
+                break;
+            }
+        }
+        if (anyWave && waveBestK > 0) {
+            *landed = waveBestRet;
+            return waveBestK;
+        }
+        return 0;
+    }
+
+    // v2.75 run check (test bench). Every attempt played from the level start is recorded
+    // (the inputs the game got, and where you were on every physics step); the longest one
+    // per level is kept. "Check run" replays it on the hidden ghost at the start of your next
+    // attempt and reports how long the ghost follows the recording. Run it after an update:
+    // if the ghost stops matching much earlier than before, the update changed the physics
+    // copy. Moving objects and triggers aren't replayed, so it's a comparison between
+    // versions, not a percentage that should reach 100.
+    struct BenchRun {
+        float startX = 0.f, startY = 0.f, dt = TICK;
+        std::vector<std::pair<int, bool>> inputs;
+        std::vector<CCPoint> track;
+    };
+    BenchRun benchLive;
+    bool benchRecording = false;
+    bool benchNeedStart = false;  // next P1 step is the first of an attempt
+    bool benchPending = false;    // "Check run" was pressed
+    std::string lastBench;        // last result, for the stats popup
+
+    std::filesystem::path benchFile() {
+        return Mod::get()->getSaveDir() / "bench" / (memoryKey + ".txt");
+    }
+
+    size_t benchSavedTicks() {
+        std::ifstream in(benchFile());
+        float x, y, dt;
+        size_t ticks = 0;
+        if (in >> x >> y >> dt >> ticks) {
+            return ticks;
+        }
+        return 0;
+    }
+
+    bool benchLoad(BenchRun& r) {
+        std::ifstream in(benchFile());
+        size_t ticks = 0, inputs = 0;
+        if (!(in >> r.startX >> r.startY >> r.dt >> ticks >> inputs)) {
+            return false;
+        }
+        for (size_t i = 0; i < inputs; ++i) {
+            int t, d;
+            if (!(in >> t >> d)) {
+                return false;
+            }
+            r.inputs.push_back({ t, d != 0 });
+        }
+        for (size_t i = 0; i < ticks; ++i) {
+            float x, y;
+            if (!(in >> x >> y)) {
+                return false;
+            }
+            r.track.push_back({ x, y });
+        }
+        return !r.track.empty();
+    }
+
+    void benchStart(PlayLayer* layer, PlayerObject* p1) {
+        benchLive = {};
+        benchLive.startX = p1->getPosition().x;
+        benchLive.startY = p1->getPosition().y;
+        benchLive.dt = buf.tickLength;
+        // only runs from the level start (no practice checkpoint)
+        bool fromCheckpoint = layer->m_isPracticeMode && layer->m_checkpointArray && layer->m_checkpointArray->count() > 0;
+        benchRecording = !memoryKey.empty() && !fromCheckpoint;
+    }
+
+    void benchInput(bool down) {
+        if (benchRecording) {
+            benchLive.inputs.push_back({ static_cast<int>(benchLive.track.size()), down });
+        }
+    }
+
+    void benchStep(PlayerObject* p1) {
+        if (benchRecording) {
+            benchLive.track.push_back(p1->getPosition());
+            if (benchLive.track.size() > 200000) {
+                benchRecording = false;
+            }
+        }
+    }
+
+    // end of an attempt: keep it if it's the longest run from the start so far
+    // v2.77: the best run is kept in memory and only written when you leave or finish the
+    // level; writing it on every new-best death made a hitch right when you died.
+    BenchRun benchBest;
+    size_t benchBestTicks = 0;   // longest run known for this level (memory or file)
+    bool benchBestDirty = false;
+
+    void benchFinish() {
+        if (!benchRecording) {
+            return;
+        }
+        benchRecording = false;
+        if (benchLive.track.size() < 240 || benchLive.track.size() <= benchBestTicks) {
+            return;
+        }
+        benchBestTicks = benchLive.track.size();
+        benchBest = std::move(benchLive);
+        benchLive = {};
+        benchBestDirty = true;
+    }
+
+    void benchFlush() {
+        if (!benchBestDirty || memoryKey.empty()) {
+            return;
+        }
+        benchBestDirty = false;
+        std::error_code ec;
+        std::filesystem::create_directories(benchFile().parent_path(), ec);
+        std::ofstream out(benchFile(), std::ios::trunc);
+        out << benchBest.startX << ' ' << benchBest.startY << ' ' << benchBest.dt << ' ' << benchBest.track.size() << ' '
+            << benchBest.inputs.size() << '\n';
+        for (auto const& [t, d] : benchBest.inputs) {
+            out << t << ' ' << (d ? 1 : 0) << '\n';
+        }
+        for (auto const& p : benchBest.track) {
+            out << p.x << ' ' << p.y << '\n';
+        }
+    }
+
+    void benchCheck(PlayLayer* layer, PlayerObject* p1) {
+        benchFlush();
+        BenchRun r;
+        if (!benchLoad(r)) {
+            say("run check: no recorded run for this level yet (play one attempt from the start first)");
+            return;
+        }
+        if (std::abs(r.startX - p1->getPosition().x) > 0.5f || std::abs(r.startY - p1->getPosition().y) > 0.5f) {
+            say("run check: this attempt doesn't start where the recording did (start from the beginning, no checkpoint)");
+            benchPending = true;
+            return;
+        }
+        buf.simulating = true;
+        buf.ghostDied = false;
+        buf.ghostHitPortal = false;
+        buf.haveRealRect = false;
+        buf.harmless.clear();
+        buf.orbClick = false;  // orbs only through the recorded inputs
+        buf.retapAt = -1;
+        copyState(buf.ghost1, p1);
+        buf.held1 = false;
+        buf.auto1 = false;
+        buf.autoAt1 = -1;
+        size_t next = 0;
+        int firstOff = -1;
+        float maxErr = 0.f;
+        int t = 0;
+        char const* end = "end of the recording";
+        auto clockStart = std::chrono::steady_clock::now();
+        for (; t < static_cast<int>(r.track.size()); ++t) {
+            while (next < r.inputs.size() && r.inputs[next].first <= t) {
+                pressGhost(buf.ghost1, r.inputs[next].second);
+                ++next;
+            }
+            buf.simTick = t;
+            advanceGhost(buf.ghost1, r.dt);
+            releaseAutoClicks();
+            if (!buf.ghostDied) {
+                checkGhost(layer, buf.ghost1, r.dt);
+            }
+            if (buf.ghostDied) {
+                end = "the ghost died";
+                break;
+            }
+            if (buf.ghostHitPortal) {
+                end = "a mode portal (predictions stop there)";
+                break;
+            }
+            auto g = buf.ghost1->getPosition();
+            float err = std::hypot(g.x - r.track[t].x, g.y - r.track[t].y);
+            maxErr = std::max(maxErr, err);
+            if (err > 3.f && firstOff < 0) {
+                firstOff = t;
+            }
+        }
+        restoreObjects();
+        buf.ghost1->stopAllActions();
+        buf.simulating = false;
+        buf.orbClick = buf.assumeOrbs;
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clockStart).count();
+        int matched = firstOff < 0 ? t : firstOff;
+        lastBench = fmt::format("{}/{} steps ({:.0f}%) match, stopped at {}", matched, r.track.size(),
+            100.0 * matched / r.track.size(), end);
+        say("run check: {} | max error {:.1f}u{} | {:.0f} ms", lastBench, maxErr,
+            std::abs(r.dt - buf.tickLength) > 1e-4f ? " | recorded at another frame rate" : "", ms);
+        std::error_code ec;
+        std::filesystem::create_directories(Mod::get()->getSaveDir(), ec);
+        std::ofstream(Mod::get()->getSaveDir() / "run-check-results.txt", std::ios::app)
+            << Mod::get()->getVersion().toVString() << ' ' << memoryKey << ": " << lastBench << '\n';
+    }
+
+    // v2.65 live path (F10): between clicks the path keeps updating (v2.70: 20 times a second):
+    // blue = where you go if you do nothing, yellow = where a click right now takes you.
+    // After a click, that click's path (red / green) stays up briefly first.
+    void livePath(PlayLayer* layer, PlayerObject* p1) {
+        if (!buf.showPath || buf.perfMode || !buf.pathNode || !buf.ghost1 || buf.simulating || p1->m_isDead || layer->m_isPlatformer) {
+            return;
+        }
+        if (tickCount < buf.pathHoldUntil || !buf.queue.empty() || tickCount % st(12) != 0) {
+            return;
+        }
+        bool twoPlayer = layer->m_level && layer->m_level->m_twoPlayerMode;
+        bool dual = !twoPlayer && layer->m_gameState.m_isDualMode && layer->m_player2;
+        auto* p2 = dual ? layer->m_player2 : nullptr;
+        bool wave = p1->m_isDart || (p2 && p2->m_isDart);
+        bool ship = p1->m_isShip || (p2 && p2->m_isShip);
+        bool flyer = isFlying(p1) || (p2 && isFlying(p2));
+        bool mini = (p1->m_isDart && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
+        int horizon = wave ? fullWaveHorizon(mini) : st(flyer ? 48 : std::clamp(buf.groundHorizon, 48, 240));
+        bool down = !buf.appliedInput;
+        int releaseAfter = down && !wave && !ship ? holdEstimate() : -1;
+
+        buf.pathNode->clear();
+        bool idleDied = false;
+        buf.skipPress = true;
+        auto idle = recordRun(layer, p1, p2, dual, 0, down, horizon, -1, &idleDied);
+        buf.skipPress = false;
+        drawPath(idle, 0, { 0.45f, 0.7f, 1.f, 0.6f }, idleDied);
+        bool clickDied = false;
+        auto click = recordRun(layer, p1, p2, dual, 0, down, horizon, releaseAfter, &clickDied);
+        drawPath(click, 0, { 1.f, 0.85f, 0.3f, 0.85f }, clickDied);
+    }
+
+    void queueInput(int ticks, bool down) {
+        buf.queue.push_back({ ticks, down });
+    }
+
+    // v2.51 practice stats: every save (or, in training, every input that would have been
+    // saved) is how early you were, in 240/s ticks.
+    struct Stats {
+        int saves = 0;
+        int earlySum = 0;
+        int attempts = 0;            // attempts that had at least one save
+        std::map<int, int> savesAt;  // level percent -> saves there
+    };
+    Stats attemptStats;
+    Stats sessionStats;
+    std::string statsKey;
+
+    void noteSave(PlayLayer* layer, int ticks) {
+        int t = static_cast<int>(std::lround(ticks / stepScale()));
+        int pct = std::clamp(static_cast<int>(layer->getCurrentPercent()), 0, 100);
+        for (auto* s : { &attemptStats, &sessionStats }) {
+            ++s->saves;
+            s->earlySum += t;
+            ++s->savesAt[pct];
+        }
+        // v2.56: a ding for every real save (training mode shows its hint instead)
+        if (buf.saveDing && !buf.train) {
+            FMODAudioEngine::sharedEngine()->playEffect("counter003.ogg");
+        }
+    }
+
+    std::string attemptSummary() {
+        auto const& a = attemptStats;
+        return fmt::format("{} {} | avg {:.1f}t ({:.2f}f) early", a.saves, buf.train ? (a.saves == 1 ? "early click" : "early clicks")
+            : (a.saves == 1 ? "save" : "saves"), static_cast<double>(a.earlySum) / a.saves, a.earlySum * TICK / a.saves);
+    }
+
+    // At the end of an attempt (death, restart or level complete).
+    // v2.52: logged to the console only (no popup after a death)
+    void endAttempt() {
+        if (attemptStats.saves > 0) {
+            ++sessionStats.attempts;
+            say("attempt: {}", attemptSummary());
+        }
+        attemptStats = {};
+    }
+
+    // v2.51 training mode: the input goes through untouched, and you're told how early it was.
+    bool trainInstead(PlayLayer* layer, int ticks, bool down, char const* what) {
+        if (!buf.train) {
+            return false;
+        }
+        noteSave(layer, ticks);
+        say("TRAIN {} {}: {}t ({:g}f) early", what, down ? "press" : "release", ticks, ticks * TICK);
+        if (buf.hintLabel) {
+            buf.hintLabel->setString(fmt::format("{} {:g}f early", down ? "click" : "release", ticks * TICK).c_str());
+            buf.hintLabel->stopAllActions();
+            buf.hintLabel->setOpacity(230);
+            buf.hintLabel->setScale(0.5f);
+            buf.hintLabel->runAction(CCSequence::create(CCEaseBackOut::create(CCScaleTo::create(0.12f, 0.6f)), CCDelayTime::create(0.5f),
+                CCFadeOut::create(0.4f), nullptr));
+        }
+        return true;
+    }
+
+    // v2.51 per-level settings: your switches (v2.59: not the stage, not low latency) are remembered for each level and
+    // come back when you open it again. Outside a level (and in levels you haven't changed
+    // anything in) the normal settings apply.
+    constexpr char const* PROFILE_KEYS[] = { "robust-saves", "orb-align", "orb-timing", "level-memory",
+        "more-time-death-spots", "ship-buffer", "ufo-smart", "ball-smart", "swing-smart", "cbf-sync", "predict-moving-objects",
+        "training-mode" };
+
+    struct Globals {
+        bool have = false;
+        std::vector<bool> values;
+    } globals;
+
+    std::string profileKey() {
+        return memoryKey.empty() ? std::string() : "profile-" + memoryKey;
+    }
+
+    void saveProfile() {
+        if (!buf.perLevel || profileKey().empty() || !globals.have) {
+            return;
+        }
+        auto v = matjson::Value::object();
+        for (auto* key : PROFILE_KEYS) {
+            v[key] = Mod::get()->getSettingValue<bool>(key);
+        }
+        Mod::get()->setSavedValue(profileKey(), v);
+    }
+
+    void restoreGlobals() {
+        if (!globals.have) {
+            return;
+        }
+        auto* mod = Mod::get();
+        for (size_t i = 0; i < std::size(PROFILE_KEYS); ++i) {
+            mod->setSettingValue<bool>(PROFILE_KEYS[i], globals.values[i]);
+        }
+        globals = {};
+        mod->setSavedValue("profile-globals", matjson::Value(nullptr));
+        readSettings();
+        applyStage();
+    }
+
+    void loadProfile() {
+        if (!buf.perLevel || profileKey().empty()) {
+            return;
+        }
+        auto* mod = Mod::get();
+        globals.have = true;
+        globals.values.clear();
+        auto backup = matjson::Value::object();
+        for (auto* key : PROFILE_KEYS) {
+            bool value = mod->getSettingValue<bool>(key);
+            globals.values.push_back(value);
+            backup[key] = value;
+        }
+        // kept until the level is left, so a crash mid-level can't leave level settings behind
+        mod->setSavedValue("profile-globals", backup);
+        if (!mod->hasSavedValue(profileKey())) {
+            return;
+        }
+        auto v = mod->getSavedValue<matjson::Value>(profileKey());
+        if (!v.isObject()) {
+            return;
+        }
+        for (auto* key : PROFILE_KEYS) {
+            if (v.contains(key)) {
+                mod->setSettingValue<bool>(key, v[key].asBool().unwrapOr(mod->getSettingValue<bool>(key)));
+            }
+        }
+        readSettings();
+        applyStage();
+        say("level settings loaded: {}", stageText());
+    }
+
+    // Settings a crash left behind are put back when the game starts.
+    void recoverGlobals() {
+        auto* mod = Mod::get();
+        if (!mod->hasSavedValue("profile-globals")) {
+            return;
+        }
+        auto v = mod->getSavedValue<matjson::Value>("profile-globals");
+        if (!v.isObject()) {
+            return;
+        }
+        for (auto* key : PROFILE_KEYS) {
+            if (v.contains(key)) {
+                mod->setSettingValue<bool>(key, v[key].asBool().unwrapOr(mod->getSettingValue<bool>(key)));
+            }
+        }
+        mod->setSavedValue("profile-globals", matjson::Value(nullptr));
+    }
+
+    // v2.51 death heatmap: red marks on the progress bar where level memory saw you die,
+    // brighter where you die more.
+    void refreshHeatmap() {
+        auto* layer = GameManager::get()->m_playLayer;
+        if (!buf.heatNode || !layer || !layer->m_progressBar) {
+            return;
+        }
+        buf.heatNode->clear();
+        float length = layer->m_levelLength;
+        if (!buf.heatmap || length <= 0.f) {
+            return;
+        }
+        auto size = layer->m_progressBar->getContentSize();
+        uint32_t most = 0;
+        for (auto const& [slice, spot] : memory) {
+            most = std::max(most, spot.deaths);
+        }
+        if (most == 0) {
+            return;
+        }
+        for (auto const& [slice, spot] : memory) {
+            if (spot.deaths == 0) {
+                continue;
+            }
+            float pct = std::clamp((slice + 0.5f) * SLICE / length, 0.f, 1.f);
+            float x = 2.f + pct * (size.width - 4.f);
+            float heat = static_cast<float>(spot.deaths) / most;
+            buf.heatNode->drawSegment({ x, 2.f }, { x, size.height - 2.f }, 0.7f, { 1.f, 0.35f + 0.3f * (1.f - heat), 0.55f, 0.35f + 0.6f * heat });
+        }
+    }
+
+    // v2.51 stats popup text
+    std::string statsText() {
+        auto const& s = sessionStats;
+        std::string text;
+        if (s.saves == 0) {
+            text += "No early clicks yet this session.\n";
+        }
+        else {
+            text += fmt::format("<cp>{}</c> {} in <cp>{}</c> attempts, on average <cp>{:.1f}t</c> ({:.2f}f) early.\n",
+                s.saves, buf.train ? "early clicks" : "saves", s.attempts, static_cast<double>(s.earlySum) / s.saves, s.earlySum * TICK / s.saves);
+            std::vector<std::pair<int, int>> spots(s.savesAt.begin(), s.savesAt.end());
+            std::sort(spots.begin(), spots.end(), [](auto const& a, auto const& b) { return a.second > b.second; });
+            text += "Most early clicks at:";
+            for (size_t i = 0; i < std::min<size_t>(3, spots.size()); ++i) {
+                text += fmt::format(" <cy>{}%</c> ({}x)", spots[i].first, spots[i].second);
+            }
+            text += "\n";
+        }
+        auto* layer = GameManager::get()->m_playLayer;
+        if (layer && layer->m_levelLength > 0.f) {
+            std::map<int, uint32_t> deathsAt;
+            for (auto const& [slice, spot] : memory) {
+                if (spot.deaths > 0) {
+                    deathsAt[std::clamp(static_cast<int>((slice + 0.5f) * SLICE / layer->m_levelLength * 100.f), 0, 100)] += spot.deaths;
+                }
+            }
+            std::vector<std::pair<int, uint32_t>> spots(deathsAt.begin(), deathsAt.end());
+            std::sort(spots.begin(), spots.end(), [](auto const& a, auto const& b) { return a.second > b.second; });
+            if (!spots.empty()) {
+                text += "Most deaths at:";
+                for (size_t i = 0; i < std::min<size_t>(3, spots.size()); ++i) {
+                    text += fmt::format(" <cr>{}%</c> ({}x)", spots[i].first, spots[i].second);
+                }
+                text += "\n";
+            }
+        }
+        if (!lastBench.empty()) {
+            text += "Run check: " + lastBench + "\n";
+        }
+        return text;
+    }
+
+    bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
+        clickStart = std::chrono::steady_clock::now();
+        clickBudget();
+        auto* layer = GameManager::get()->m_playLayer;
+        if (!layer) {
+            return false;
+        }
+
+        auto* level = layer->m_level;
+        bool twoPlayer = level && level->m_twoPlayerMode;
+        // v2.55: a P2-side input in a two-player level only steers Player 2 while dual mode is
+        // on; before that it moves Player 1 (Relief's wave parts), so it's buffered like a P1 input.
+        if (twoPlayer && !isPlayer1 && layer->m_gameState.m_isDualMode) {
+            return false;
+        }
+        // In two-player levels P2 is someone else: never simulate P1's input on it.
+        bool dual = !twoPlayer && layer->m_gameState.m_isDualMode && layer->m_player2;
+
+        buf.isPlayer1 = isPlayer1;
+        buf.realInput = down;
+        if (buf.autoReleased) {
+            // the game already let go for you: your real release has nothing left to do
+            buf.autoReleased = false;
+            buf.autoDash = false;
+            if (!down) {
+                return true;
+            }
+        }
+        if (!buf.enabled) {
+            buf.appliedInput = down;
+            return false;
+        }
+        if (buf.practiceOnly && !layer->m_isPracticeMode) {
+            buf.appliedInput = down;
+            return false;
+        }
+        // v2.4: the ghost never presses left/right, so platformer predictions are meaningless.
+        if (layer->m_isPlatformer) {
+            buf.appliedInput = down;
+            return false;
+        }
+
+        auto* p1 = self->m_player1;
+        auto* p2 = dual ? layer->m_player2 : nullptr;
+
+        // v2.18 Click Between Frames: a click that arrives in the middle of P1's physics step
+        // landed `midTick` of the way through the tick (measured from how far P1 has moved
+        // since the tick started). The ghost then starts with the rest of that tick, and
+        // delayed inputs are queued one tick sooner, because the game's next tick boundary
+        // is already the ghost's tick 1.
+        float midTick = 0.f;
+        if (buf.cbfSync && buf.inRealUpdate && p1 && std::abs(buf.tickDx) > 0.01f) {
+            midTick = std::clamp((p1->getPosition().x - buf.tickStartX) / buf.tickDx, 0.f, 0.999f);
+        }
+        buf.firstStep = 1.f - midTick;
+        struct FirstStepReset {
+            ~FirstStepReset() {
+                buf.firstStep = 1.f;
+            }
+        } firstStepReset;
+        int early = midTick > 0.f ? 1 : 0;
+
+        bool anyShip = p1 && (p1->m_isShip || (p2 && p2->m_isShip));
+        if (!p1 || p1->m_isDead || (anyShip && !buf.shipBuffer)) {
+            resetPending();
+            buf.appliedInput = down;
+            return false;
+        }
+
+        if (down && buf.queue.empty()) {
+            buf.releaseShift = 0;
+        }
+
+        bool p1Wave = p1->m_isDart;
+        bool anyWave = p1Wave || (p2 && p2->m_isDart);
+        bool mini = (p1Wave && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
+
+        // Wave spam: don't fight fast inputs. Counted for every input, including ones made
+        // while a delayed input is waiting (v2.5.1 skipped those, so a spam that started
+        // with a buffered click never reached the streak and its taps got collapsed).
+        // Once the streak is reached, anything still waiting is dropped and your inputs
+        // go straight to the game until you pause for longer than the spam gap.
+        // v2.44: ship is steered by feathering, so it gets its own, much shorter spam gap;
+        // otherwise nearly every ship input counted as spam and was never buffered.
+        int spamGap = st(anyShip && !anyWave ? std::clamp(buf.shipSpamGap, 2, 40) : std::clamp(buf.spamGap, 4, 40));
+        if (buf.sinceInput < spamGap) {
+            ++buf.rapid;
+        }
+        else {
+            buf.rapid = 0;
+        }
+        buf.sinceInput = 0;
+        bool anyUfo = p1->m_isBird || (p2 && p2->m_isBird);
+        bool anyBall = p1->m_isBall || (p2 && p2->m_isBall);
+        bool anySwing = p1->m_isSwing || (p2 && p2->m_isSwing);
+        if ((anyWave || anyShip || (anyUfo && buf.ufoSmart) || (anyBall && buf.ballSmart) || (anySwing && buf.swingSmart)) &&
+            buf.rapid >= SPAM_STREAK) {
+            if (buf.explain) {
+                say("pass {}: spam ({} fast inputs in a row, gap < {}t)", down ? "press" : "release", buf.rapid, spamGap);
+            }
+            // v2.47: path view marks inputs that skipped prediction (gray dot on you), so a
+            // missing path isn't mistaken for a broken mod
+            if (buf.showPath && buf.pathNode) {
+                buf.pathNode->clear();
+                buf.pathNode->drawDot(p1->getPosition(), 4.f, { 0.6f, 0.6f, 0.65f, 0.9f });
+            }
+            // v2.66: inputs still waiting aren't dropped any more (a dropped press was a turn
+            // that never happened) and aren't all sent at once (v2.49, a zero-length tap):
+            // they fire one per tick, in order, starting next tick, and this input right after.
+            if (!buf.queue.empty()) {
+                for (size_t i = 0; i < buf.queue.size(); ++i) {
+                    buf.queue[i].ticksLeft = static_cast<int>(i);
+                }
+                if (buf.queue.back().down != down) {
+                    queueInput(static_cast<int>(buf.queue.size()), down);
+                }
+                buf.shift = 0;
+                return true;
+            }
+            buf.appliedInput = down;
+            return false;
+        }
+
+        // v4.6 wave mode only: while a delayed input waits, a quick opposite input fires
+        // one tick after it; pressing the same way again cancels that. (The default wave
+        // mode shifts it like the cube does, below, so your zigzag keeps its shape.)
+        if (!buf.queue.empty() && anyWave && buf.waveV46) {
+            auto first = buf.queue.front();
+            buf.queue.erase(buf.queue.begin() + 1, buf.queue.end());
+            if (down != first.down) {
+                queueInput(first.ticksLeft + 1, down);
+            }
+            return true;
+        }
+
+        // A delay is in progress: shift this input by the same amount so your
+        // rhythm (tap length, hold length, follow-up clicks) is preserved.
+        if (!buf.queue.empty()) {
+            int after = buf.queue.back().ticksLeft;
+            // low latency: a new press isn't shifted, it goes right after what's already queued
+            queueInput(buf.lowLatency && down ? after : std::max(buf.shift - early, after), down);
+            return true;
+        }
+
+        // Releases only matter for wave and robot.
+        if (!p1Wave) {
+            bool robot = p1->m_isRobot;
+            bool wave2 = false;
+            if (p2 && !robot) {
+                wave2 = p2->m_isDart;
+                if (!wave2) {
+                    robot = p2->m_isRobot;
+                }
+            }
+            // v2.16: letting go ends a dash, so dash releases are predicted like robot ones.
+            bool dashing = p1->m_isDashing || (p2 && p2->m_isDashing);
+            if (!wave2 && !down && !robot && !dashing && !anyShip) {
+                if (buf.releaseShift > 0) {
+                    // the press was delayed, so its release is delayed by the same amount:
+                    // the hold length the ghost was tested with is the one the game gets
+                    buf.shift = buf.releaseShift;
+                    buf.releaseShift = 0;
+                    queueInput(buf.shift, false);
+                    return true;
+                }
+                buf.appliedInput = false;
+                return false;
+            }
+        }
+
+        bool anyFlyer = isFlying(p1) || (p2 && isFlying(p2));  // wave / ufo / swing
+        int horizon = st(anyFlyer ? 48 : std::clamp(buf.groundHorizon, 48, 240));
+        if (anyWave) {
+            horizon = fullWaveHorizon(mini);
+        }
+        int maxDelay = st(anyWave ? buf.ticksWave : (anyShip ? std::clamp(buf.shipMaxDelay, 0, 16) : buf.ticksAll));
+        if (buf.lowLatency) {
+            maxDelay = std::min(maxDelay, st(4));  // at most 1 frame (60 fps) of delay
+        }
+        if (maxDelay <= 0) {
+            if (buf.explain) {
+                say("pass {}: max delay is 0 for this mode", down ? "press" : "release");
+            }
+            buf.appliedInput = down;
+            return false;
+        }
+
+        // Wave releases are predicted separately, so hold there. Robot jump height depends
+        // on the hold, so use your usual robot hold (once known); everything else (cube,
+        // ball, ufo, spider, swing) re-triggers while held, so model a tap.
+        bool anyRobot = p1->m_isRobot || (p2 && p2->m_isRobot);
+        int releaseAfter = -1;
+        if (down && !anyWave && !anyShip) {
+            releaseAfter = anyRobot ? robotHold.pick(-1, 50) : holdEstimate();
+        }
+
+        // On the ground a press is a jump; only move it onto an orb if the setting says so.
+        bool grounded = p1->m_isOnGround && (!p2 || p2->m_isOnGround);
+        if (buf.explain && down && grounded && !buf.orbAlignGround && !anyWave && !anyShip && buf.orbAlign && buf.smart) {
+            // v2.42: is there an orb right ahead that this ground jump could have been moved onto?
+            SimEnd probeEnd;
+            buf.skipPress = true;
+            buf.orbClick = false;
+            int window = st(std::clamp(buf.orbWindow, 1, 64));
+            simulate(layer, p1, p2, dual, 0, true, window + 2, -1, window + 2, &probeEnd);
+            buf.skipPress = false;
+            buf.orbClick = buf.assumeOrbs;
+            if (buf.firstOrbTick >= 0 && buf.firstOrbTick <= window) {
+                say("orb: you'd touch an orb at t{}, but this press is from the ground ('also from the ground' is off)",
+                    buf.firstOrbTick);
+            }
+        }
+        if (down && !anyWave && !anyShip && buf.orbAlign && buf.smart && (!grounded || buf.orbAlignGround)) {
+            int orbLanded = 0;
+            int k = memorySaysSkip(sliceOf(p1)) ? 0 : alignOrb(layer, p1, p2, dual, horizon, releaseAfter, memoryDelay(sliceOf(p1)), &orbLanded);
+            if (k > 0 && trainInstead(layer, k, down, "orb")) {
+                decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+                buf.appliedInput = down;
+                return false;
+            }
+            if (k > 0) {
+                say("ORB {} +{}t ({:g}f) -> {}t", buf.orbWasTiming ? "timing" : "press", k, k * TICK, orbLanded);
+                noteSave(layer, k);
+                decided(layer, p1, p2, dual, k, down, horizon, releaseAfter);
+                buf.shift = k;
+                queueInput(k - early, down);
+                return true;
+            }
+        }
+
+        buf.sawMover = false;
+        buf.trackMovers = buf.avoidMovers || buf.predictMovers;
+        SimEnd end;
+        bool cubeStyleWave = anyWave && !buf.waveV46;
+        bool robotPress = down && anyRobot && !anyWave && buf.robotSmart;
+        bool anySpider = p1->m_isSpider || (p2 && p2->m_isSpider);
+        bool spiderPress = down && anySpider && !anyWave && !robotPress && buf.spiderSmart;
+        bool ufoPress = down && anyUfo && !anyWave && !anyShip && buf.ufoSmart;  // v2.40
+        // v2.51 swing: one flip, then nothing for the whole look-ahead, crashes into what your
+        // next flip would have avoided. Scored like the UFO: could one more flip have saved it?
+        bool swingPress = down && anySwing && !anyWave && !anyShip && !ufoPress && buf.swingSmart;
+        ufoPress = ufoPress || swingPress;
+        bool shipInput = anyShip && !anyWave;  // v2.25: press or release, both steer the ship
+        buf.captureKiller = true;
+        buf.baseTouchedDown = false;
+        buf.killerSeen = false;
+        buf.baseEscape = -1;
+        int base = cubeStyleWave ? waveScore(layer, p1, p2, dual, 0, down, horizon, horizon, &end)
+                 : robotPress    ? robotScore(layer, p1, p2, dual, 0, horizon, horizon, &end)
+                 : spiderPress   ? spiderScore(layer, p1, p2, dual, 0, horizon, releaseAfter, horizon, &end)
+                 : ufoPress      ? ufoScore(layer, p1, p2, dual, 0, horizon, releaseAfter, horizon, &end)
+                 : shipInput     ? shipScore(layer, p1, p2, dual, 0, down, horizon, horizon, &end)
+                                 : simulateOrbs(layer, p1, p2, dual, 0, down, horizon, releaseAfter, horizon, &end);
+        buf.captureKiller = false;
+        buf.trackMovers = false;
+
+        // v2.30 diagnostics: a ghost that dies within a few ticks while you live means the
+        // prediction doesn't match you there. Log what killed it and how both hitboxes compare.
+        if (buf.killerSeen && (base <= st(3) || (buf.deathLog && base < horizon))) {
+            auto real = p1->getObjectRect();
+            auto const& g = buf.ghostDeathRect;
+            if (buf.killerType >= 0) {
+                auto const& k = buf.killerRect;
+                say("ghost killed at t{} by obj {} (type {}{}{}) at dx {:.1f} dy {:.1f} size {:.1f}x{:.1f}", buf.killerTick, buf.killerId,
+                    buf.killerType, buf.killerNoTouch ? ", no-touch" : "", buf.killerDisabled ? ", disabled" : "",
+                    k.getMidX() - real.getMidX(), k.getMidY() - real.getMidY(), k.size.width, k.size.height);
+            }
+            else {
+                say("ghost killed at t{} by no object (crushed / out of bounds / slope)", buf.killerTick);
+            }
+            say("  hitbox ghost {:.1f}x{:.1f} vs you {:.1f}x{:.1f}, ghost moved dx {:.1f} dy {:.1f}{}", g.size.width, g.size.height,
+                real.size.width, real.size.height, g.getMidX() - real.getMidX(), g.getMidY() - real.getMidY(),
+                buf.predictMovers ? " (moving objects predicted)" : "");
+            // v2.54: which players exist and which one your clicks move
+            auto desc = [](PlayerObject* p) {
+                if (!p) {
+                    return std::string("none");
+                }
+                char const* mode = p->m_isDart ? "wave" : p->m_isShip ? "ship" : p->m_isBird ? "ufo" : p->m_isBall ? "ball"
+                    : p->m_isRobot ? "robot" : p->m_isSpider ? "spider" : p->m_isSwing ? "swing" : "cube";
+                return fmt::format("{}{}{}", mode, p->m_controlsDisabled ? " controls-off" : "", p->isVisible() ? "" : " hidden");
+            };
+            say("  players: P1 {} | P2 {} | dual {} | predicted {}", desc(layer->m_player1), desc(layer->m_player2),
+                layer->m_gameState.m_isDualMode, p1 == layer->m_player1 ? "P1" : "P2");
+        }
+
+        // v2.36: with CBF, where inside the tick the click landed (0 = on the tick)
+        std::string tickTag = midTick > 0.f ? fmt::format(" @{:.2f}", midTick) : std::string();
+        if (base >= horizon) {
+            // v2.43 more time at death spots. This input is only safe if your next input comes
+            // in time, and level memory has seen you die here repeatedly: try small delays
+            // that push the crash further away (or remove it), so you get more time to react.
+            // Only at those spots, so normal play isn't delayed.
+            bool reactMode = cubeStyleWave || shipInput || ufoPress || spiderPress;
+            if (buf.moreTime && buf.learn && reactMode && buf.baseEscape >= 0 && spotAround(sliceOf(p1)).deaths >= 2) {
+                int crash0 = buf.baseCrash;
+                int bestK = 0;
+                int bestCrash = crash0;
+                int hold = (cubeStyleWave || shipInput) ? -1 : releaseAfter;
+                // v2.67: wave / ship input that's already safe (if you keep reacting) is held back
+                // at most 1 frame here. Up to 4f (16t) made fast zigzags at death spots feel late:
+                // every later click in the rhythm gets shifted by the same amount.
+                int moreMax = (cubeStyleWave || shipInput) ? std::min(maxDelay, st(4)) : maxDelay;
+                for (int k = 1; k <= moreMax; ++k) {
+                    SimEnd e;
+                    int ret = simulateOrbs(layer, p1, p2, dual, k, down, horizon, hold, horizon, &e);
+                    if (e == SimEnd::StopSearch) {
+                        break;
+                    }
+                    if (ret >= horizon) {
+                        bestK = k;
+                        bestCrash = -1;  // no crash at all
+                        break;
+                    }
+                    int crashAt = k + ret;  // ticks from now
+                    if (crashAt >= crash0 + st(8) && crashAt > bestCrash) {
+                        bestK = k;
+                        bestCrash = crashAt;
+                    }
+                }
+                if (bestK > 0 && !buf.train) {
+                    noteSave(layer, bestK);
+                    say("MORE TIME {}{} +{}t: crash t{} -> {} (died here {}x)", down ? "press" : "release", tickTag, bestK, crash0,
+                        bestCrash < 0 ? std::string("none") : fmt::format("t{}", bestCrash), spotAround(sliceOf(p1)).deaths);
+                    decided(layer, p1, p2, dual, bestK, down, horizon, releaseAfter);
+                    buf.shift = bestK;
+                    queueInput(bestK - early, down);
+                    return true;
+                }
+            }
+            if (buf.explain) {
+                if (buf.baseEscape >= 0) {
+                    say("pass {}{}: safe only if you react by t{} (else crash at t{})", down ? "press" : "release", tickTag,
+                        buf.baseEscape, buf.baseCrash);
+                }
+                else {
+                    say("pass {}{}: safe now (survives the {}t look-ahead)", down ? "press" : "release", tickTag, horizon);
+                }
+            }
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+            buf.appliedInput = down;
+            return false;
+        }
+
+        // v2.27: a cube / ball press that only crashes after a normal jump would have landed
+        // (~90 ticks) dies to the next obstacle, not this click: no delay helps, so don't
+        // spend the whole time budget searching (it was most of the per-click lag).
+        bool groundPress = down && !anyFlyer && !anyRobot && !anySpider && !anyWave;
+        // v2.63: only once the jump came back down. A long jump (Acheron's first: ~94 ticks in
+        // the air, then onto a spike) crashes late too, and that crash *is* this click's.
+        if (groundPress && buf.lateCrash > 0 && base >= st(buf.lateCrash) && buf.baseTouchedDown) {
+            if (buf.explain) {
+                say("pass press: crash only at {}t, after the jump would land (late crash rule)", base);
+            }
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+            buf.appliedInput = down;
+            return false;
+        }
+
+        // v2.13 memory: saves at this spot kept ending in deaths, so the prediction can't be
+        // trusted here. Leave the input alone.
+        int slice = sliceOf(p1);
+        if (memorySaysSkip(slice)) {
+            say("memory: saves here failed before, input left alone");
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+            pending.skipped = true;
+            buf.appliedInput = down;
+            return false;
+        }
+
+        int landed = 0;
+        int saved = 0;
+        bool fromMemory = false;
+        crashFixed = false;
+        // v2.13 memory: the delay that worked here on earlier runs is tried first, so the
+        // same gap gets the same save every time.
+        // The same judgement this mode's search uses, for a single delay.
+        auto scoreAt = [&](int k, int target, SimEnd* e) {
+            return cubeStyleWave ? waveScore(layer, p1, p2, dual, k, down, horizon, target, e)
+                 : robotPress    ? robotScore(layer, p1, p2, dual, k, horizon, target, e)
+                 : spiderPress   ? spiderScore(layer, p1, p2, dual, k, horizon, releaseAfter, target, e)
+                 : ufoPress      ? ufoScore(layer, p1, p2, dual, k, horizon, releaseAfter, target, e)
+                 : shipInput     ? shipScore(layer, p1, p2, dual, k, down, horizon, target, e)
+                                 : simulateOrbs(layer, p1, p2, dual, k, down, horizon, releaseAfter, target, e);
+        };
+
+        // v2.69: a cube / ball jump save has to land safely. A save that only lived 12 ticks
+        // longer than pressing now still crashed later in the same jump (Acheron's first jump:
+        // +32t..+40t "saves" that died ~130 ticks later, every time); those clicks now go
+        // through untouched instead of being moved by up to 10 frames for nothing.
+        // v2.75: robot jumps and UFO / swing flaps too (no more half saves there either)
+        int needed = (groundPress || robotPress || ufoPress) ? horizon : std::min(horizon, base + st(12));
+        int learned = memoryDelay(slice);
+        if (learned > 0 && learned <= maxDelay && !(anyWave && buf.waveV46)) {
+            int target = needed;
+            SimEnd e;
+            int ret = scoreAt(learned, target, &e);
+            if (ret >= target) {
+                saved = learned;
+                landed = ret;
+                fromMemory = true;
+            }
+        }
+        if (saved <= 0) {
+            saved = cubeStyleWave ? searchWave(layer, p1, p2, dual, down, horizon, maxDelay, base, &landed)
+                  : robotPress    ? searchTwoPass(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
+                        return robotScore(layer, p1, p2, dual, k, horizon, target, e);
+                    }, true)
+                  : spiderPress   ? searchTwoPass(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
+                        return spiderScore(layer, p1, p2, dual, k, horizon, releaseAfter, target, e);
+                    })
+                  : shipInput     ? searchSmallest(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
+                        return shipScore(layer, p1, p2, dual, k, down, horizon, target, e);
+                    })
+                  : ufoPress      ? searchTwoPass(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
+                        return ufoScore(layer, p1, p2, dual, k, horizon, releaseAfter, target, e);
+                    }, true)
+                                  : searchDelay(layer, p1, p2, dual, down, anyWave, horizon, maxDelay, releaseAfter, base, &landed,
+                                        groundPress);
+        }
+        if (saved <= 0) {
+            say("no save: {}{} dies in {}t (max {}t, best +{}t -> {}t of {}){}", down ? "press" : "release", tickTag, base, maxDelay,
+                dbgBestK, dbgBestRet, horizon, !crashFixed ? "" : base < st(30) ? " - too late: waiting only makes it crash sooner" : " - same crash at any timing (next obstacle)");
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+            buf.appliedInput = down;
+            return false;
+        }
+
+        // v2.28 robustness check. A save can work in the exact predicted conditions and still
+        // fail for real, because a real run is always a hair off (a fraction of a tick, a bit
+        // of float error). So the chosen delay must also survive with you starting slightly
+        // ahead of and behind where you are (half a tick of movement each way). If it only
+        // works at the exact spot, the next few delays are tried for one that survives all
+        // three; if none does, the original save is kept, so this never makes things worse.
+        bool robustNote = false;
+        if (buf.robustSaves && !(anyWave && buf.waveV46)) {
+            int target = needed;
+            // half a tick of x movement: normal speed (0.9) covers 311.58 units a second
+            float shift = std::max(0.3f, 0.5f * (311.58f / 240.f) * (std::abs(p1->m_playerSpeed) / 0.9f));
+            auto robust = [&](int k) {
+                for (float off : { shift, -shift }) {
+                    buf.ghostShiftX = off;
+                    SimEnd e;
+                    int ret = scoreAt(k, target, &e);
+                    buf.ghostShiftX = 0.f;
+                    if (ret < target) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (clickMs() < buf.budgetMs && !robust(saved)) {
+                for (int k = saved + 1; k <= std::min(maxDelay, saved + st(3)); ++k) {
+                    SimEnd e;
+                    int ret = scoreAt(k, target, &e);
+                    if (ret >= target && robust(k)) {
+                        saved = k;
+                        landed = ret;
+                        robustNote = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (buf.avoidMovers) {
+            // One extra run of the chosen delay with the moving-object watch on. (Watching
+            // in every search run made cube searches hit the time budget.)
+            buf.trackMovers = true;
+            simulateOrbs(layer, p1, p2, dual, saved, down, horizon, releaseAfter, horizon, &end);
+            buf.trackMovers = false;
+        }
+        if (buf.avoidMovers && buf.sawMover) {
+            say("skip +{}t save: moving objects ahead", saved);
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+            buf.appliedInput = down;
+            return false;
+        }
+
+        if (trainInstead(layer, saved, down, swingPress ? "swing" : "")) {
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+            buf.appliedInput = down;
+            return false;
+        }
+        if (robotPress) {
+            releaseAfter = robotUsedHold;  // the path view / drift check show the hold that works
+        }
+        noteSave(layer, saved);
+        say("SAVED {}{} +{}t ({:g}f)  {}->{}  [max {}]{}", down ? "press" : "release", tickTag, saved, saved * TICK, base, landed, maxDelay,
+            robustNote ? std::string("  (robust)")
+            : fromMemory ? std::string("  (memory)")
+            : cubeStyleWave && marginUsed ? std::string("  +margin")
+            : robotPress ? fmt::format("  hold {}t", robotUsedHold) : std::string());
+        decided(layer, p1, p2, dual, saved, down, horizon, releaseAfter);
+        buf.shift = saved;
+        queueInput(saved - early, down);
+        return true;
+    }
+
+    void cycleStage(int dir = 1) {
+        buf.stage = (buf.stage + dir + STAGE_COUNT) % STAGE_COUNT;
+        // v2.59: the stage is one setting for every level and survives restarts
+        Mod::get()->setSavedValue("stage", buf.stage);
+        resetPending();
+        // A delayed input that was waiting is dropped; the game gets what you're really
+        // holding now (otherwise, with the buffer switched off, it never would).
+        auto* layer = GameManager::get()->m_playLayer;
+        if (layer && !buf.autoReleased && buf.appliedInput != buf.realInput) {
+            sendButton(layer, buf.realInput);
+        }
+        applyStage();
+        readSettings();
+        saveProfile();
+        say("F6 -> {}", stageText());
+        refreshAutoTag();
+        refreshWatermark();
+        refreshPanel();
+    }
+
+    // v2.4 wave auto-release (practice mode only): while you hold in wave, check every
+    // tick whether holding crashes within the next `autoWindow` ticks. If it does and
+    // letting go now clearly survives longer, let go for you. Your own release later is
+    // swallowed, and your next press works as normal.
+    void tryAutoRelease(PlayLayer* layer, PlayerObject* p1) {
+        if ((!buf.autoRelease && !buf.robotAutoRelease && !buf.dashAutoRelease) || buf.autoReleased || layer->m_isPlatformer) {
+            return;
+        }
+        if (!layer->m_isPracticeMode && !buf.autoNormalRuns) {
+            return;
+        }
+        if (!buf.queue.empty() || !buf.realInput || !buf.appliedInput || !buf.isPlayer1 || !buf.ghost1) {
+            return;
+        }
+        if (layer->m_level && layer->m_level->m_twoPlayerMode) {
+            return;
+        }
+        bool dual = layer->m_gameState.m_isDualMode && layer->m_player2;
+        auto* p2 = dual ? layer->m_player2 : nullptr;
+        bool dash = p1->m_isDashing || (p2 && p2->m_isDashing);
+        bool wave = !dash && (p1->m_isDart || (p2 && p2->m_isDart));
+        bool robot = !dash && !wave && (p1->m_isRobot || (p2 && p2->m_isRobot));
+        if (p1->m_isDead || !((dash && buf.dashAutoRelease) || (wave && buf.autoRelease) || (robot && buf.robotAutoRelease))) {
+            return;
+        }
+        bool mini = (p1->m_isDart && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
+
+        int window = st(std::clamp(buf.autoWindow, 2, 24));
+        buf.sawMover = false;
+        buf.skipPress = true;
+        buf.orbClick = buf.assumeOrbs;
+        SimEnd end;
+        int hold = simulate(layer, p1, p2, dual, 0, true, window, -1, window, &end);
+        buf.skipPress = false;
+        if (hold >= window || buf.ghostHitPortal) {
+            return;
+        }
+
+        // v2.12 robot: letting go ends the jump boost; judged like a cube jump (landing = safe).
+        int horizon = wave ? fullWaveHorizon(mini) : st(std::clamp(buf.groundHorizon, 48, 240));
+        if (dash && (p1->m_isDart || p1->m_isBird || p1->m_isSwing)) {
+            horizon = st(48);
+        }
+        buf.trackMovers = buf.avoidMovers;
+        int release = simulateOrbs(layer, p1, p2, dual, 0, false, horizon, -1, horizon, &end);
+        buf.trackMovers = false;
+        if (release < horizon && release < hold + st(10)) {
+            return;
+        }
+        if (buf.avoidMovers && buf.sawMover) {
+            return;
+        }
+        buf.autoReleased = true;
+        buf.autoDash = dash;
+        sendButton(layer, false);
+        say("AUTO release{}: holding dies in {}t, letting go lives {}t", dash ? " (dash)" : (robot ? " (robot)" : ""), hold, release);
+    }
+
+    void deliverPending(PlayLayer* layer, PlayerObject* player) {
+        if (buf.sinceInput <= 998) {
+            ++buf.sinceInput;
+        }
+        if ((buf.avoidMovers || buf.predictMovers) && !watched.empty()) {
+            updateWatched();
+        }
+
+        bool twoPlayer = layer->m_level && layer->m_level->m_twoPlayerMode;
+        bool dual = !twoPlayer && layer->m_gameState.m_isDualMode && layer->m_player2;
+        if (!buf.shipBuffer && (player->m_isShip || (dual && layer->m_player2->m_isShip))) {
+            resetPending();
+            buf.autoReleased = false;
+            if (buf.appliedInput != buf.realInput) {
+                sendButton(layer, buf.realInput);
+            }
+            return;
+        }
+        // Left wave / robot while auto-released: the game goes back to what you're really holding.
+        bool autoMode = player->m_isDart || player->m_isRobot || (dual && (layer->m_player2->m_isDart || layer->m_player2->m_isRobot));
+        if (buf.autoReleased && !buf.autoDash && !autoMode) {
+            buf.autoReleased = false;
+        }
+
+        if (buf.queue.empty()) {
+            if (buf.appliedInput != buf.realInput && !buf.autoReleased) {
+                sendButton(layer, buf.realInput);
+            }
+            tryAutoRelease(layer, player);
+            sweepGhostLayer();
+            return;
+        }
+
+        // Check before decrementing: an input queued with N ticks fires right before
+        // physics step N, which is exactly what simulate(delay = N) tested.
+        while (!buf.queue.empty() && buf.queue.front().ticksLeft <= 0) {
+            bool down = buf.queue.front().down;
+            buf.queue.pop_front();
+            buf.releaseShift = down ? buf.shift : 0;
+            if (down != buf.appliedInput) {
+                sendButton(layer, down);
+            }
+        }
+        for (auto& q : buf.queue) {
+            --q.ticksLeft;
+        }
+        if (buf.queue.empty()) {
+            buf.shift = 0;
+        }
+    }
+}
+
+// v2.44 in-game menu: pause menu button or F7 in a level. Stage, the main switches,
+// status, and shortcuts to all settings / copy log / forget level.
+class BufferMenu : public geode::Popup {
+    struct Option {
+        char const* key;    // mod setting, or nullptr for the runtime path view
+        char const* label;
+    };
+    static constexpr Option OPTIONS[] = {
+        { "low-latency", "Low latency" },
+        { "robust-saves", "Robust saves" },
+        { "orb-align", "Orb alignment" },
+        { "orb-timing", "Orb timing" },
+        { "level-memory", "Level memory" },
+        { "more-time-death-spots", "More time (death spots)" },
+        { "ship-buffer", "Ship buffering" },
+        { "ufo-smart", "Smart UFO" },
+        { "ball-smart", "Smart ball" },
+        { "swing-smart", "Smart swing" },
+        { "cbf-sync", "CBF sync" },
+        { "predict-moving-objects", "Predict moving objects" },
+        { nullptr, "Path view (F10)" },
+        { "training-mode", "Training (hints only)" },
+        { "death-heatmap", "Death heatmap" },
+        { "save-ding", "Ding on save" },
+        { "performance-mode", "Performance mode" },
+        { "explain-inputs", "Explain inputs (debug)" },
+    };
+
+    // v2.50: cute theme. v2.75: colour themes (setting "Menu theme")
+    struct Theme {
+        ccColor3B main, soft, accent, bg;
+        char const* button;
+    };
+
+public:
+    static Theme currentTheme() {
+        auto name = Mod::get()->getSettingValue<std::string>("menu-theme");
+        if (name == "Blue") {
+            return { { 120, 180, 255 }, { 205, 228, 255 }, { 170, 210, 255 }, { 170, 205, 255 }, "GJ_button_06.png" };
+        }
+        if (name == "Green") {
+            return { { 120, 230, 150 }, { 210, 255, 220 }, { 180, 240, 200 }, { 170, 235, 190 }, "GJ_button_01.png" };
+        }
+        if (name == "Dark") {
+            return { { 200, 160, 255 }, { 225, 225, 235 }, { 170, 170, 190 }, { 90, 85, 110 }, "GJ_button_04.png" };
+        }
+        return { { 255, 150, 205 }, { 255, 205, 230 }, { 215, 190, 255 }, { 255, 195, 235 }, "GJ_button_02.png" };
+    }
+
+private:
+    Theme m_t = currentTheme();
+
+    CCLabelBMFont* m_stage = nullptr;
+    CCLabelBMFont* m_status = nullptr;
+    std::vector<CCLabelBMFont*> m_labels;
+
+    static CCSprite* heart(float scale, ccColor3B color) {
+        auto* sprite = CCSprite::createWithSpriteFrameName("GJ_button_02.png");
+        sprite->setScale(scale);
+        sprite->setColor(color);
+        return sprite;
+    }
+
+    static void pulse(CCNode* node, float scale) {
+        node->runAction(CCRepeatForever::create(CCSequence::create(CCEaseSineInOut::create(CCScaleTo::create(0.45f, scale * 1.18f)),
+            CCEaseSineInOut::create(CCScaleTo::create(0.45f, scale)), nullptr)));
+    }
+
+    // hearts and sparkles drifting up behind the switches; the tag holds the rise time (x10)
+    void addFloaters() {
+        for (int i = 0; i < 9; ++i) {
+            bool sparkle = i % 3 == 2;
+            auto* sprite = sparkle ? CCSprite::createWithSpriteFrameName("GJ_button_01.png") : heart(0.3f + 0.05f * (i % 3), i % 2 ? m_t.main : m_t.accent);
+            if (sparkle) {
+                sprite->setScale(0.35f);
+            }
+            sprite->setOpacity(0);
+            sprite->setPosition({ 20.f + 340.f * ((i * 37) % 100) / 100.f, 20.f });
+            sprite->setTag(50 + 10 * (i % 4));
+            sprite->runAction(CCSequence::create(CCDelayTime::create(0.7f * i),
+                CCCallFuncN::create(this, callfuncN_selector(BufferMenu::loopFloater)), nullptr));
+            m_mainLayer->addChild(sprite, -1);
+        }
+    }
+
+    void loopFloater(CCNode* node) {
+        float rise = node->getTag() / 10.f;
+        node->runAction(CCRepeatForever::create(CCSequence::create(
+            CCSpawn::create(CCMoveBy::create(rise, { 0.f, 270.f }),
+                CCSequence::create(CCFadeTo::create(rise * 0.3f, 110), CCDelayTime::create(rise * 0.4f), CCFadeTo::create(rise * 0.3f, 0),
+                    nullptr),
+                nullptr),
+            CCPlace::create(node->getPosition()), nullptr)));
+    }
+
+    void colorLabels() {
+        for (size_t i = 0; i < m_labels.size(); ++i) {
+            m_labels[i]->setColor(optionValue(OPTIONS[i]) ? m_t.soft : ccColor3B { 170, 160, 185 });
+        }
+    }
+
+    static bool optionValue(Option const& o) {
+        return o.key ? Mod::get()->getSettingValue<bool>(o.key) : buf.showPath;
+    }
+
+    void refresh() {
+        m_stage->setString(stageText().c_str());
+        m_stage->limitLabelWidth(200.f, 0.5f, 0.2f);
+        float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
+        m_status->setString(fmt::format("physics {:.0f}/s  |  CBF {}  |  memory {} spots", 60.f / dt,
+            Loader::get()->isModLoaded("syzzi.click_between_frames") ? "on" : "off", memorySpots()).c_str());
+        colorLabels();
+    }
+
+    void onToggle(CCObject* sender) {
+        auto const& o = OPTIONS[sender->getTag()];
+        bool value = !optionValue(o);
+        if (o.key) {
+            Mod::get()->setSettingValue<bool>(o.key, value);
+            readSettings();
+            saveProfile();
+            refreshHeatmap();
+            refreshWatermark();
+        }
+        else {
+            buf.showPath = value;
+            if (buf.pathNode) {
+                buf.pathNode->clear();
+            }
+        }
+        say("{} {}", o.label, value ? "on" : "off");
+        refresh();
+    }
+
+    void onStage(CCObject* sender) {
+        cycleStage(sender->getTag());
+        refresh();
+    }
+
+    void onAllSettings(CCObject*) {
+        geode::openSettingsPopup(Mod::get());
+    }
+
+    void onCopyLog(CCObject*) {
+        exportConsole();
+    }
+
+    // v2.75 presets: stage + the switches that matter most, in one click
+    void onPreset(CCObject* sender) {
+        auto* mod = Mod::get();
+        int which = sender->getTag();
+        int stage = which == 0 ? 2 : which == 1 ? 3 : 5;  // 2f / 4f / 8f
+        mod->setSettingValue<bool>("robust-saves", true);
+        mod->setSettingValue<bool>("wave-safety-margin", which != 2);
+        mod->setSettingValue<bool>("more-time-death-spots", which != 0);
+        mod->setSettingValue<bool>("low-latency", false);
+        buf.stage = stage;
+        mod->setSavedValue("stage", buf.stage);
+        resetPending();
+        applyStage();
+        readSettings();
+        refreshWatermark();
+        refreshPanel();
+        say("preset: {} -> {}", which == 0 ? "Safe" : which == 1 ? "Balanced" : "Aggressive", stageText());
+        refresh();
+    }
+
+    void onRunCheck(CCObject*) {
+        benchPending = true;
+        say("run check: runs at the start of your next attempt from the beginning (restart the level)");
+        FLAlertLayer::create("Run check",
+            "Restart the level from the beginning: your longest recorded run is replayed on the hidden player and the "
+            "result shows in the console (F9) and in Stats.",
+            "OK")->show();
+    }
+
+    void onStats(CCObject*) {
+        FLAlertLayer::create("Practice stats", statsText(), "OK")->show();
+    }
+
+    void onForget(CCObject*) {
+        memory.clear();
+        pending.active = false;
+        memoryDirty = true;
+        saveMemory();
+        refreshHeatmap();
+        say("memory for this level cleared");
+        refresh();
+    }
+
+    CCMenuItemSpriteExtra* textButton(char const* text, SEL_MenuHandler handler, float scale = 0.6f) {
+        auto* sprite = ButtonSprite::create(text, "bigFont.fnt", m_t.button, 0.8f);
+        sprite->setScale(scale);
+        return CCMenuItemSpriteExtra::create(sprite, this, handler);
+    }
+
+protected:
+    bool init() {
+        if (!Popup::init(380.f, 412.f, "GJ_square04.png")) {
+            return false;
+        }
+        m_bgSprite->setColor(m_t.bg);
+        this->setTitle("Click Before Frames");
+        if (m_title) {
+            m_title->setColor(m_t.soft);
+        }
+        addFloaters();
+
+        // hearts around the title
+        for (float side : { -1.f, 1.f }) {
+            auto* h = heart(0.32f, m_t.main);
+            h->setRotation(side * 15.f);
+            m_mainLayer->addChildAtPosition(h, Anchor::Top, { side * 118.f, -20.f });
+            pulse(h, 0.32f);
+            auto* sp = CCSprite::createWithSpriteFrameName("GJ_button_01.png");
+            sp->setScale(0.25f);
+            sp->setColor(m_t.soft);
+            m_mainLayer->addChildAtPosition(sp, Anchor::Top, { side * 134.f, -10.f });
+            sp->runAction(CCRepeatForever::create(CCRotateBy::create(3.f, side * 360.f)));
+        }
+
+        // your own icon, with a little heart
+        auto* gm = GameManager::get();
+        auto* icon = SimplePlayer::create(gm->getPlayerFrame());
+        icon->updatePlayerFrame(gm->getPlayerFrame(), IconType::Cube);
+        icon->setColor(gm->colorForIdx(gm->getPlayerColor()));
+        icon->setSecondColor(gm->colorForIdx(gm->getPlayerColor2()));
+        icon->setScale(0.7f);
+        m_mainLayer->addChildAtPosition(icon, Anchor::TopLeft, { 34.f, -30.f });
+        icon->runAction(CCRepeatForever::create(CCSequence::create(CCEaseSineInOut::create(CCMoveBy::create(0.8f, { 0.f, 3.f })),
+            CCEaseSineInOut::create(CCMoveBy::create(0.8f, { 0.f, -3.f })), nullptr)));
+        auto* iconHeart = heart(0.2f, m_t.main);
+        m_mainLayer->addChildAtPosition(iconHeart, Anchor::TopLeft, { 52.f, -16.f });
+        pulse(iconHeart, 0.2f);
+
+        // stage row
+        auto* prev = CCMenuItemSpriteExtra::create(CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png"), this,
+            menu_selector(BufferMenu::onStage));
+        prev->setTag(-1);
+        prev->setScale(0.6f);
+        prev->m_baseScale = 0.6f;
+        m_buttonMenu->addChildAtPosition(prev, Anchor::Top, { -130.f, -52.f });
+        auto* nextSprite = CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png");
+        nextSprite->setFlipX(true);
+        auto* next = CCMenuItemSpriteExtra::create(nextSprite, this, menu_selector(BufferMenu::onStage));
+        next->setTag(1);
+        next->setScale(0.6f);
+        next->m_baseScale = 0.6f;
+        m_buttonMenu->addChildAtPosition(next, Anchor::Top, { 130.f, -52.f });
+        m_stage = CCLabelBMFont::create("", "bigFont.fnt");
+        m_mainLayer->addChildAtPosition(m_stage, Anchor::Top, { 0.f, -52.f });
+
+        // switches, two columns
+        constexpr int ROWS = 10;
+        for (int i = 0; i < static_cast<int>(std::size(OPTIONS)); ++i) {
+            int col = i / ROWS;
+            int row = i % ROWS;
+            CCPoint at { col == 0 ? -165.f : 15.f, -86.f - row * 24.f };
+            auto* toggler = CCMenuItemToggler::createWithStandardSprites(this, menu_selector(BufferMenu::onToggle), 0.55f);
+            toggler->setTag(i);
+            toggler->toggle(optionValue(OPTIONS[i]));
+            m_buttonMenu->addChildAtPosition(toggler, Anchor::Top, at);
+            auto* label = CCLabelBMFont::create(OPTIONS[i].label, "bigFont.fnt");
+            label->setAnchorPoint({ 0.f, 0.5f });
+            label->limitLabelWidth(140.f, 0.38f, 0.2f);
+            m_mainLayer->addChildAtPosition(label, Anchor::Top, at + CCPoint { 16.f, 0.f });
+            m_labels.push_back(label);
+        }
+
+        // status + shortcuts
+        m_status = CCLabelBMFont::create("", "chatFont.fnt");
+        m_status->setScale(0.55f);
+        m_status->setColor(m_t.accent);
+        m_mainLayer->addChildAtPosition(m_status, Anchor::Bottom, { 0.f, 56.f });
+        m_buttonMenu->addChildAtPosition(textButton("Settings", menu_selector(BufferMenu::onAllSettings), 0.55f), Anchor::Bottom,
+            { -132.f, 26.f });
+        m_buttonMenu->addChildAtPosition(textButton("Stats", menu_selector(BufferMenu::onStats), 0.55f), Anchor::Bottom, { -45.f, 26.f });
+        m_buttonMenu->addChildAtPosition(textButton("Copy log", menu_selector(BufferMenu::onCopyLog), 0.55f), Anchor::Bottom,
+            { 37.f, 26.f });
+        m_buttonMenu->addChildAtPosition(textButton("Forget", menu_selector(BufferMenu::onForget), 0.55f), Anchor::Bottom,
+            { 124.f, 26.f });
+
+        // presets + run check
+        char const* presets[] = { "Safe", "Balanced", "Aggressive" };
+        for (int i = 0; i < 3; ++i) {
+            auto* button = textButton(presets[i], menu_selector(BufferMenu::onPreset), 0.5f);
+            button->setTag(i);
+            m_buttonMenu->addChildAtPosition(button, Anchor::Bottom, { -132.f + 82.f * i, 82.f });
+        }
+        m_buttonMenu->addChildAtPosition(textButton("Run check", menu_selector(BufferMenu::onRunCheck), 0.5f), Anchor::Bottom,
+            { 124.f, 82.f });
+
+        refresh();
+        return true;
+    }
+
+public:
+    // v2.56: the menu opens at 78% size (the popup's own pop-in animation scales it back to
+    // 100%, so it's re-run with the smaller target)
+    void show() override {
+        Popup::show();
+        m_mainLayer->stopAllActions();
+        m_mainLayer->setScale(0.1f);
+        m_mainLayer->runAction(CCEaseElasticOut::create(CCScaleTo::create(0.5f, MENU_SCALE), 0.6f));
+    }
+
+    static constexpr float MENU_SCALE = 0.78f;
+
+    static BufferMenu* create() {
+        auto* ret = new BufferMenu();
+        if (ret->init()) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+
+    static void open() {
+        if (auto* menu = create()) {
+            menu->show();
+        }
+    }
+};
+
+// v2.46: the level complete screen says so if the buffer was on during the attempt.
+class $modify(BufEndLevelLayer, EndLevelLayer) {
+    void customSetup() {
+        EndLevelLayer::customSetup();
+        if (!buf.usedThisAttempt) {
+            return;
+        }
+        auto win = CCDirector::get()->getWinSize();
+        auto* label = CCLabelBMFont::create("Click Before Frames was on", "bigFont.fnt");
+        label->setScale(0.35f);
+        label->setColor({ 150, 205, 255 });
+        label->setOpacity(170);
+        label->setAnchorPoint({ 1.f, 1.f });
+        label->setPosition({ win.width - 6.f, win.height - 4.f });
+        this->addChild(label, 100);
+        if (attemptStats.saves > 0) {
+            auto* stats = CCLabelBMFont::create(attemptSummary().c_str(), "bigFont.fnt");
+            stats->setScale(0.28f);
+            stats->setColor({ 255, 190, 225 });
+            stats->setOpacity(170);
+            stats->setAnchorPoint({ 1.f, 1.f });
+            stats->setPosition({ win.width - 6.f, win.height - 16.f });
+            this->addChild(stats, 100);
+        }
+        benchFinish();  // a completed run is the best recording there is
+        benchFlush();
+        endAttempt();
+    }
+};
+
+class $modify(BufPauseLayer, PauseLayer) {
+    void customSetup() {
+        PauseLayer::customSetup();
+        auto* sprite = ButtonSprite::create("Buffer", "bigFont.fnt", BufferMenu::currentTheme().button, 0.8f);
+        sprite->setScale(0.6f);
+        auto* button = CCMenuItemSpriteExtra::create(sprite, this, menu_selector(BufPauseLayer::onBufferMenu));
+        auto* menu = CCMenu::create();
+        menu->addChild(button);
+        auto win = CCDirector::get()->getWinSize();
+        menu->setPosition({ win.width - 50.f, 30.f });
+        this->addChild(menu, 10);
+    }
+
+    void onBufferMenu(CCObject*) {
+        BufferMenu::open();
+    }
+};
+
+$on_mod(Loaded) {
+    buf.console = Mod::get()->getSettingValue<bool>("debug-console");
+    buf.showPath = Mod::get()->getSettingValue<bool>("show-path");
+    recoverGlobals();
+    buf.stage = std::clamp(static_cast<int>(Mod::get()->getSavedValue<int64_t>("stage", 0)), 0, STAGE_COUNT - 1);
+    // v2.62: per-level settings off (switched off once): every level uses the same switches, like v2.43.1
+    if (!Mod::get()->getSavedValue<bool>("per-level-v262", false)) {
+        Mod::get()->setSettingValue<bool>("per-level-settings", false);
+        Mod::get()->setSavedValue("per-level-v262", true);
+    }
+    // v2.60: low latency is off for every level (switched off once for existing installs too;
+    // it's one setting for all levels, not saved per level)
+    if (!Mod::get()->getSavedValue<bool>("low-latency-v260", false)) {
+        Mod::get()->setSettingValue<bool>("low-latency", false);
+        Mod::get()->setSavedValue("low-latency-v260", true);
+    }
+    readSettings();
+    applyStage();
+    if (buf.console) {
+#if defined(_WIN32)
+        AllocConsole();
+        FILE* out = nullptr;
+        freopen_s(&out, "CONOUT$", "w", stdout);
+        SetConsoleTitleA("Click Before Frames - Live Console");
+#else
+        say("Separate Windows console is unavailable on this platform; use the in-game console.");
+#endif
+    }
+    if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
+        say("Click Between Frames detected: mid-tick sync {}", buf.cbfSync ? "on" : "off");
+    }
+    if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
+        say("CBF Extrapolate detected: visual only, predictions unaffected");
+    }
+    say("v2.77 loaded. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+}
+
+class $modify(BufPlayLayer, PlayLayer) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("PlayLayer::destroyPlayer", HOOK_PRIORITY);
+        (void)self.setHookPriority("PlayLayer::playEndAnimationToPos", HOOK_PRIORITY);
+    }
+
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        if (buf.simulating && isGhost(player)) {
+            buf.ghostDied = true;
+            // v2.30 diagnostics: remember the first thing that kills the press-now ghost
+            if (buf.captureKiller && !buf.killerSeen) {
+                buf.killerSeen = true;
+                buf.killerTick = buf.simTick;
+                buf.ghostDeathRect = player->getObjectRect();
+                if (object) {
+                    buf.killerId = object->m_objectID;
+                    buf.killerType = static_cast<int>(object->m_objectType);
+                    buf.killerNoTouch = object->m_isNoTouch;
+                    buf.killerDisabled = object->m_isDisabled;
+                    buf.killerRect = object->getObjectRect();
+                }
+                else {
+                    buf.killerId = 0;
+                    buf.killerType = -1;
+                }
+            }
+            return;
+        }
+        // v2.34: let the game (and noclip / other mods) decide first, and only reset if you
+        // really died. With noclip this is called every tick you're inside a spike; resetting
+        // before it marked the button released each tick, the next tick pressed it again to
+        // match you, and a held button turned into 100-200 clicks a second.
+        bool wasDead = player && player->m_isDead;
+        PlayLayer::destroyPlayer(player, object);
+        if (!player || wasDead || !player->m_isDead) {
+            return;
+        }
+        resetPending();
+        buf.appliedInput = false;
+        buf.autoReleased = false;
+        buf.rapid = 0;
+        forgetPress();
+        memoryDeath();
+        benchFinish();
+        refreshHeatmap();
+        endAttempt();
+        finishDrift(" (died)");
+    }
+
+    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
+            return false;
+        }
+        dropGhosts();
+        readSettings();
+        applyStage();
+        exportLines.clear();
+        logClock = 0;
+        loadMemory(level);
+        if (statsKey != memoryKey) {
+            statsKey = memoryKey;
+            sessionStats = {};
+        }
+        attemptStats = {};
+        benchNeedStart = true;
+        benchRecording = false;
+        benchBest = {};
+        benchBestDirty = false;
+        benchBestTicks = benchSavedTicks();
+        loadProfile();
+        if (buf.saveDing) {
+            FMODAudioEngine::sharedEngine()->preloadEffect("counter003.ogg");  // v2.58: no hitch on the first ding
+        }
+        buf.ghost1 = makeGhost(this);
+        buf.ghost2 = makeGhost(this);
+        buf.ghostLayerBase = buf.ghostLayer->getChildrenCount();
+
+        // In-game console (F9): hidden unless the player opens it.
+        constexpr float W = PANEL_W;
+        constexpr float H = PANEL_H;
+        auto win = CCDirector::get()->getWinSize();
+        buf.panel = CCNode::create();
+        buf.panel->setPosition({ 8.f, win.height - H - 8.f });
+        buf.panel->setZOrder(1000);
+
+        // Background: the game's own blue background art, cropped to the panel and
+        // darkened from top to bottom so the text stays readable.
+        auto* stencil = CCLayerColor::create({ 255, 255, 255, 255 }, W, H);
+        auto* clip = CCClippingNode::create(stencil);
+        if (auto* art = CCSprite::create("game_bg_01_001.png")) {
+            auto size = art->getContentSize();
+            art->setScale(std::max(W / size.width, H / size.height));
+            art->setPosition({ W / 2.f, H / 2.f });
+            art->setColor({ 40, 120, 255 });
+            art->setOpacity(150);
+            clip->addChild(art);
+        }
+        auto* shade = CCLayerGradient::create({ 0, 0, 0, 50 }, { 0, 0, 0, 140 }, { 0.f, -1.f });
+        shade->setContentSize({ W, H });
+        clip->addChild(shade);
+        auto* header = CCLayerColor::create({ 0, 0, 0, 80 }, W, 28.f);
+        header->setPosition({ 0.f, H - 28.f });
+        clip->addChild(header);
+        auto* rule = CCLayerColor::create({ 255, 255, 255, 45 }, W - 16.f, 1.f);
+        rule->setPosition({ 8.f, H - 46.f });
+        clip->addChild(rule);
+        buf.panel->addChild(clip);
+
+        if (auto* frame = CCScale9Sprite::create("GJ_square07.png")) {
+            frame->setContentSize({ W, H });
+            frame->setPosition({ W / 2.f, H / 2.f });
+            frame->setOpacity(190);
+            buf.panel->addChild(frame);
+        }
+
+        auto* title = CCLabelBMFont::create("Click Before Frames", "goldFont.fnt");
+        title->setScale(0.55f);
+        title->setAnchorPoint({ 0.f, 0.5f });
+        title->setPosition({ 10.f, H - 14.f });
+        buf.panel->addChild(title);
+
+        auto* version = CCLabelBMFont::create(Mod::get()->getVersion().toVString().c_str(), "chatFont.fnt");
+        version->setScale(0.45f);
+        version->setOpacity(150);
+        version->setAnchorPoint({ 1.f, 0.5f });
+        version->setPosition({ W - 10.f, H - 14.f });
+        buf.panel->addChild(version);
+
+        buf.panelTitle = CCLabelBMFont::create("", "bigFont.fnt");
+        buf.panelTitle->setScale(0.4f);
+        buf.panelTitle->setAnchorPoint({ 0.f, 0.5f });
+        buf.panelTitle->setPosition({ 10.f, H - 37.f });
+        buf.panel->addChild(buf.panelTitle);
+
+        buf.panelLines.clear();
+        for (size_t i = 0; i < PANEL_LINES; ++i) {
+            auto* line = CCLabelBMFont::create("", "chatFont.fnt");
+            line->setScale(0.55f);
+            line->setAnchorPoint({ 0.f, 0.5f });
+            line->setPosition({ 10.f, H - 57.f - i * 13.f });
+            buf.panel->addChild(line);
+            buf.panelLines.push_back(line);
+        }
+
+        auto* hint = CCLabelBMFont::create("F6 stage  F7 menu  F8 copy log  F9 console  F10 path  F11 forget", "chatFont.fnt");
+        hint->setScale(0.45f);
+        hint->setColor({ 160, 190, 255 });
+        hint->setAnchorPoint({ 0.5f, 0.5f });
+        hint->setPosition({ W / 2.f, 9.f });
+        buf.panel->addChild(hint);
+
+        this->addChild(buf.panel);
+        refreshPanel();
+
+        buf.watermark = CCLabelBMFont::create("", "bigFont.fnt");
+        buf.watermark->setScale(0.28f);
+        buf.watermark->setColor({ 150, 205, 255 });
+        buf.watermark->setOpacity(153);
+        buf.watermark->setAnchorPoint({ 0.f, 0.f });
+        buf.watermark->setPosition({ 6.f, 4.f });
+        buf.watermark->setZOrder(1000);
+        this->addChild(buf.watermark);
+        buf.usedThisAttempt = false;
+        refreshWatermark();
+
+        buf.autoTag = CCLabelBMFont::create("AUTO INPUTS ON", "bigFont.fnt");
+        buf.autoTag->setScale(0.24f);
+        buf.autoTag->setColor({ 255, 120, 120 });
+        buf.autoTag->setOpacity(153);  // 60%, like the console; still readable in a recording
+        buf.autoTag->setAnchorPoint({ 1.f, 0.f });
+        buf.autoTag->setPosition({ win.width - 6.f, 4.f });
+        buf.autoTag->setZOrder(1000);
+        this->addChild(buf.autoTag);
+        refreshAutoTag();
+
+        buf.hintLabel = CCLabelBMFont::create("", "bigFont.fnt");
+        buf.hintLabel->setColor({ 255, 170, 215 });
+        buf.hintLabel->setOpacity(0);
+        buf.hintLabel->setPosition({ win.width / 2.f, win.height - 40.f });
+        buf.hintLabel->setZOrder(1000);
+        this->addChild(buf.hintLabel);
+
+        buf.heatNode = nullptr;
+        if (m_progressBar) {
+            buf.heatNode = CCDrawNode::create();
+            m_progressBar->addChild(buf.heatNode, 5);
+            refreshHeatmap();
+        }
+
+        // Path view lives in the object layer, so it scrolls with the level.
+        buf.pathNode = CCDrawNode::create();
+        // v2.48: above the level's shader effects when it has that layer; inside the shader
+        // layer, dark or glow shaders could hide the path completely.
+        (m_aboveShaderObjectLayer ? m_aboveShaderObjectLayer : m_objectLayer)->addChild(buf.pathNode, 9999);
+
+        buf.realInput = false;
+        buf.appliedInput = false;
+        buf.isPlayer1 = true;
+        buf.sinceInput = 999;
+        buf.rapid = 0;
+        forgetPress();
+        return true;
+    }
+
+    void onQuit() {
+        benchFinish();
+        benchFlush();
+        benchRecording = false;
+        saveMemory();
+        // v2.58: changes made in the settings popup during the level are kept for this level;
+        // before, leaving the level silently put the old values back.
+        saveProfile();
+        restoreGlobals();
+        buf.hintLabel = nullptr;
+        buf.heatNode = nullptr;
+        memoryKey.clear();
+        dropGhosts();
+        PlayLayer::onQuit();
+    }
+
+    void resetLevel() {
+        benchFinish();
+        benchNeedStart = true;
+        endAttempt();
+        buf.usedThisAttempt = false;
+        resetPending();
+        forgetPress();
+        refreshAutoTag();
+        if (buf.pathNode) {
+            buf.pathNode->clear();
+        }
+        buf.autoReleased = false;
+        drift.active = false;
+        PlayLayer::resetLevel();
+    }
+
+    void togglePracticeMode(bool practiceMode) {
+        PlayLayer::togglePracticeMode(practiceMode);
+        refreshWatermark();
+        refreshAutoTag();
+    }
+
+    void playEndAnimationToPos(CCPoint position) {
+        if (buf.simulating) {
+            return;
+        }
+        PlayLayer::playEndAnimationToPos(position);
+    }
+};
+
+class $modify(BufEditorLayer, LevelEditorLayer) {
+    bool init(GJGameLevel* level, bool noUI) {
+        bool ok = LevelEditorLayer::init(level, noUI);
+        dropGhosts();
+        return ok;
+    }
+};
+
+class $modify(BufHardStreak, HardStreak) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("HardStreak::addPoint", HOOK_PRIORITY);
+    }
+
+    void addPoint(CCPoint point) {
+        if (buf.simulating) {
+            return;
+        }
+        HardStreak::addPoint(point);
+    }
+};
+
+class $modify(BufEffectGameObject, EffectGameObject) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("EffectGameObject::triggerObject", HOOK_PRIORITY);
+    }
+
+    void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
+        if (buf.simulating) {
+            return;
+        }
+        EffectGameObject::triggerObject(layer, uniqueID, remapKeys);
+    }
+};
+
+class $modify(BufGameObject, GameObject) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("GameObject::playShineEffect", HOOK_PRIORITY);
+    }
+
+    void playShineEffect() {
+        if (buf.simulating) {
+            return;
+        }
+        GameObject::playShineEffect();
+    }
+};
+
+class $modify(BufPlayerObject, PlayerObject) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("PlayerObject::playSpiderDashEffect", HOOK_PRIORITY);
+        // v2.18: run before Click Between Frames, so this sees each physics tick once, with
+        // its full dt, and CBF's mid-tick clicks arrive while inRealUpdate is set.
+        (void)self.setHookPriority("PlayerObject::update", HOOK_PRIORITY);
+        (void)self.setHookPriority("PlayerObject::incrementJumps", HOOK_PRIORITY);
+        (void)self.setHookPriority("PlayerObject::ringJump", HOOK_PRIORITY);
+    }
+
+    // Runs 240x/sec per player. Ghost steps (during a simulation) skip straight to
+    // the original; F6 is no longer polled here (see BufKeyboard below).
+    void update(float dt) {
+        if (buf.simulating) {
+            PlayerObject::update(dt);
+            return;
+        }
+        auto* layer = GameManager::get()->m_playLayer;
+        if (layer && this == layer->m_player1) {
+            ++tickCount;
+            ++logClock;
+            if (buf.enabled) {
+                buf.usedThisAttempt = true;
+            }
+            if (buf.panelDirty) {
+                buf.panelDirty = false;
+                refreshPanel();
+            }
+            if (benchNeedStart) {
+                benchNeedStart = false;
+                if (benchPending) {
+                    benchPending = false;
+                    benchCheck(layer, this);
+                }
+                benchStart(layer, this);
+            }
+            driftStep(this);
+            memoryTick();
+            if (buf.enabled) {
+                deliverPending(layer, this);
+                livePath(layer, this);
+            }
+        }
+
+        bool isP1 = layer && this == layer->m_player1;
+        if (isP1) {
+            // v2.37: getPosition() is updated every physics step; PlayerObject::m_position lags
+            // behind, which kept CBF sync, the drift check, path view and memory slices off.
+            buf.tickStartX = getPosition().x;
+            buf.inRealUpdate = true;
+        }
+        PlayerObject::update(dt);
+        if (isP1) {
+            benchStep(this);
+            buf.inRealUpdate = false;
+            float dx = getPosition().x - buf.tickStartX;
+            if (std::abs(dx) > 0.01f) {
+                buf.tickDx = dx;
+            }
+            // The ghost must step with the dt the real player gets. v2.23: with unlocked FPS the
+            // step length jitters from frame to frame, so use a running average; a big jump
+            // (FPS cap or time warp changed) is taken over straight away. (P1 only: with CBF,
+            // P2 can be stepped in pieces of a tick.)
+            if (dt > 0.f) {
+                float avg = buf.tickLength;
+                buf.tickLength = (avg > 0.f && std::abs(dt - avg) < avg * 0.3f) ? avg * 0.9f + dt * 0.1f : dt;
+            }
+        }
+    }
+
+    void incrementJumps() {
+        if (buf.simulating) {
+            return;
+        }
+        PlayerObject::incrementJumps();
+    }
+
+    // v2.24: the ghost runs the real player's code, which also spawns visual effects
+    // (circles, bump waves, trail fade-outs, spider run sprites, rotation actions). None
+    // of it matters for physics, and some of it was added to the real level, so ghosts
+    // skip all of it.
+    bool ghostEffect() {
+        return buf.simulating && isGhost(this);
+    }
+
+    void spawnCircle() {
+        if (!ghostEffect()) PlayerObject::spawnCircle();
+    }
+
+    void spawnDualCircle() {
+        if (!ghostEffect()) PlayerObject::spawnDualCircle();
+    }
+
+    void spawnPortalCircle(ccColor3B color, float startRadius) {
+        if (!ghostEffect()) PlayerObject::spawnPortalCircle(color, startRadius);
+    }
+
+    void spawnScaleCircle() {
+        if (!ghostEffect()) PlayerObject::spawnScaleCircle();
+    }
+
+    void playBumpEffect(int objectType, GameObject* object) {
+        if (!ghostEffect()) PlayerObject::playBumpEffect(objectType, object);
+    }
+
+    void playSpawnEffect() {
+        if (!ghostEffect()) PlayerObject::playSpawnEffect();
+    }
+
+    void createFadeOutDartStreak() {
+        if (!ghostEffect()) PlayerObject::createFadeOutDartStreak();
+    }
+
+    void fadeOutStreak2(float duration) {
+        if (!ghostEffect()) PlayerObject::fadeOutStreak2(duration);
+    }
+
+    void playDynamicSpiderRun() {
+        if (!ghostEffect()) PlayerObject::playDynamicSpiderRun();
+    }
+
+    void animatePlatformerJump(float scale) {
+        if (!ghostEffect()) PlayerObject::animatePlatformerJump(scale);
+    }
+
+    void runBallRotation(float speed) {
+        if (!ghostEffect()) PlayerObject::runBallRotation(speed);
+    }
+
+    void runBallRotation2() {
+        if (!ghostEffect()) PlayerObject::runBallRotation2();
+    }
+
+    void runNormalRotation(bool notNormalMode, float speed) {
+        if (!ghostEffect()) PlayerObject::runNormalRotation(notNormalMode, speed);
+    }
+
+    void toggleGhostEffect(GhostType type) {
+        if (!ghostEffect()) PlayerObject::toggleGhostEffect(type);
+    }
+
+    void activateStreak() {
+        if (!ghostEffect()) PlayerObject::activateStreak();
+    }
+
+    void playSpiderDashEffect(CCPoint from, CCPoint to) {
+        if (buf.simulating) {
+            return;
+        }
+        PlayerObject::playSpiderDashEffect(from, to);
+    }
+
+    void ringJump(RingObject* ring, bool skipCheck) {
+        if (buf.simulating) {
+            if (!buf.smart || !isGhost(this)) {
+                return;
+            }
+            if (buf.orbsUsed.contains(ring)) {
+                return;
+            }
+            snapshotObject(ring);
+            // v2.43: the game can still refuse the orb inside ringJump, so the orb only counts
+            // as used if it actually changed the ghost's motion or gravity.
+            double vy = m_yVelocity;
+            bool upsideDown = m_isUpsideDown;
+            bool dashing = m_isDashing;
+            PlayerObject::ringJump(ring, skipCheck);
+            if (m_yVelocity != vy || m_isUpsideDown != upsideDown || m_isDashing != dashing) {
+                buf.orbsUsed.insert(ring);
+                if (buf.orbUsedTick < 0) {
+                    buf.orbUsedTick = buf.simTick;
+                }
+            }
+            return;
+        }
+        PlayerObject::ringJump(ring, skipCheck);
+    }
+
+    // Dash orbs don't go through ringJump.
+    void startDashing(DashRingObject* ring) {
+        if (buf.simulating && isGhost(this)) {
+            buf.orbsUsed.insert(ring);
+            if (buf.orbUsedTick < 0) {
+                buf.orbUsedTick = buf.simTick;
+            }
+        }
+        PlayerObject::startDashing(ring);
+    }
+};
+
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
+// F6 via the game's own keyboard events: no polling, and it only fires while GD has
+// focus (v1 polled GetAsyncKeyState every physics tick, even when tabbed out).
+class $modify(BufKeyboard, CCKeyboardDispatcher) {
+    bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
+        if (isKeyDown && !isKeyRepeat && GameManager::get()->m_playLayer) {
+            // v2.75: rebindable in the settings
+            int k = static_cast<int>(key);
+            auto is = [&](int i) { return buf.keys[i] != 0 && k == buf.keys[i]; };
+            if (is(0)) {
+                cycleStage();
+            }
+            else if (is(1)) {
+                auto* layer = GameManager::get()->m_playLayer;
+                if (layer && !layer->m_isPaused) {
+                    layer->pauseGame(true);
+                }
+                BufferMenu::open();
+            }
+            else if (is(3)) {
+                buf.panelOpen = !buf.panelOpen;
+                refreshPanel();
+            }
+            else if (is(2)) {
+                exportConsole();
+            }
+            else if (is(5)) {
+                memory.clear();
+                pending.active = false;
+                memoryDirty = true;
+                saveMemory();
+                say("memory for this level cleared");
+            }
+            else if (is(4)) {
+                buf.showPath = !buf.showPath;
+                if (buf.pathNode) {
+                    buf.pathNode->clear();
+                }
+                say("path view {}", buf.showPath ? "on" : "off");
+            }
+        }
+        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
+    }
+};
+
+#endif // !TARGET_OS_IPHONE
+
+class $modify(BufBaseGameLayer, GJBaseGameLayer) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("GJBaseGameLayer::canBeActivatedByPlayer", HOOK_PRIORITY);
+        (void)self.setHookPriority("GJBaseGameLayer::handleButton", HOOK_PRIORITY);
+        (void)self.setHookPriority("GJBaseGameLayer::collisionCheckObjects", HOOK_PRIORITY);
+        (void)self.setHookPriority("GJBaseGameLayer::playerTouchedRing", HOOK_PRIORITY);
+        (void)self.setHookPriority("GJBaseGameLayer::flipGravity", HOOK_PRIORITY);
+        (void)self.setHookPriority("GJBaseGameLayer::gameEventTriggered", HOOK_PRIORITY);
+        (void)self.setHookPriority("GJBaseGameLayer::playerWillSwitchMode", HOOK_PRIORITY);
+    }
+
+    // During a simulation the ghost may use each object once; the real activation
+    // state is snapshotted and restored afterwards so the real player is unaffected.
     bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
-        if (g_prediction.simulating && player == g_prediction.ghost) return false;
+        if (buf.simulating) {
+            if (!buf.smart || !isGhost(player) || !object) {
+                return false;
+            }
+            // v2.16: an orb can be checked on every tick you're inside it. Before, the first
+            // check already "spent" it, so the ghost could only click an orb on the very
+            // first tick it touched it. Now an orb is only spent once the ghost used it.
+            if (typeinfo_cast<RingObject*>(object)) {
+                if (buf.orbsUsed.contains(object)) {
+                    return false;
+                }
+                snapshotObject(object);
+                return true;
+            }
+            if (buf.simUsed.contains(object)) {
+                return false;
+            }
+            snapshotObject(object);
+            return true;
+        }
         return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
     }
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int objectCount, float dt) {
-        if (!g_prediction.simulating || player != g_prediction.ghost) {
+        if (!buf.simulating) {
             GJBaseGameLayer::collisionCheckObjects(player, objects, objectCount, dt);
             return;
         }
         static gd::vector<GameObject*> relevant;
         relevant.clear();
-        if (static_cast<int>(relevant.capacity()) < objectCount) relevant.reserve(objectCount);
-        auto rect = player->getObjectRect();
+        if (static_cast<int>(relevant.capacity()) < objectCount) {
+            relevant.reserve(objectCount);
+        }
+
+        // Hot loop: runs for every nearby object, every ghost tick. One type lookup per
+        // object, no bounds-checked at(), and the ghost rect is only fetched if needed.
+        uint64_t keep = buf.smart ? (COLLIDING_TYPES | INTERACT_TYPES) : COLLIDING_TYPES;
+        bool haveRect = false;
+        CCRect ghostRect;
+        auto& list = *objects;
         for (int i = 0; i < objectCount; ++i) {
-            auto* object = (*objects)[i];
-            if (!object) continue;
-            auto type = static_cast<unsigned>(object->m_objectType);
-            if (type >= 64) continue;
-            if ((PREDICTION_COLLIDERS >> type) & 1ull) {
-                relevant.push_back(object);
+            auto* object = list[i];
+            if (!object) {
                 continue;
             }
-            if (rect.intersectsRect(object->getObjectRect())) {
-                switch (object->m_objectType) {
-                    case GameObjectType::YellowJumpPad:
-                    case GameObjectType::PinkJumpPad:
-                    case GameObjectType::RedJumpPad:
-                    case GameObjectType::GravityPad:
-                    case GameObjectType::SpiderPad:
-                    case GameObjectType::YellowJumpRing:
-                    case GameObjectType::PinkJumpRing:
-                    case GameObjectType::RedJumpRing:
-                    case GameObjectType::GravityRing:
-                    case GameObjectType::GreenRing:
-                    case GameObjectType::DropRing:
-                    case GameObjectType::CustomRing:
-                    case GameObjectType::DashRing:
-                    case GameObjectType::GravityDashRing:
-                    case GameObjectType::SpiderOrb:
-                    case GameObjectType::InverseGravityPortal:
-                    case GameObjectType::NormalGravityPortal:
-                    case GameObjectType::GravityTogglePortal:
-                    case GameObjectType::ShipPortal:
-                    case GameObjectType::CubePortal:
-                    case GameObjectType::BallPortal:
-                    case GameObjectType::UfoPortal:
-                    case GameObjectType::WavePortal:
-                    case GameObjectType::RobotPortal:
-                    case GameObjectType::SpiderPortal:
-                    case GameObjectType::SwingPortal:
-                    case GameObjectType::DualPortal:
-                    case GameObjectType::SoloPortal:
-                    case GameObjectType::TeleportPortal:
-                    case GameObjectType::TeleportOrb:
-                        g_prediction.hitUnknownObject = true;
-                        break;
-                    default:
-                        break;
+            auto type = static_cast<unsigned>(object->m_objectType);
+            uint64_t bit = type < 64 ? (1ull << type) : 0;
+            if (keep & bit) {
+                // v2.31: a hazard you're touching right now while alive is one the game doesn't
+                // let kill you (a spike made to follow the player, noclip...). Seen in GRIEF:
+                // a spike always sitting exactly on the player killed every wave prediction on
+                // its first tick.
+                // Decided on the first ticks and kept by object, so a spike that follows you
+                // stays ignored even when "predict moving objects" moves it along.
+                if (!buf.simDisabled.empty() && buf.simDisabled.contains(object)) {
+                    continue;
                 }
-                if (g_prediction.hitUnknownObject) break;
+                if (buf.haveRealRect && (bit & HAZARD_TYPES)) {
+                    if (!buf.harmless.empty() && buf.harmless.contains(object)) {
+                        continue;
+                    }
+                    if (buf.simTick <= 1) {
+                        auto const& r = object->getObjectRect();
+                        if (r.intersectsRect(buf.realRect1) || r.intersectsRect(buf.realRect2)) {
+                            buf.harmless.insert(object);
+                            continue;
+                        }
+                    }
+                }
+                relevant.push_back(object);
+                if (buf.trackMovers && (COLLIDING_TYPES & bit)) {
+                    watchObject(object);
+                }
+                continue;
+            }
+            if (!buf.smart) {
+                continue;
+            }
+            bool stop = (STOP_TYPES & bit) != 0;
+            bool size = (SIZE_TYPES & bit) != 0;
+            float speed = (stop || size) ? 0.f : speedPortalValue(object->m_objectID);
+            if (!stop && !size && speed <= 0.f) {
+                continue;
+            }
+            if (!haveRect) {
+                ghostRect = player->getObjectRect();
+                haveRect = true;
+            }
+            if (ghostRect.intersectsRect(object->getObjectRect())) {
+                if (stop) {
+                    buf.ghostHitPortal = true;
+                }
+                else if (size) {
+                    bool mini = object->m_objectType == GameObjectType::MiniSizePortal;
+                    if ((player->m_vehicleSize < 1.f) != mini) {
+                        player->togglePlayerScale(mini, true);
+                    }
+                }
+                else {
+                    player->m_playerSpeed = speed;
+                }
             }
         }
-        if (!g_prediction.hitUnknownObject) {
-            GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
-        }
-    }
-
-    void playerTouchedRing(PlayerObject* player, RingObject* ring) {
-        if (g_prediction.simulating && player == g_prediction.ghost) return;
-        GJBaseGameLayer::playerTouchedRing(player, ring);
-    }
-
-    void flipGravity(PlayerObject* player, bool flip, bool noEffects) {
-        if (g_prediction.simulating && player == g_prediction.ghost) return;
-        GJBaseGameLayer::flipGravity(player, flip, noEffects);
-    }
-
-    void gameEventTriggered(GJGameEvent event, int material, int playerID) {
-        if (g_prediction.simulating) return;
-        GJBaseGameLayer::gameEventTriggered(event, material, playerID);
-    }
-
-    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        auto f = m_fields.operator->();
-        f->step++;
-        syncState();
-
-        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-
-        if (!PlayLayer::get()) {
-            for (auto& s : f->ps) s = PState();
-            return;
-        }
-
-        // Experimental dual support is off: plain game input in dual sections.
-        if (sharedDualInput() && !g_dualEnabled) {
-            bypassCleanup();
-            return;
-        }
-
-        if (m_player1) stepPlayer(m_player1, f->ps[0], 0);
-        if (m_player2) stepPlayer(m_player2, f->ps[1], 1);
+        GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
-        auto f = m_fields.operator->();
-        syncState();
-
-        if (PlayLayer::get() && button == 1) {
-            // Outside two-player mode the game applies every input to player 1,
-            // even one that arrives flagged as player 2 (for example a Jump P2
-            // keybind). Treat those inputs as player 1 so the right icon is helped.
-            bool asPlayer1 = isPlayer1 || !(m_levelSettings && m_levelSettings->m_twoPlayerMode);
-
-            // Dual portal in a one-player level: the game applies a single
-            // click to both icons.
-            if (asPlayer1 && m_player1 && sharedDualInput()) {
-                if (!g_dualEnabled) {
-                    // Experimental dual support is off: plain game input.
-                    bypassCleanup();
-                    f->ps[0].held = down;
-                    f->ps[1].held = down;
-                    GJBaseGameLayer::handleButton(down, button, isPlayer1);
-                    return;
-                }
-
-                // Each icon follows its own game mode and its own state.
-                bool hold1 = inputPlayer(m_player1, f->ps[0], 0, down);
-                bool hold2 = m_player2 ? inputPlayer(m_player2, f->ps[1], 1, down) : false;
-                if (hold1 && hold2) return;
-                if (!hold1 && !hold2) {
-                    GJBaseGameLayer::handleButton(down, button, isPlayer1);
-                    return;
-                }
-                // Only one icon is held back: give the click to the other now.
-                auto now = hold1 ? m_player2 : m_player1;
-                if (now) sendInput(now, down);
+        if (!buf.simulating && button == 1 && !buf.injecting) {
+            auto* p1 = this->m_player1;
+            if (down || (p1 && (p1->m_isDart || p1->m_isRobot))) {
+                finishDrift("");
+            }
+            recordRealInput(down, p1);
+        }
+        if (!buf.simulating && button == 1 && !buf.injecting) {
+            // v2.21 performance log: what this click cost, measured around the whole decision.
+            buf.simRuns = 0;
+            buf.simTicks = 0;
+            auto start = std::chrono::steady_clock::now();
+            bool held = intercept(this, down, isPlayer1);
+            sweepGhostLayer();
+            if (buf.perfLog && buf.simRuns > 0) {
+                double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                say("perf: {:.2f} ms, {} runs, {} ghost ticks ({:.1f} us/tick)", ms, buf.simRuns, buf.simTicks,
+                    ms * 1000.0 / static_cast<double>(std::max(1L, buf.simTicks)));
+            }
+            if (held) {
                 return;
             }
+        }
+        if (!buf.simulating && button == 1) {
+            benchInput(down);  // v2.75: what the game really gets (your clicks and delayed ones)
+        }
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
 
-            int idx = asPlayer1 ? 0 : 1;
-            auto p = asPlayer1 ? m_player1 : m_player2;
-            if (p) {
-                if (inputPlayer(p, f->ps[idx], idx, down)) return;
+    void playerTouchedRing(PlayerObject* player, RingObject* ring) {
+        if (buf.simulating) {
+            if (!buf.smart || !isGhost(player)) {
+                return;
+            }
+            snapshotObject(ring);
+            buf.touchedOrb = true;
+            if (buf.firstOrbTick < 0) {
+                buf.firstOrbTick = buf.simTick;
             }
         }
+        GJBaseGameLayer::playerTouchedRing(player, ring);
 
-        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        // v2.2 calculation mode: assume you click every orb you touch, on time. Without
+        // this the ghost (which only has the one click being tested) misses the next orb in a
+        // chain, falls, and the mod thinks a perfectly good click is a death.
+        if (buf.simulating && buf.orbClick) {
+            bool first = player == buf.ghost1;
+            bool& held = first ? buf.held1 : buf.held2;
+            bool& autoClick = first ? buf.auto1 : buf.auto2;
+            int& autoAt = first ? buf.autoAt1 : buf.autoAt2;
+            if (buf.orbClickDelay > 0) {
+                if (!held && autoAt == -1) {
+                    autoAt = buf.simTick + buf.orbClickDelay;  // v2.26: click later inside the orb
+                }
+            }
+            else if (!held && !autoClick) {
+                player->pushButton(PlayerButton::Jump);
+                autoClick = true;
+            }
+        }
+    }
+
+    // Gravity portals / blue pads / blue orbs: flip only the ghost, no layer effects.
+    void flipGravity(PlayerObject* player, bool flip, bool noEffects) {
+        if (buf.simulating) {
+            if (buf.smart && isGhost(player)) {
+                player->flipGravity(flip, true);
+            }
+            return;
+        }
+        GJBaseGameLayer::flipGravity(player, flip, noEffects);
+    }
+
+    // Never let ghost activity fire event triggers in the real level.
+    void gameEventTriggered(GJGameEvent event, int material, int playerID) {
+        if (buf.simulating) {
+            return;
+        }
+        GJBaseGameLayer::gameEventTriggered(event, material, playerID);
+    }
+
+    // v2.74: nothing the hidden ghost touches during a prediction may change the real level.
+    // Toggle orbs, orbs / pads / collectibles with groups, item and counter triggers could
+    // otherwise toggle or spawn groups and change item counters for real (once per
+    // prediction run, many times a click), which broke triggers in some levels.
+    void toggleGroupTriggered(int group, bool activate, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
+        if (buf.simulating) {
+            // v2.75: a toggle orb that switches a group off: the ghost stops colliding with
+            // that group for the rest of this prediction (the real objects aren't touched)
+            if (!activate) {
+                if (auto* objects = this->getGroup(group)) {
+                    for (auto* object : CCArrayExt<GameObject*>(objects)) {
+                        buf.simDisabled.insert(object);
+                    }
+                }
+            }
+            return;
+        }
+        GJBaseGameLayer::toggleGroupTriggered(group, activate, remapKeys, triggerID, controlID);
+    }
+
+    void spawnGroup(int group, bool ordered, double delay, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
+        if (buf.simulating) {
+            return;
+        }
+        GJBaseGameLayer::spawnGroup(group, ordered, delay, remapKeys, triggerID, controlID);
+    }
+
+    void toggleGroup(int id, bool activate) {
+        if (buf.simulating) {
+            return;
+        }
+        GJBaseGameLayer::toggleGroup(id, activate);
+    }
+
+    void pickupItem(EffectGameObject* object) {
+        if (buf.simulating) {
+            return;
+        }
+        GJBaseGameLayer::pickupItem(object);
+    }
+
+    void updateCounters(int itemId, int value) {
+        if (buf.simulating) {
+            return;
+        }
+        GJBaseGameLayer::updateCounters(itemId, value);
+    }
+
+    void activateItemEditTrigger(ItemTriggerGameObject* object) {
+        if (buf.simulating) {
+            return;
+        }
+        GJBaseGameLayer::activateItemEditTrigger(object);
+    }
+
+    void activateItemCompareTrigger(ItemTriggerGameObject* object, gd::vector<int> const& remapKeys) {
+        if (buf.simulating) {
+            return;
+        }
+        GJBaseGameLayer::activateItemCompareTrigger(object, remapKeys);
+    }
+
+    // Safety net in case a mode portal slips through: end prediction, change nothing.
+    void playerWillSwitchMode(PlayerObject* player, GameObject* object) {
+        if (buf.simulating) {
+            buf.ghostHitPortal = true;
+            return;
+        }
+        GJBaseGameLayer::playerWillSwitchMode(player, object);
     }
 };
