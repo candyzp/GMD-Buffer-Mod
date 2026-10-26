@@ -2124,26 +2124,27 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         int step = m_fields->step;
         char const* tag = idx == 0 ? "P1" : "P2";
 
-        // Experimental predictive path: practice-mode cube inputs only. Once a
-        // press has been shifted, shift its release and any follow-up events too.
+        // Finish any already-delayed input even if a mode portal is crossed before
+        // its release arrives. Press and release must stay on the same shifted timeline.
+        if (s.predictionShift > 0 || !s.predictionQueue.empty()) {
+            s.held = down;
+            int target = step + s.predictionShift;
+            if (!s.predictionQueue.empty() && target <= s.predictionQueue.back().second) {
+                target = s.predictionQueue.back().second + 1;
+            }
+            s.predictionQueue.emplace_back(down, target);
+            DBG("[InputBuffer] {} PREDICT {} queued at step {} -> {} (shift {})",
+                tag, down ? "PRESS" : "RELEASE", step, target, s.predictionShift);
+            return true;
+        }
+
+        // Experimental predictive path: practice-mode cube inputs only.
         bool cubePredictionMode = p && !isFlyMode(p) && !p->m_isBall &&
             !p->m_isRobot && !p->m_isSpider;
         auto* currentLayer = PlayLayer::get();
         if (cubePredictionMode && currentLayer && currentLayer->m_isPracticeMode &&
             !sharedDualInput() && !(m_levelSettings && m_levelSettings->m_twoPlayerMode)) {
             bool wasHeld = s.held;
-            if (s.predictionShift > 0 || !s.predictionQueue.empty()) {
-                s.held = down;
-                int target = step + s.predictionShift;
-                if (!s.predictionQueue.empty() && target <= s.predictionQueue.back().second) {
-                    target = s.predictionQueue.back().second + 1;
-                }
-                s.predictionQueue.emplace_back(down, target);
-                DBG("[InputBuffer] {} PREDICT {} queued at step {} -> {} (shift {})",
-                    tag, down ? "PRESS" : "RELEASE", step, target, s.predictionShift);
-                return true;
-            }
-
             s.held = down;
             s.pending = false;
             if (down && !wasHeld) {
