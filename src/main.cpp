@@ -1824,6 +1824,27 @@ struct PredictionResult {
     bool diedBeforeInput = false;
 };
 
+// Learn the user's actual tap duration from recent press/release pairs.
+// The first prediction uses a 50 ms tap, like the upstream predictor.
+static int g_predictionHoldSamples[8] = {};
+static int g_predictionHoldCount = 0;
+static int g_predictionHoldIndex = 0;
+
+static int predictionHoldEstimate() {
+    if (g_predictionHoldCount == 0) return 12;
+    int values[8] = {};
+    std::copy(g_predictionHoldSamples, g_predictionHoldSamples + g_predictionHoldCount, values);
+    int middle = g_predictionHoldCount / 2;
+    std::nth_element(values, values + middle, values + g_predictionHoldCount);
+    return std::clamp(values[middle], 1, 240);
+}
+
+static void recordPredictionHold(int ticks) {
+    g_predictionHoldSamples[g_predictionHoldIndex] = std::clamp(ticks, 1, 240);
+    g_predictionHoldIndex = (g_predictionHoldIndex + 1) % 8;
+    g_predictionHoldCount = std::min(g_predictionHoldCount + 1, 8);
+}
+
 static PredictionResult simulateCubePress(PlayLayer* layer, PlayerObject* real, int delay, int horizon, int holdTicks) {
     PredictionResult result;
     if (!layer || !real || !g_prediction.ghost || g_prediction.owner != layer || g_prediction.simulating) {
@@ -1893,16 +1914,24 @@ static int findPredictiveCubeDelay(PlayLayer* layer, PlayerObject* player, int m
         return 0;
     }
     const int horizon = std::clamp(maxDelay * 8, 48, 160);
-    const int holdTicks = 8;
+    const int holdTicks = predictionHoldEstimate();
     using clock = std::chrono::steady_clock;
     const auto started = clock::now();
     const double budgetMs = 4.0;
 
     auto base = simulateCubePress(layer, player, 0, horizon, holdTicks);
+    if (std::chrono::duration<double, std::milli>(clock::now() - started).count() > budgetMs) {
+        DBG("[InputBuffer] prediction baseline exceeded 4ms budget; input passed through");
+        return 0;
+    }
     if (base.safe || base.diedBeforeInput) return 0;
 
     for (int delay = 1; delay <= maxDelay; ++delay) {
         auto candidate = simulateCubePress(layer, player, delay, horizon, holdTicks);
+        if (std::chrono::duration<double, std::milli>(clock::now() - started).count() > budgetMs) {
+            DBG("[InputBuffer] prediction search hit 4ms budget; input passed through");
+            return 0;
+        }
         if (candidate.diedBeforeInput) break;
         if (candidate.safe) {
             log::info("[InputBuffer] PREDICT: press-now dies after {} steps; delaying {} steps predicted safe (horizon {}).",
@@ -2125,6 +2154,12 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         // Finish any already-delayed input even if a mode portal is crossed before
         // its release arrives. Press and release must stay on the same shifted timeline.
         if (s.predictionShift > 0 || !s.predictionQueue.empty()) {
+            if (down && !s.held) {
+                s.pressStep = step;
+            } else if (!down && s.pressStep >= 0) {
+                recordPredictionHold(step - s.pressStep);
+                s.pressStep = -1;
+            }
             s.held = down;
             int target = step + s.predictionShift;
             if (!s.predictionQueue.empty() && target <= s.predictionQueue.back().second) {
@@ -2143,6 +2178,12 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         if (cubePredictionMode && currentLayer && currentLayer->m_isPracticeMode &&
             !sharedDualInput() && !(m_levelSettings && m_levelSettings->m_twoPlayerMode)) {
             bool wasHeld = s.held;
+            if (down && !wasHeld) {
+                s.pressStep = step;
+            } else if (!down && s.pressStep >= 0) {
+                recordPredictionHold(step - s.pressStep);
+                s.pressStep = -1;
+            }
             s.held = down;
             s.pending = false;
             if (down && !wasHeld) {
