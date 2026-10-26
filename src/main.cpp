@@ -20,9 +20,9 @@
 using namespace geode::prelude;
 
 // ---- settings --------------------------------------------------------
-static constexpr char const* STAGE_NAMES[] = {"2 ticks", "4 ticks", "8 ticks", "16 ticks", "Off"};
-static constexpr int STAGES[] = {2, 4, 8, 16, 0};
-static constexpr int STAGE_COUNT = 5;
+static constexpr char const* STAGE_NAMES[] = {"2 ticks", "4 ticks", "8 ticks", "16 ticks", "32 ticks", "Off"};
+static constexpr int STAGES[] = {2, 4, 8, 16, 32, 0};
+static constexpr int STAGE_COUNT = 6;
 static int g_stage = 1;
 
 static constexpr int WAVE_MAX_TICKS = 8;
@@ -59,6 +59,17 @@ static constexpr int TPS_MAX = 10000;
 static int g_tps = 240;
 
 static bool g_debug = false;
+static bool g_saveDing = true;
+
+// Optional override that applies one tick window to every gameplay mode.
+static bool g_masterTickEnabled = false;
+static int g_masterTickValue = 4;
+
+// Optional deterministic rate limit: buffer the first eligible press, then
+// pass through the next N-1 eligible presses, repeating that cadence.
+static bool g_activationRateEnabled = false;
+static int g_activationEvery = 2;
+static int g_activationCounter = 0;
 
 // Experimental: buffering during dual-portal sections of one-player levels.
 // Off by default. Real 2-player levels are not affected by this.
@@ -91,6 +102,11 @@ static void loadSettings() {
         g_flyStyle[i] = indexOf(WAVE_NAMES, WAVE_MODE_COUNT, m->getSettingValue<std::string>(FLY_STYLE_KEYS[i]), WAVE_HOLD);
     }
     g_debug = m->getSettingValue<bool>("debug");
+    g_saveDing = m->getSettingValue<bool>("save-ding");
+    g_masterTickEnabled = m->getSettingValue<bool>("master-tick-enabled");
+    g_masterTickValue = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("master-tick-value")), 0, 64);
+    g_activationRateEnabled = m->getSettingValue<bool>("activation-rate-enabled");
+    g_activationEvery = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("activation-every")), 1, 10);
     g_dualEnabled = m->getSettingValue<bool>("dual-mode");
 }
 
@@ -132,6 +148,9 @@ static int styleFor(PlayerObject* p) {
 }
 
 static int ticksForMode(int idx) {
+    // When enabled, this deliberately overrides even per-mode values so every
+    // icon uses exactly the same tick window. Zero means raw input / OFF.
+    if (g_masterTickEnabled) return g_masterTickValue;
     int c = g_modeTicks[idx];
     if (c < 0) {
         int t = STAGES[g_stage];
@@ -236,6 +255,8 @@ static void hotkeyPressed(int action, bool down, bool repeat) {
 struct ProfileKey { char const* key; char type; }; // s = string, i = int, b = bool
 static constexpr ProfileKey PROFILE_KEYS[] = {
     {"stage", 's'}, {"wave-mode", 's'}, {"tps-value", 'i'},
+    {"master-tick-enabled", 'b'}, {"master-tick-value", 'i'},
+    {"activation-rate-enabled", 'b'}, {"activation-every", 'i'},
     {"cube-ticks", 'i'}, {"ball-ticks", 'i'}, {"robot-ticks", 'i'}, {"spider-ticks", 'i'},
     {"ship-ticks", 'i'}, {"ufo-ticks", 'i'}, {"swing-ticks", 'i'}, {"wave-ticks", 'i'},
     {"dual-mode", 'b'},
@@ -1264,18 +1285,24 @@ public:
 
 
 // ---- main popup: Basic and Advanced tabs --------------------------------
-static constexpr int PRESET_COUNT = 5;
-static constexpr char const* PRESET_NAMES[PRESET_COUNT] = {"Off", "Strict", "Standard", "Relaxed", "Very relaxed"};
-static constexpr char const* PRESET_STAGE[PRESET_COUNT] = {"Off", "2 ticks", "4 ticks", "8 ticks", "16 ticks"};
+static constexpr int PRESET_COUNT = 6;
+static constexpr char const* PRESET_NAMES[PRESET_COUNT] = {
+    "Off", "Strict", "Standard", "Relaxed", "Very relaxed", "Extremely Aggressive"
+};
+static constexpr char const* PRESET_STAGE[PRESET_COUNT] = {
+    "Off", "2 ticks", "4 ticks", "8 ticks", "16 ticks", "32 ticks"
+};
 static constexpr char const* PRESET_INFO[PRESET_COUNT] = {
     "No buffering or timing help.",
     "Remembers a click about half a frame early.",
     "Remembers a click about 1 frame early. A good start.",
     "Remembers a click about 2 frames early.",
-    "Remembers a click about 4 frames early. Very forgiving."
+    "Remembers a click about 4 frames early. Very forgiving.",
+    "Master override: all modes use 32 ticks (about 8 frames at 60 FPS). Very forgiving and can feel delayed."
 };
 static constexpr char const* DEFAULT_PROFILE =
-    "stage=4 ticks|wave-mode=Grid|tps-value=240|cube-ticks=-1|ball-ticks=-1|robot-ticks=-1|spider-ticks=-1|"
+    "stage=4 ticks|wave-mode=Grid|tps-value=240|master-tick-enabled=0|master-tick-value=4|"
+    "activation-rate-enabled=0|activation-every=2|cube-ticks=-1|ball-ticks=-1|robot-ticks=-1|spider-ticks=-1|"
     "ship-ticks=-1|ufo-ticks=-1|swing-ticks=-1|wave-ticks=-1|dual-mode=0|"
     "ship-style=Min Hold|ufo-style=Min Hold|swing-style=Min Hold";
 
@@ -1286,8 +1313,15 @@ static int currentPreset() {
         if (m->getSettingValue<int64_t>(key) != -1) return -1;
     }
     std::string stage = m->getSettingValue<std::string>("stage");
+    bool masterOn = m->getSettingValue<bool>("master-tick-enabled");
+    int masterTicks = static_cast<int>(m->getSettingValue<int64_t>("master-tick-value"));
     for (int i = 0; i < PRESET_COUNT; i++) {
-        if (stage == PRESET_STAGE[i]) return i;
+        if (stage != PRESET_STAGE[i]) continue;
+        if (i == PRESET_COUNT - 1) {
+            if (masterOn && masterTicks == 32) return i;
+        } else if (!masterOn) {
+            return i;
+        }
     }
     return -1;
 }
@@ -1430,6 +1464,11 @@ public:
         auto m = Mod::get();
         m->setSettingValue<std::string>("stage", PRESET_STAGE[p]);
         for (auto key : MODE_KEYS) m->setSettingValue<int64_t>(key, -1);
+        // Only the dedicated Extremely Aggressive preset enables the master
+        // override; every other preset returns to the normal per-mode behavior.
+        m->setSettingValue<bool>("master-tick-enabled", p == PRESET_COUNT - 1);
+        m->setSettingValue<int64_t>("master-tick-value", p == PRESET_COUNT - 1 ? 32 : 4);
+        loadSettings();
         refresh();
     }
 
@@ -1474,6 +1513,7 @@ public:
 
 $on_mod(Loaded) {
     loadSettings();
+    if (g_saveDing) FMODAudioEngine::sharedEngine()->preloadEffect("counter003.ogg");
     restoreAfterLevel(); // undo a level profile left over from a crash
     listenForSettingChanges<std::string>("stage", [](std::string) { loadSettings(); });
     listenForSettingChanges<int64_t>("tps-value", [](int64_t) { loadSettings(); });
@@ -1482,6 +1522,14 @@ $on_mod(Loaded) {
         listenForSettingChanges<int64_t>(key, [](int64_t) { loadSettings(); });
     }
     listenForSettingChanges<bool>("debug", [](bool) { loadSettings(); });
+    listenForSettingChanges<bool>("save-ding", [](bool enabled) {
+        loadSettings();
+        if (enabled) FMODAudioEngine::sharedEngine()->preloadEffect("counter003.ogg");
+    });
+    listenForSettingChanges<bool>("master-tick-enabled", [](bool) { loadSettings(); });
+    listenForSettingChanges<int64_t>("master-tick-value", [](int64_t) { loadSettings(); });
+    listenForSettingChanges<bool>("activation-rate-enabled", [](bool) { loadSettings(); });
+    listenForSettingChanges<int64_t>("activation-every", [](int64_t) { loadSettings(); });
     listenForSettingChanges<bool>("dual-mode", [](bool) { loadSettings(); });
     for (auto key : FLY_STYLE_KEYS) {
         listenForSettingChanges<std::string>(key, [](std::string) { loadSettings(); });
@@ -1609,6 +1657,7 @@ struct PState {
     int pendingStart = 0;
     int lastRingCount = 0;
     bool releaseNext = false;
+    bool bypassCurrentPress = false;
 
     int pressStep = -1;
     bool delayedRelease = false;
@@ -1667,6 +1716,7 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         auto f = m_fields.operator->();
         if (f->epoch == g_resetEpoch) return;
         f->epoch = g_resetEpoch;
+        g_activationCounter = 0;
 
         bool inconsistent = false;
         for (auto& s : f->ps) {
@@ -1766,9 +1816,14 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             } else {
                 sendInput(p, true);
                 s.releaseNext = true;
-                log::info("[InputBuffer] *** SAVED +{:.1f} TICKS ({:.2f} frames @ 60fps) PRESS! [{} {} {}] (Step0: {} -> Delayed: {}) [Limit: {} steps] ***",
-                          ticksSaved, ticksSaved / 4.0f, tag, modeName(p), what,
-                          s.pendingStart, step, limit);
+                if (g_saveDing) {
+                    FMODAudioEngine::sharedEngine()->playEffect("counter003.ogg");
+                }
+                // Detailed per-save formatting/log writes are opt-in: doing this
+                // for every rescue was a source of unnecessary console overhead.
+                DBG("[InputBuffer] *** SAVED +{:.1f} TICKS ({:.2f} frames @ 60fps) PRESS! [{} {} {}] (Step0: {} -> Delayed: {}) [Limit: {} steps] ***",
+                    ticksSaved, ticksSaved / 4.0f, tag, modeName(p), what,
+                    s.pendingStart, step, limit);
             }
         }
     }
@@ -1776,6 +1831,18 @@ class $modify(BufferLayer, GJBaseGameLayer) {
     bool inputPlayer(PlayerObject* p, PState& s, int idx, bool down) {
         int step = m_fields->step;
         char const* tag = idx == 0 ? "P1" : "P2";
+
+        // Inputs selected by the optional cadence limiter are passed straight
+        // through as a complete press/release pair, never half-buffered.
+        if (s.bypassCurrentPress) {
+            s.held = down;
+            if (!down) {
+                s.bypassCurrentPress = false;
+                s.pending = false;
+                s.lastRingCount = 0;
+            }
+            return false;
+        }
 
         if (!isFlyMode(p) && !s.waveQueue.empty()) {
             flushWaveQueue(p, s, idx);
@@ -1882,6 +1949,25 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         if (m_player2) stepPlayer(m_player2, f->ps[1], 1);
     }
 
+    bool shouldRateBypass(PlayerObject* p, PState const& s, bool down) {
+        if (!g_activationRateEnabled || !down || !p || modeLimitSteps(p) <= 0 ||
+            s.held || s.pending || s.delayedRelease || !s.waveQueue.empty()) {
+            return false;
+        }
+        ++g_activationCounter;
+        return ((g_activationCounter - 1) % std::max(1, g_activationEvery)) != 0;
+    }
+
+    void markRateBypass(PState& s) {
+        s.bypassCurrentPress = true;
+        s.held = true;
+        s.pending = false;
+        s.lastRingCount = 0;
+        s.releaseNext = false;
+        s.delayedRelease = false;
+        s.pressStep = -1;
+    }
+
     void handleButton(bool down, int button, bool isPlayer1) {
         auto f = m_fields.operator->();
         syncState();
@@ -1904,6 +1990,14 @@ class $modify(BufferLayer, GJBaseGameLayer) {
                     return;
                 }
 
+                // Decide once for a shared dual input, not once per icon.
+                if (shouldRateBypass(m_player1, f->ps[0], down)) {
+                    markRateBypass(f->ps[0]);
+                    if (m_player2) markRateBypass(f->ps[1]);
+                    GJBaseGameLayer::handleButton(down, button, isPlayer1);
+                    return;
+                }
+
                 // Each icon follows its own game mode and its own state.
                 bool hold1 = inputPlayer(m_player1, f->ps[0], 0, down);
                 bool hold2 = m_player2 ? inputPlayer(m_player2, f->ps[1], 1, down) : false;
@@ -1921,6 +2015,11 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             int idx = asPlayer1 ? 0 : 1;
             auto p = asPlayer1 ? m_player1 : m_player2;
             if (p) {
+                if (shouldRateBypass(p, f->ps[idx], down)) {
+                    markRateBypass(f->ps[idx]);
+                    GJBaseGameLayer::handleButton(down, button, isPlayer1);
+                    return;
+                }
                 if (inputPlayer(p, f->ps[idx], idx, down)) return;
             }
         }
