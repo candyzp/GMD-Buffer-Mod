@@ -1533,93 +1533,6 @@ class $modify(BufferPause, PauseLayer) {
 
 // Raises the reset flag on death, restart and checkpoint loads. The buffer
 // layer clears its state on the next step.
-class $modify(BufferReset, PlayLayer) {
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        if (!createPredictionGhost(this)) {
-            log::warn("[InputBuffer] prediction ghost creation failed; predictive mode will pass inputs through");
-        }
-        return true;
-    }
-
-    void resetLevel() {
-        PlayLayer::resetLevel();
-        g_resetEpoch++;
-    }
-
-    void resetLevelFromStart() {
-        PlayLayer::resetLevelFromStart();
-        g_resetEpoch++;
-    }
-
-    void loadFromCheckpoint(CheckpointObject* object) {
-        PlayLayer::loadFromCheckpoint(object);
-        g_resetEpoch++;
-    }
-
-    void destroyPlayer(PlayerObject* player, GameObject* object) {
-        // A predicted ghost death is only a simulation result, never a real death.
-        if (g_prediction.simulating && player == g_prediction.ghost) {
-            g_prediction.died = true;
-            player->m_isDead = true;
-            return;
-        }
-        PlayLayer::destroyPlayer(player, object);
-        g_resetEpoch++;
-        g_lastDeathPct = this->getCurrentPercent();
-    }
-
-    // Switches settings when the player moves into a different section.
-    void postUpdate(float dt) {
-        PlayLayer::postUpdate(dt);
-        if (!g_secActive) return;
-        if (m_level && m_level->isPlatformer()) return;
-        std::string tok = sectionToken(this->getCurrentPercent());
-        if (tok == g_secToken) return;
-        g_secToken = tok;
-        applyToken(tok, levelKeyFor(m_level));
-        g_resetEpoch++; // start the new section with clean input state
-        DBG("[InputBuffer] Section -> {}", tok);
-    }
-
-    // Leaving the level puts the player's own settings back.
-    void onExit() {
-        dropPredictionGhost();
-        PlayLayer::onExit();
-        g_secActive = false;
-        g_secToken.clear();
-        restoreAfterLevel();
-    }
-
-    // Applies the profile linked to this level, if there is one.
-    void setupHasCompleted() {
-        PlayLayer::setupHasCompleted();
-        if (!m_level) return;
-        int id = levelKeyFor(m_level);
-        if (id == 0) return;
-        std::string name = levelProfileFor(id);
-        g_secActive = false;
-        g_secToken.clear();
-        LevelSections ls = loadLevelSections(id);
-        bool useSections = Mod::get()->getSettingValue<bool>("sections") && !ls.secs.empty();
-        if (name.empty() && !useSections) return;
-        // Remember the player's own settings so they can be restored on exit.
-        ensureSnapshot();
-        if (!name.empty() && applyProfileByName(name)) {
-            log::info("[InputBuffer] Applied profile '{}' for level {}", name, id);
-            std::string msg = "Input Buffer profile: " + name;
-            Notification::create(msg.c_str(), NotificationIcon::Success, 1.5f)->show();
-        }
-        if (useSections) {
-            sortSections(ls);
-            g_sec = ls;
-            g_secActive = true;
-            log::info("[InputBuffer] {} sections active for level {}", ls.secs.size(), id);
-        }
-    }
-};
-
-
 // Experimental iOS-safe prediction core. Unlike the old fixed landing wait, this makes
 // a detached ghost player run the same physics/collision steps for "press now" and
 // candidate delayed presses. It is deliberately limited to cube-like prediction in
@@ -1631,6 +1544,7 @@ struct PredictionGhostState {
     unsigned layerBase = 0;
     bool simulating = false;
     bool died = false;
+    bool hitUnknownObject = false;
 };
 static PredictionGhostState g_prediction;
 
@@ -1659,6 +1573,7 @@ static void dropPredictionGhost() {
     g_prediction.layerBase = 0;
     g_prediction.simulating = false;
     g_prediction.died = false;
+    g_prediction.hitUnknownObject = false;
 }
 
 static bool createPredictionGhost(PlayLayer* owner) {
@@ -1845,7 +1760,10 @@ static void recordPredictionHold(int ticks) {
     g_predictionHoldCount = std::min(g_predictionHoldCount + 1, 8);
 }
 
-static PredictionResult simulateCubePress(PlayLayer* layer, PlayerObject* real, int delay, int horizon, int holdTicks) {
+static PredictionResult simulatePredictionInput(
+    PlayLayer* layer, PlayerObject* real, int delay, bool inputDown, int horizon, int holdTicks,
+    bool continuousHold, int recoveryTick = -1
+) {
     PredictionResult result;
     if (!layer || !real || !g_prediction.ghost || g_prediction.owner != layer || g_prediction.simulating) {
         result.safe = true;
@@ -1854,18 +1772,29 @@ static PredictionResult simulateCubePress(PlayLayer* layer, PlayerObject* real, 
     }
     auto* ghost = g_prediction.ghost;
     g_prediction.died = false;
+    g_prediction.hitUnknownObject = false;
     copyPredictionState(ghost, real);
     ghost->setVisible(false);
     ghost->m_isDead = false;
     g_prediction.simulating = true;
 
+    constexpr float SIM_DT = 0.25f;
+    const bool landingScored = !(real->m_isShip || real->m_isDart || real->m_isSwing);
     bool sawAir = false;
     int groundedAfterAir = 0;
-    constexpr float SIM_DT = 0.25f; // one normal Geometry Dash physics step
     const int total = delay + horizon;
     for (int tick = 0; tick < total; ++tick) {
-        if (tick == delay) ghost->pushButton(PlayerButton::Jump);
-        if (tick == delay + holdTicks) ghost->releaseButton(PlayerButton::Jump);
+        if (tick == delay) {
+            if (inputDown) ghost->pushButton(PlayerButton::Jump);
+            else ghost->releaseButton(PlayerButton::Jump);
+        }
+        if (inputDown && !continuousHold && holdTicks >= 0 && tick == delay + holdTicks) {
+            ghost->releaseButton(PlayerButton::Jump);
+        }
+        if (recoveryTick >= 0 && tick == delay + recoveryTick) {
+            if (inputDown) ghost->releaseButton(PlayerButton::Jump);
+            else ghost->pushButton(PlayerButton::Jump);
+        }
 
         if (ghost->m_collisionLogTop) ghost->m_collisionLogTop->removeAllObjects();
         if (ghost->m_collisionLogBottom) ghost->m_collisionLogBottom->removeAllObjects();
@@ -1881,16 +1810,24 @@ static PredictionResult simulateCubePress(PlayLayer* layer, PlayerObject* real, 
             result.survived = std::max(0, tick - delay);
             break;
         }
+        if (g_prediction.hitUnknownObject) {
+            result.diedBeforeInput = tick < delay;
+            result.safe = tick >= delay;
+            result.survived = tick >= delay ? horizon : 0;
+            break;
+        }
         if (tick < delay) continue;
 
-        if (!ghost->m_isOnGround) {
-            sawAir = true;
-            groundedAfterAir = 0;
-        } else if (sawAir) {
-            if (++groundedAfterAir >= 3) {
-                result.safe = true;
-                result.survived = horizon;
-                break;
+        if (landingScored) {
+            if (!ghost->m_isOnGround) {
+                sawAir = true;
+                groundedAfterAir = 0;
+            } else if (sawAir) {
+                if (++groundedAfterAir >= 3) {
+                    result.safe = true;
+                    result.survived = horizon;
+                    break;
+                }
             }
         }
         result.survived = std::min(horizon, tick - delay + 1);
@@ -1904,48 +1841,161 @@ static PredictionResult simulateCubePress(PlayLayer* layer, PlayerObject* real, 
     return result;
 }
 
-// Returns the first delay whose prediction survives, but never delays a press that
-// already looks safe. A small hard time budget prevents long prediction searches from
-// freezing gameplay on slower phones.
-static int findPredictiveCubeDelay(PlayLayer* layer, PlayerObject* player, int maxDelay) {
-    if (!layer || !player || !g_prediction.ghost || maxDelay <= 0) return 0;
-    if (player->m_isDead || player->m_isBall || player->m_isRobot || player->m_isSpider ||
-        player->m_isShip || player->m_isBird || player->m_isDart || player->m_isSwing) {
-        return 0;
-    }
-    const int horizon = std::clamp(maxDelay * 8, 48, 160);
-    const int holdTicks = predictionHoldEstimate();
+// All standard modes share the ghost physics core, but use different safety horizons.
+// Wave and ship also try a late inverse input, following the upstream predictor's recovery idea.
+static int findPredictiveDelay(PlayLayer* layer, PlayerObject* player, int maxDelay, bool inputDown) {
+    if (!layer || !player || !g_prediction.ghost || maxDelay <= 0 || player->m_isDead) return 0;
+
+    const bool isShip = player->m_isShip;
+    const bool isWave = player->m_isDart;
+    const bool isSwing = player->m_isSwing;
+    const bool isUfo = player->m_isBird;
+    const bool continuousHold = isShip || isWave;
+    const bool landingScored = !(isShip || isWave || isSwing);
+    if (!inputDown && landingScored && !isUfo) return 0;
+
+    const int horizon = (isShip || isWave || isSwing || isUfo)
+        ? std::clamp(maxDelay * 6, 36, 72)
+        : std::clamp(maxDelay * 8, 48, 144);
+    const int holdTicks = continuousHold ? -1 : predictionHoldEstimate();
     using clock = std::chrono::steady_clock;
     const auto started = clock::now();
-    const double budgetMs = 4.0;
+    constexpr double budgetMs = 6.0;
+    auto overBudget = [&] {
+        return std::chrono::duration<double, std::milli>(clock::now() - started).count() > budgetMs;
+    };
+    auto score = [&](int delay, int recovery = -1) {
+        return simulatePredictionInput(layer, player, delay, inputDown, horizon, holdTicks, continuousHold, recovery);
+    };
 
-    auto base = simulateCubePress(layer, player, 0, horizon, holdTicks);
-    if (std::chrono::duration<double, std::milli>(clock::now() - started).count() > budgetMs) {
-        DBG("[InputBuffer] prediction baseline exceeded 4ms budget; input passed through");
+    auto base = score(0);
+    if (overBudget()) {
+        DBG("[InputBuffer] prediction baseline exceeded 6ms budget; input passed through");
         return 0;
     }
     if (base.safe || base.diedBeforeInput) return 0;
 
     for (int delay = 1; delay <= maxDelay; ++delay) {
-        auto candidate = simulateCubePress(layer, player, delay, horizon, holdTicks);
-        if (std::chrono::duration<double, std::milli>(clock::now() - started).count() > budgetMs) {
-            DBG("[InputBuffer] prediction search hit 4ms budget; input passed through");
+        auto candidate = score(delay);
+        if (overBudget()) {
+            DBG("[InputBuffer] prediction search exceeded 6ms budget; input passed through");
             return 0;
         }
         if (candidate.diedBeforeInput) break;
         if (candidate.safe) {
-            log::info("[InputBuffer] PREDICT: press-now dies after {} steps; delaying {} steps predicted safe (horizon {}).",
-                base.survived, delay, horizon);
+            log::info("[InputBuffer] PREDICT: {} survived {} steps now; delay {} predicted safe (mode {}, horizon {}).",
+                inputDown ? "press" : "release", base.survived, delay, modeName(player), horizon);
             return delay;
         }
-        if (std::chrono::duration<double, std::milli>(clock::now() - started).count() > budgetMs) {
-            DBG("[InputBuffer] prediction search hit 4ms budget; input passed through");
-            return 0;
+        if (isWave || isShip) {
+            for (int margin : {4, 8, 12}) {
+                int recovery = candidate.survived - margin;
+                if (recovery < 4) continue;
+                auto recovered = score(delay, recovery);
+                if (overBudget()) {
+                    DBG("[InputBuffer] prediction recovery search exceeded 6ms budget; input passed through");
+                    return 0;
+                }
+                if (recovered.safe) {
+                    log::info("[InputBuffer] PREDICT: {} delay {} with recovery {} predicted safe [{}].",
+                        inputDown ? "press" : "release", delay, recovery, modeName(player));
+                    return delay;
+                }
+            }
         }
     }
-    DBG("[InputBuffer] prediction found no safer delay; input passed through");
+    DBG("[InputBuffer] prediction found no safer {} for mode {}; input passed through",
+        inputDown ? "press" : "release", modeName(player));
     return 0;
 }
+
+
+class $modify(BufferReset, PlayLayer) {
+    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+        if (!createPredictionGhost(this)) {
+            log::warn("[InputBuffer] prediction ghost creation failed; predictive mode will pass inputs through");
+        }
+        return true;
+    }
+
+    void resetLevel() {
+        PlayLayer::resetLevel();
+        g_resetEpoch++;
+    }
+
+    void resetLevelFromStart() {
+        PlayLayer::resetLevelFromStart();
+        g_resetEpoch++;
+    }
+
+    void loadFromCheckpoint(CheckpointObject* object) {
+        PlayLayer::loadFromCheckpoint(object);
+        g_resetEpoch++;
+    }
+
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        // A predicted ghost death is only a simulation result, never a real death.
+        if (g_prediction.simulating && player == g_prediction.ghost) {
+            g_prediction.died = true;
+            player->m_isDead = true;
+            return;
+        }
+        PlayLayer::destroyPlayer(player, object);
+        g_resetEpoch++;
+        g_lastDeathPct = this->getCurrentPercent();
+    }
+
+    // Switches settings when the player moves into a different section.
+    void postUpdate(float dt) {
+        PlayLayer::postUpdate(dt);
+        if (!g_secActive) return;
+        if (m_level && m_level->isPlatformer()) return;
+        std::string tok = sectionToken(this->getCurrentPercent());
+        if (tok == g_secToken) return;
+        g_secToken = tok;
+        applyToken(tok, levelKeyFor(m_level));
+        g_resetEpoch++; // start the new section with clean input state
+        DBG("[InputBuffer] Section -> {}", tok);
+    }
+
+    // Leaving the level puts the player's own settings back.
+    void onExit() {
+        dropPredictionGhost();
+        PlayLayer::onExit();
+        g_secActive = false;
+        g_secToken.clear();
+        restoreAfterLevel();
+    }
+
+    // Applies the profile linked to this level, if there is one.
+    void setupHasCompleted() {
+        PlayLayer::setupHasCompleted();
+        if (!m_level) return;
+        int id = levelKeyFor(m_level);
+        if (id == 0) return;
+        std::string name = levelProfileFor(id);
+        g_secActive = false;
+        g_secToken.clear();
+        LevelSections ls = loadLevelSections(id);
+        bool useSections = Mod::get()->getSettingValue<bool>("sections") && !ls.secs.empty();
+        if (name.empty() && !useSections) return;
+        // Remember the player's own settings so they can be restored on exit.
+        ensureSnapshot();
+        if (!name.empty() && applyProfileByName(name)) {
+            log::info("[InputBuffer] Applied profile '{}' for level {}", name, id);
+            std::string msg = "Input Buffer profile: " + name;
+            Notification::create(msg.c_str(), NotificationIcon::Success, 1.5f)->show();
+        }
+        if (useSections) {
+            sortSections(ls);
+            g_sec = ls;
+            g_secActive = true;
+            log::info("[InputBuffer] {} sections active for level {}", ls.secs.size(), id);
+        }
+    }
+};
+
 
 struct PState {
     bool held = false;
@@ -2171,11 +2221,14 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             return true;
         }
 
-        // Experimental predictive path: practice-mode cube inputs only.
-        bool cubePredictionMode = p && !isFlyMode(p) && !p->m_isBall &&
-            !p->m_isRobot && !p->m_isSpider;
+        // All-mode predictive path: cube, ball, robot, spider, ship, UFO, wave and swing.
+        // Practice-only until the first on-device validation is complete.
         auto* currentLayer = PlayLayer::get();
-        if (cubePredictionMode && currentLayer && currentLayer->m_isPracticeMode &&
+        bool supportedPredictionMode = p && (p->m_isShip || p->m_isBird || p->m_isBall ||
+            p->m_isDart || p->m_isRobot || p->m_isSpider || p->m_isSwing ||
+            (!p->m_isShip && !p->m_isBird && !p->m_isBall && !p->m_isDart &&
+             !p->m_isRobot && !p->m_isSpider && !p->m_isSwing));
+        if (supportedPredictionMode && currentLayer && currentLayer->m_isPracticeMode &&
             !sharedDualInput() && !(m_levelSettings && m_levelSettings->m_twoPlayerMode)) {
             bool wasHeld = s.held;
             if (down && !wasHeld) {
@@ -2186,18 +2239,17 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             }
             s.held = down;
             s.pending = false;
-            if (down && !wasHeld) {
+            if (down != wasHeld || isFlyMode(p)) {
                 int maxDelay = modeLimitSteps(p);
-                int delay = findPredictiveCubeDelay(currentLayer, p, maxDelay);
+                int delay = findPredictiveDelay(currentLayer, p, maxDelay, down);
                 if (delay > 0) {
                     s.predictionShift = delay;
-                    s.predictionQueue.emplace_back(true, step + delay);
-                    DBG("[InputBuffer] {} PREDICT selected +{} steps [{}]", tag, delay, modeName(p));
+                    s.predictionQueue.emplace_back(down, step + delay);
+                    DBG("[InputBuffer] {} PREDICT selected {} +{} steps [{}]",
+                        tag, down ? "PRESS" : "RELEASE", delay, modeName(p));
                     return true;
                 }
             }
-            // When prediction sees no proven improvement, leave the input to the
-            // game. Do not fall back to the old unconditional wait-until-landing rule.
             return false;
         }
 
@@ -2308,15 +2360,59 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         static gd::vector<GameObject*> relevant;
         relevant.clear();
         if (static_cast<int>(relevant.capacity()) < objectCount) relevant.reserve(objectCount);
+        auto rect = player->getObjectRect();
         for (int i = 0; i < objectCount; ++i) {
             auto* object = (*objects)[i];
             if (!object) continue;
             auto type = static_cast<unsigned>(object->m_objectType);
-            if (type < 64 && ((PREDICTION_COLLIDERS >> type) & 1ull)) {
+            if (type >= 64) continue;
+            if ((PREDICTION_COLLIDERS >> type) & 1ull) {
                 relevant.push_back(object);
+                continue;
+            }
+            if (rect.intersectsRect(object->getObjectRect())) {
+                switch (object->m_objectType) {
+                    case GameObjectType::YellowJumpPad:
+                    case GameObjectType::PinkJumpPad:
+                    case GameObjectType::RedJumpPad:
+                    case GameObjectType::GravityPad:
+                    case GameObjectType::SpiderPad:
+                    case GameObjectType::YellowJumpRing:
+                    case GameObjectType::PinkJumpRing:
+                    case GameObjectType::RedJumpRing:
+                    case GameObjectType::GravityRing:
+                    case GameObjectType::GreenRing:
+                    case GameObjectType::DropRing:
+                    case GameObjectType::CustomRing:
+                    case GameObjectType::DashRing:
+                    case GameObjectType::GravityDashRing:
+                    case GameObjectType::SpiderOrb:
+                    case GameObjectType::InverseGravityPortal:
+                    case GameObjectType::NormalGravityPortal:
+                    case GameObjectType::GravityTogglePortal:
+                    case GameObjectType::ShipPortal:
+                    case GameObjectType::CubePortal:
+                    case GameObjectType::BallPortal:
+                    case GameObjectType::UfoPortal:
+                    case GameObjectType::WavePortal:
+                    case GameObjectType::RobotPortal:
+                    case GameObjectType::SpiderPortal:
+                    case GameObjectType::SwingPortal:
+                    case GameObjectType::DualPortal:
+                    case GameObjectType::SoloPortal:
+                    case GameObjectType::TeleportPortal:
+                    case GameObjectType::TeleportOrb:
+                        g_prediction.hitUnknownObject = true;
+                        break;
+                    default:
+                        break;
+                }
+                if (g_prediction.hitUnknownObject) break;
             }
         }
-        GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
+        if (!g_prediction.hitUnknownObject) {
+            GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
+        }
     }
 
     void playerTouchedRing(PlayerObject* player, RingObject* ring) {
