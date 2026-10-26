@@ -56,7 +56,7 @@
 using namespace geode::prelude;
 
 namespace {
-    constexpr int HOOK_PRIORITY = -1000000;
+    constexpr auto HOOK_PRIORITY = Priority::VeryEarly;
     constexpr float TICK = 0.25f;
     constexpr size_t PANEL_LINES = 8;
     constexpr int SPIDER_LAND = 12;  // v2.15: ticks on a surface after a spider input = safe
