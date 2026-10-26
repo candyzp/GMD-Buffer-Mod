@@ -1,4 +1,4 @@
-name: Build Geode Mod
+name: Build Windows Mod (Geometry Dash 2.2081)
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
 jobs:
   build:
     # mod.json only lists Windows (gd.win), so Windows is the only target.
-    name: Windows
+    name: Windows · Win64
     runs-on: windows-latest
 
     steps:
