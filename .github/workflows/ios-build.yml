@@ -5,6 +5,11 @@ on:
   push:
     branches:
       - ios-port
+    paths:
+      - 'src/**'
+      - 'mod.json'
+      - 'CMakeLists.txt'
+      - '.github/workflows/ios-build.yml'
 
 jobs:
   build-ios:
