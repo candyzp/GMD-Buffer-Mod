@@ -1619,6 +1619,20 @@ static void sweepPredictionGhostLayer() {
         ghost->m_playerSpeed = real->m_playerSpeed;
         ghost->m_isDashing = real->m_isDashing;
         ghost->m_lastActivatedPortal = real->m_lastActivatedPortal;
+
+        // Reset input/jump state from the real player before every simulated run.
+        // Otherwise a previous ghost simulation can leave jumpBuffered/held state behind.
+        ghost->m_holdingButtons = real->m_holdingButtons;
+        ghost->m_jumpBuffered = real->m_jumpBuffered;
+        ghost->m_wasJumpBuffered = real->m_wasJumpBuffered;
+        ghost->m_stateJumpBuffered = real->m_stateJumpBuffered;
+        ghost->m_stateRingJump = real->m_stateRingJump;
+        ghost->m_stateRingJump2 = real->m_stateRingJump2;
+        ghost->m_wasRobotJump = real->m_wasRobotJump;
+        ghost->m_touchedRing = real->m_touchedRing;
+        ghost->m_touchedPad = real->m_touchedPad;
+        ghost->m_touchedGravityPortal = real->m_touchedGravityPortal;
+
         // Copy the remaining physics fields too; copyAttributes alone is not sufficient for prediction.
 
         // v2.8: everything else the physics step reads, so every mode matches the real
@@ -1823,9 +1837,11 @@ static PredictionResult simulatePredictionInput(
             break;
         }
         if (g_prediction.hitUnknownObject) {
-            result.diedBeforeInput = tick < delay;
-            result.safe = tick >= delay;
-            result.survived = tick >= delay ? horizon : 0;
+            // This simulator does not model the object's effect, so neither the baseline nor
+            // a delayed candidate may claim safety from a trajectory that reaches it.
+            result.diedBeforeInput = true;
+            result.safe = false;
+            result.survived = 0;
             break;
         }
         if (tick < delay) continue;
@@ -2221,7 +2237,8 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             } else if (!down && s.pressStep >= 0) {
                 if (p->m_isRobot) {
                     recordPredictionHold(step - s.pressStep, true);
-                } else if (!isFlyMode(p) && !p->m_isBall && !p->m_isSpider) {
+                } else if (!p->m_isShip && !p->m_isDart && !p->m_isRobot &&
+                           !p->m_isBall && !p->m_isSpider) {
                     recordPredictionHold(step - s.pressStep, false);
                 }
                 s.pressStep = -1;
