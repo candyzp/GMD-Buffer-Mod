@@ -1955,11 +1955,14 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         if (m_player2) stepPlayer(m_player2, f->ps[1], 1);
     }
 
+    bool canRateLimit(PlayerObject* p, PState const& s, bool down) {
+        return g_activationRateEnabled && down && p && modeLimitSteps(p) > 0 &&
+            !s.held && !s.pending && !s.delayedRelease && !s.releaseNext &&
+            !s.bypassCurrentPress && s.waveQueue.empty();
+    }
+
     bool shouldRateBypass(PlayerObject* p, PState const& s, bool down) {
-        if (!g_activationRateEnabled || !down || !p || modeLimitSteps(p) <= 0 ||
-            s.held || s.pending || s.delayedRelease || !s.waveQueue.empty()) {
-            return false;
-        }
+        if (!canRateLimit(p, s, down)) return false;
         ++g_activationCounter;
         return ((g_activationCounter - 1) % std::max(1, g_activationEvery)) != 0;
     }
@@ -1996,8 +1999,11 @@ class $modify(BufferLayer, GJBaseGameLayer) {
                     return;
                 }
 
-                // Decide once for a shared dual input, not once per icon.
-                if (shouldRateBypass(m_player1, f->ps[0], down)) {
+                // Rate-limit a shared dual input only when both icon states are
+                // clean, and decide once rather than once per icon.
+                bool dualRateEligible = canRateLimit(m_player1, f->ps[0], down) &&
+                    (!m_player2 || canRateLimit(m_player2, f->ps[1], down));
+                if (dualRateEligible && shouldRateBypass(m_player1, f->ps[0], down)) {
                     markRateBypass(f->ps[0]);
                     if (m_player2) markRateBypass(f->ps[1]);
                     GJBaseGameLayer::handleButton(down, button, isPlayer1);
