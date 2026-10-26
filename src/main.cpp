@@ -16,6 +16,7 @@
 //    dead flipGravity hook priority, optional console, in-game console (stage + live log, hidden by default).
 
 #include <Geode/Geode.hpp>
+#include "crash_diagnostics.hpp"
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -390,6 +391,7 @@ namespace {
     template <class... Args>
     void say(fmt::format_string<Args...> f, Args&&... args) {
         auto msg = fmt::format(f, std::forward<Args>(args)...);
+        crashdiag::recordf("BUFFER_EVENT step=%d %s", logClock, msg.c_str());
         exportLines.push_back(fmt::format("[{:>6}] {}", logClock, msg));
         while (exportLines.size() > EXPORT_LINES) {
             exportLines.pop_front();
@@ -626,6 +628,10 @@ namespace {
     }
 
     void dropGhosts() {
+        crashdiag::HookScope __diag("dropGhosts");
+        crashdiag::recordf("GHOST_DROP_BEGIN ghost1=%p ghost2=%p ghostLayer=%p simulating=%d injecting=%d",
+            static_cast<void*>(buf.ghost1), static_cast<void*>(buf.ghost2), static_cast<void*>(buf.ghostLayer),
+            buf.simulating ? 1 : 0, buf.injecting ? 1 : 0);
         for (auto** g : { &buf.ghost1, &buf.ghost2 }) {
             if (*g) {
                 (*g)->removeFromParentAndCleanup(true);
@@ -653,6 +659,8 @@ namespace {
         watched.clear();
         drift.active = false;
         resetPending();
+        crashdiag::record("GHOST_DROP_DONE all ghost pointers cleared");
+        crashdiag::flush();
     }
 
     // PERF: v1 created ghosts with the PlayLayer as their parent layer and put them in
@@ -663,15 +671,33 @@ namespace {
     // layer that is never added to the scene: cocos never visits/draws it and its
     // nodes' scheduled updates stay paused, so the ghosts cost nothing between clicks.
     PlayerObject* makeGhost(PlayLayer* layer) {
+        crashdiag::HookScope __diag("makeGhost");
+        crashdiag::recordf("GHOST_CREATE_BEGIN playLayer=%p ghostLayer=%p", static_cast<void*>(layer), static_cast<void*>(buf.ghostLayer));
+        if (!layer) {
+            crashdiag::record("GHOST_CREATE_FAILED reason=null PlayLayer");
+            return nullptr;
+        }
         if (!buf.ghostLayer) {
             buf.ghostLayer = CCLayer::create();
+            if (!buf.ghostLayer) {
+                crashdiag::record("GHOST_CREATE_FAILED reason=CCLayer::create returned null");
+                return nullptr;
+            }
             buf.ghostLayer->retain();
         }
         auto* ghost = PlayerObject::create(1, 1, layer, buf.ghostLayer, true);
+        if (!ghost) {
+            crashdiag::record("GHOST_CREATE_FAILED reason=PlayerObject::create returned null");
+            return nullptr;
+        }
         ghost->retain();
         ghost->setPosition(CCPoint(0.f, 105.f));
         ghost->setVisible(false);
         buf.ghostLayer->addChild(ghost);
+        crashdiag::recordf("GHOST_CREATE_OK ghost=%p parent=%p gameLayer=%p childCount=%u",
+            static_cast<void*>(ghost), static_cast<void*>(ghost->getParent()), static_cast<void*>(layer),
+            static_cast<unsigned>(buf.ghostLayer->getChildrenCount()));
+        crashdiag::flush();
         return ghost;
     }
 
@@ -691,10 +717,13 @@ namespace {
     }
 
     void sendButton(PlayLayer* layer, bool down) {
+        crashdiag::ActiveScope __diag("sendButton -> PlayLayer::handleButton");
+        crashdiag::recordf("INPUT_INJECT_BEGIN layer=%p down=%d player1=%d", static_cast<void*>(layer), down ? 1 : 0, buf.isPlayer1 ? 1 : 0);
         buf.injecting = true;
         buf.appliedInput = down;
         layer->handleButton(down, 1, buf.isPlayer1);
         buf.injecting = false;
+        crashdiag::recordf("INPUT_INJECT_END down=%d", down ? 1 : 0);
     }
 
     void pressGhost(PlayerObject* ghost, bool down) {
@@ -708,6 +737,11 @@ namespace {
     }
 
     void copyState(PlayerObject* ghost, PlayerObject* real) {
+        crashdiag::ActiveScope __diag("copyState(ghost, real)");
+        if (!ghost || !real) {
+            crashdiag::recordf("COPY_STATE_SKIPPED ghost=%p real=%p", static_cast<void*>(ghost), static_cast<void*>(real));
+            return;
+        }
         ghost->setVisible(false);
         ghost->resetTouchedRings(true);
         ghost->copyAttributes(real);
@@ -1409,11 +1443,21 @@ namespace {
     // that's good enough), instead of always running the full horizon.
     int simulate(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter,
         int stopAt, SimEnd* end) {
+        crashdiag::HookScope __diag("simulate");
+        crashdiag::recordf("SIM_BEGIN layer=%p p1=%p p2=%p dual=%d delay=%d down=%d horizon=%d releaseAfter=%d stopAt=%d",
+            static_cast<void*>(layer), static_cast<void*>(p1), static_cast<void*>(p2), dual ? 1 : 0, delay,
+            down ? 1 : 0, horizon, releaseAfter, stopAt);
         *end = SimEnd::Ok;
         if (!buf.ghost1) {
+            crashdiag::record("SIM_ABORT reason=ghost1 is null");
             return horizon;
         }
+        if (!layer || !p1) {
+            crashdiag::recordf("SIM_ABORT reason=null play/player layer=%p p1=%p", static_cast<void*>(layer), static_cast<void*>(p1));
+            return 0;
+        }
         buf.simulating = true;
+        crashdiag::recordf("SIM_STATE simulating=1 ghost1=%p ghost2=%p", static_cast<void*>(buf.ghost1), static_cast<void*>(buf.ghost2));
         buf.ghostDied = false;
         buf.ghostHitPortal = false;
         buf.firstOrbTick = -1;
@@ -1611,6 +1655,8 @@ namespace {
             buf.ghost2->stopAllActions();
         }
         buf.simulating = false;
+        crashdiag::recordf("SIM_END survived=%d horizon=%d safe=%d died=%d portal=%d tick=%d runs=%d simTicks=%d",
+            survived, horizon, safe ? 1 : 0, died ? 1 : 0, buf.ghostHitPortal ? 1 : 0, tick, buf.simRuns, buf.simTicks);
         return safe ? horizon : survived;
     }
 
@@ -2678,6 +2724,9 @@ namespace {
     }
 
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
+        crashdiag::HookScope __diag("intercept");
+        crashdiag::recordf("INPUT_INTERCEPT down=%d p1Side=%d enabled=%d simulating=%d injecting=%d layer=%p",
+            down ? 1 : 0, isPlayer1 ? 1 : 0, buf.enabled ? 1 : 0, buf.simulating ? 1 : 0, buf.injecting ? 1 : 0, static_cast<void*>(self));
         clickStart = std::chrono::steady_clock::now();
         clickBudget();
         auto* layer = GameManager::get()->m_playLayer;
@@ -3674,17 +3723,55 @@ class $modify(BufPauseLayer, PauseLayer) {
         auto* button = CCMenuItemSpriteExtra::create(sprite, this, menu_selector(BufPauseLayer::onBufferMenu));
         auto* menu = CCMenu::create();
         menu->addChild(button);
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        auto* diagnosticSprite = ButtonSprite::create("DIAG", "bigFont.fnt", BufferMenu::currentTheme().button, 0.8f);
+        diagnosticSprite->setScale(0.6f);
+        auto* diagnosticButton = CCMenuItemSpriteExtra::create(diagnosticSprite, this, menu_selector(BufPauseLayer::onDiagnostics));
+        diagnosticButton->setPosition({ -72.f, 0.f });
+        menu->addChild(diagnosticButton);
+#endif
         auto win = CCDirector::get()->getWinSize();
         menu->setPosition({ win.width - 50.f, 30.f });
         this->addChild(menu, 10);
     }
 
     void onBufferMenu(CCObject*) {
+        crashdiag::HookScope __diag("BufPauseLayer::onBufferMenu");
         BufferMenu::open();
+    }
+
+    void onDiagnostics(CCObject*) {
+        crashdiag::HookScope __diag("BufPauseLayer::onDiagnostics");
+        crashdiag::flush();
+        auto diagnostics = crashdiag::exportText();
+        bool copied = geode::utils::clipboard::write(diagnostics);
+        crashdiag::recordf("DIAGNOSTICS_EXPORT bytes=%zu clipboardCopied=%d", diagnostics.size(), copied ? 1 : 0);
+        crashdiag::flush();
+        FLAlertLayer::create("Input Buffer Diagnostics",
+            copied ? "Crash diagnostics copied to the clipboard. Paste the full text into the chat so we can inspect the exact crash path."
+                    : "Clipboard copy failed. The logs are still saved in the Input Buffer mod save folder.",
+            "OK")->show();
     }
 };
 
 $on_mod(Loaded) {
+    crashdiag::install();
+    crashdiag::record("MOD_LOADED callback entered");
+    auto allMods = Loader::get()->getAllMods();
+    size_t relevantMods = 0;
+    for (auto* loadedMod : allMods) {
+        if (!loadedMod || !loadedMod->isLoaded()) continue;
+        std::string id(loadedMod->getID().data());
+        if (id.find("cbf") != std::string::npos || id.find("buffer") != std::string::npos ||
+            id.find("input") != std::string::npos || id.find("click") != std::string::npos ||
+            id.find("hook") != std::string::npos || id.find("qol") != std::string::npos ||
+            id.find("tulip") != std::string::npos) {
+            crashdiag::recordf("LOADED_MOD id=%s version=%s", id.c_str(), loadedMod->getVersion().toVString().c_str());
+            ++relevantMods;
+        }
+    }
+    crashdiag::recordf("LOADED_MOD_SUMMARY total=%zu relevantLogged=%zu", allMods.size(), relevantMods);
+    crashdiag::flush();
     buf.console = Mod::get()->getSettingValue<bool>("debug-console");
     buf.showPath = Mod::get()->getSettingValue<bool>("show-path");
     recoverGlobals();
@@ -3718,6 +3805,8 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: visual only, predictions unaffected");
     }
+    crashdiag::record("HOOK_SET preserved: upstream BufPlayLayer/BufPlayerObject/BufBaseGameLayer/GameObject/EffectGameObject/HardStreak hooks remain enabled");
+    crashdiag::flush();
     say("v2.77 loaded. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
@@ -3728,6 +3817,9 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
+        crashdiag::HookScope __diag("BufPlayLayer::destroyPlayer");
+        crashdiag::recordf("DESTROY_PLAYER player=%p object=%p ghost=%d simulating=%d", static_cast<void*>(player),
+            static_cast<void*>(object), isGhost(player) ? 1 : 0, buf.simulating ? 1 : 0);
         if (buf.simulating && isGhost(player)) {
             buf.ghostDied = true;
             // v2.30 diagnostics: remember the first thing that kills the press-now ghost
@@ -3771,7 +3863,10 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        crashdiag::HookScope __diag("BufPlayLayer::init");
+        crashdiag::recordf("PLAY_INIT_BEGIN level=%p replay=%d dontCreateObjects=%d", static_cast<void*>(level), useReplay ? 1 : 0, dontCreateObjects ? 1 : 0);
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
+            crashdiag::record("PLAY_INIT_BASE_FAILED");
             return false;
         }
         dropGhosts();
@@ -3796,7 +3891,14 @@ class $modify(BufPlayLayer, PlayLayer) {
         }
         buf.ghost1 = makeGhost(this);
         buf.ghost2 = makeGhost(this);
-        buf.ghostLayerBase = buf.ghostLayer->getChildrenCount();
+        if (!buf.ghost1 || !buf.ghost2 || !buf.ghostLayer) {
+            crashdiag::recordf("FATAL_INIT missing clone(s): ghost1=%p ghost2=%p ghostLayer=%p; disabling buffer for safety",
+                static_cast<void*>(buf.ghost1), static_cast<void*>(buf.ghost2), static_cast<void*>(buf.ghostLayer));
+            buf.enabled = false;
+            say("ERROR: could not create hidden prediction player; buffer disabled for this level");
+            crashdiag::flush();
+        }
+        buf.ghostLayerBase = buf.ghostLayer ? buf.ghostLayer->getChildrenCount() : 0;
 
         // In-game console (F9): hidden unless the player opens it.
         constexpr float W = PANEL_W;
@@ -3886,6 +3988,9 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.usedThisAttempt = false;
         refreshWatermark();
 
+        crashdiag::recordf("PLAY_INIT_READY ghost1=%p ghost2=%p ghostLayer=%p enabled=%d",
+            static_cast<void*>(buf.ghost1), static_cast<void*>(buf.ghost2), static_cast<void*>(buf.ghostLayer), buf.enabled ? 1 : 0);
+        crashdiag::flush();
         buf.autoTag = CCLabelBMFont::create("AUTO INPUTS ON", "bigFont.fnt");
         buf.autoTag->setScale(0.24f);
         buf.autoTag->setColor({ 255, 120, 120 });
@@ -3926,6 +4031,10 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void onQuit() {
+        crashdiag::HookScope __diag("BufPlayLayer::onQuit");
+        crashdiag::recordf("PLAY_QUIT simulating=%d injecting=%d ghost1=%p ghost2=%p", buf.simulating ? 1 : 0,
+            buf.injecting ? 1 : 0, static_cast<void*>(buf.ghost1), static_cast<void*>(buf.ghost2));
+        crashdiag::flush();
         benchFinish();
         benchFlush();
         benchRecording = false;
@@ -3942,6 +4051,9 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
+        crashdiag::HookScope __diag("BufPlayLayer::resetLevel");
+        crashdiag::recordf("LEVEL_RESET simulating=%d ghost1=%p ghost2=%p", buf.simulating ? 1 : 0,
+            static_cast<void*>(buf.ghost1), static_cast<void*>(buf.ghost2));
         benchFinish();
         benchNeedStart = true;
         endAttempt();
@@ -4031,6 +4143,7 @@ class $modify(BufPlayerObject, PlayerObject) {
     // Runs 240x/sec per player. Ghost steps (during a simulation) skip straight to
     // the original; F6 is no longer polled here (see BufKeyboard below).
     void update(float dt) {
+        crashdiag::ActiveScope __diag(buf.simulating ? "BufPlayerObject::update [SIMULATION]" : "BufPlayerObject::update [LIVE]");
         if (buf.simulating) {
             PlayerObject::update(dt);
             return;
@@ -4063,6 +4176,7 @@ class $modify(BufPlayerObject, PlayerObject) {
         }
 
         bool isP1 = layer && this == layer->m_player1;
+        if (isP1 && tickCount > 0 && tickCount % 120 == 0) crashdiag::flush();
         if (isP1) {
             // v2.37: getPosition() is updated every physics step; PlayerObject::m_position lags
             // behind, which kept CBF sync, the drift check, path view and memory slices off.
@@ -4089,6 +4203,7 @@ class $modify(BufPlayerObject, PlayerObject) {
     }
 
     void incrementJumps() {
+        crashdiag::ActiveScope __diag("BufPlayerObject::incrementJumps");
         if (buf.simulating) {
             return;
         }
@@ -4269,6 +4384,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     // During a simulation the ghost may use each object once; the real activation
     // state is snapshotted and restored afterwards so the real player is unaffected.
     bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::canBeActivatedByPlayer");
         if (buf.simulating) {
             if (!buf.smart || !isGhost(player) || !object) {
                 return false;
@@ -4293,6 +4409,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int objectCount, float dt) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::collisionCheckObjects");
         if (!buf.simulating) {
             GJBaseGameLayer::collisionCheckObjects(player, objects, objectCount, dt);
             return;
@@ -4376,6 +4493,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
+        crashdiag::HookScope __diag("BufBaseGameLayer::handleButton");
+        crashdiag::recordf("HANDLE_BUTTON down=%d button=%d p1Side=%d simulating=%d injecting=%d", down ? 1 : 0, button,
+            isPlayer1 ? 1 : 0, buf.simulating ? 1 : 0, buf.injecting ? 1 : 0);
         if (!buf.simulating && button == 1 && !buf.injecting) {
             auto* p1 = this->m_player1;
             if (down || (p1 && (p1->m_isDart || p1->m_isRobot))) {
@@ -4406,6 +4526,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void playerTouchedRing(PlayerObject* player, RingObject* ring) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::playerTouchedRing");
         if (buf.simulating) {
             if (!buf.smart || !isGhost(player)) {
                 return;
@@ -4440,6 +4561,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     // Gravity portals / blue pads / blue orbs: flip only the ghost, no layer effects.
     void flipGravity(PlayerObject* player, bool flip, bool noEffects) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::flipGravity");
         if (buf.simulating) {
             if (buf.smart && isGhost(player)) {
                 player->flipGravity(flip, true);
@@ -4451,6 +4573,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     // Never let ghost activity fire event triggers in the real level.
     void gameEventTriggered(GJGameEvent event, int material, int playerID) {
+        crashdiag::ActiveScope __diag("BufBaseGameLayer::gameEventTriggered");
         if (buf.simulating) {
             return;
         }
