@@ -2263,7 +2263,7 @@ class $modify(BufferLayer, GJBaseGameLayer) {
              !p->m_isRobot && !p->m_isSpider && !p->m_isSwing));
         if (supportedPredictionMode && currentLayer && currentLayer->m_isPracticeMode &&
             !currentLayer->m_isPlatformer && !sharedDualInput() &&
-            !(m_levelSettings && m_levelSettings->m_twoPlayerMode))
+            !(m_levelSettings && m_levelSettings->m_twoPlayerMode)) {
             bool wasHeld = s.held;
             if (down && !wasHeld) {
                 s.pressStep = step;
