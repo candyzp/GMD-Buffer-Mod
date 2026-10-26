@@ -5,7 +5,7 @@
     },
     "id": "lyophi.buffermod",
     "name": "Input Buffer",
-    "version": "v1.1.0",
+    "version": "v1.2.0",
     "developer": "Lyophi",
     "description": "Predictive input buffering for Geometry Dash. Early clicks are remembered and fired when you land or touch an orb, and ship, UFO, swing and wave get smoother, more consistent timing.",
     "settings": {
@@ -14,12 +14,69 @@
             "name": "How to read the timing numbers",
             "description": "Timing windows are measured in **ticks**. A tick is one tiny step of the game's physics. There are 240 ticks per second, so:\n\n**1 tick** = about 4 milliseconds\n**2 ticks** = about 8 ms\n**4 ticks** = about 17 ms (1 frame at 60 FPS)\n**8 ticks** = about 33 ms (2 frames)\n**16 ticks** = about 67 ms (4 frames)\n**32 ticks** = about 133 ms (8 frames)\n\nOn every window setting:\n**-1** = use the Main Buffer Window\n**0** = off, raw input with no help\n**1 or more** = your own value\n\nSmaller windows are stricter and feel more natural. Larger windows are more forgiving but can fire clicks earlier or later than you meant."
         },
+        "sec-master-controls": {
+            "type": "title",
+            "name": "Master controls",
+            "description": "Optional controls for applying one timing window everywhere or reducing how often the buffer handles a new press."
+        },
+        "master-tick-enabled": {
+            "type": "bool",
+            "name": "Master tick controller",
+            "description": "ON: the Master Tick Value below overrides the Main Buffer Window and every per-mode window, so all gameplay modes use the exact same tick count. OFF: normal mode-specific settings return.",
+            "default": false
+        },
+        "master-tick-value": {
+            "type": "int",
+            "name": "Master Tick Value",
+            "description": "Tick window used for every mode while Master tick controller is on. 0 = raw input / no buffering. 4 is about one frame at 60 FPS; 32 is about eight frames and can feel very delayed.",
+            "default": 4,
+            "min": 0,
+            "max": 64,
+            "control": {
+                "input": true,
+                "arrows": true,
+                "slider": true,
+                "slider-step": 1
+            }
+        },
+        "sec-activation-rate": {
+            "type": "title",
+            "name": "Activation rate (optional)",
+            "description": "Limit which new press cycles are buffered. This is deterministic rather than random: the first eligible press is buffered, then the next N-1 eligible presses pass through unchanged."
+        },
+        "activation-rate-enabled": {
+            "type": "bool",
+            "name": "Enable activation rate limit",
+            "description": "ON: use the Activation Frequency slider below. OFF: every eligible input is handled normally by the buffer.",
+            "default": false
+        },
+        "activation-every": {
+            "type": "int",
+            "name": "Activation Frequency (every Nth press)",
+            "description": "When the rate limit is enabled, buffer every Nth eligible new press (1 = every press, 2 = every other press, 3 = every third press, up to 10). Other press cycles go straight to the game.",
+            "default": 2,
+            "min": 1,
+            "max": 10,
+            "control": {
+                "input": true,
+                "arrows": true,
+                "slider": true,
+                "slider-step": 1
+            }
+        },
         "stage": {
             "type": "string",
             "name": "Main Buffer Window",
             "description": "The default window for every mode that is set to -1 below.\n\n**2 ticks** = about half a frame (very strict)\n**4 ticks** = about 1 frame (a good starting point)\n**8 ticks** = about 2 frames\n**16 ticks** = about 4 frames (very forgiving)\n**Off** = no default window\n\nA bigger window is more forgiving, but a click meant for later might fire sooner than you wanted.",
             "default": "4 ticks",
-            "one-of": ["2 ticks", "4 ticks", "8 ticks", "16 ticks", "Off"]
+            "one-of": [
+                "2 ticks",
+                "4 ticks",
+                "8 ticks",
+                "16 ticks",
+                "32 ticks",
+                "Off"
+            ]
         },
         "sec-ground": {
             "type": "title",
@@ -33,7 +90,11 @@
             "default": -1,
             "min": -1,
             "max": 64,
-            "control": { "input": true, "arrows": true, "slider": false }
+            "control": {
+                "input": true,
+                "arrows": true,
+                "slider": false
+            }
         },
         "ball-ticks": {
             "type": "int",
@@ -42,7 +103,11 @@
             "default": -1,
             "min": -1,
             "max": 64,
-            "control": { "input": true, "arrows": true, "slider": false }
+            "control": {
+                "input": true,
+                "arrows": true,
+                "slider": false
+            }
         },
         "robot-ticks": {
             "type": "int",
@@ -51,7 +116,11 @@
             "default": -1,
             "min": -1,
             "max": 64,
-            "control": { "input": true, "arrows": true, "slider": false }
+            "control": {
+                "input": true,
+                "arrows": true,
+                "slider": false
+            }
         },
         "spider-ticks": {
             "type": "int",
@@ -60,7 +129,11 @@
             "default": -1,
             "min": -1,
             "max": 64,
-            "control": { "input": true, "arrows": true, "slider": false }
+            "control": {
+                "input": true,
+                "arrows": true,
+                "slider": false
+            }
         },
         "sec-fly": {
             "type": "title",
@@ -74,7 +147,11 @@
             "default": -1,
             "min": -1,
             "max": 64,
-            "control": { "input": true, "arrows": true, "slider": false }
+            "control": {
+                "input": true,
+                "arrows": true,
+                "slider": false
+            }
         },
         "ufo-ticks": {
             "type": "int",
@@ -83,7 +160,11 @@
             "default": -1,
             "min": -1,
             "max": 64,
-            "control": { "input": true, "arrows": true, "slider": false }
+            "control": {
+                "input": true,
+                "arrows": true,
+                "slider": false
+            }
         },
         "swing-ticks": {
             "type": "int",
@@ -92,7 +173,11 @@
             "default": -1,
             "min": -1,
             "max": 64,
-            "control": { "input": true, "arrows": true, "slider": false }
+            "control": {
+                "input": true,
+                "arrows": true,
+                "slider": false
+            }
         },
         "wave-ticks": {
             "type": "int",
@@ -101,14 +186,22 @@
             "default": -1,
             "min": -1,
             "max": 64,
-            "control": { "input": true, "arrows": true, "slider": false }
+            "control": {
+                "input": true,
+                "arrows": true,
+                "slider": false
+            }
         },
         "wave-mode": {
             "type": "string",
             "name": "Wave Mode",
             "description": "Picks how the wave timing help works. The Wave Window above sets how strong it is.\n\n**Min Hold**: a very short tap is stretched to at least the window length. Good if your quick taps come out too short or uneven.\nWatch out: quick taps feel slightly longer than you pressed, and fast spam can feel sticky.\n\n**Min Gap**: after you let go, the next press has to wait a minimum time. Good for fast zigzags that bunch up.\nWatch out: a press that comes too soon is delayed, which can feel like a late or skipped click.\n\n**Grid**: every press and release waits for the next beat of a fixed timing grid, so everything lines up evenly. Gives the most consistent result.\nWatch out: adds a small delay to every click and release, up to the window size. It can feel laggy with large windows.\n\nSwitching modes in the middle of a wave section can cause one odd click, so change it while paused.",
             "default": "Grid",
-            "one-of": ["Min Hold", "Min Gap", "Grid"]
+            "one-of": [
+                "Min Hold",
+                "Min Gap",
+                "Grid"
+            ]
         },
         "sec-keys": {
             "type": "title",
@@ -173,21 +266,33 @@
             "name": "Ship Timing Style (Experimental)",
             "description": "How clicks are handled in ship mode, using the ship window.\n\n**Min Hold** (default): a quick tap is held for at least the window.\n**Min Gap**: clicks keep at least the window between a release and the next press.\n**Grid**: presses and releases snap to a fixed beat. Clicks can be delayed by up to the window, so it can make some timings impossible to hit.\n\nExperimental. Leave on Min Hold unless you are testing.",
             "default": "Min Hold",
-            "one-of": ["Min Hold", "Min Gap", "Grid"]
+            "one-of": [
+                "Min Hold",
+                "Min Gap",
+                "Grid"
+            ]
         },
         "ufo-style": {
             "type": "string",
             "name": "UFO Timing Style (Experimental)",
             "description": "How clicks are handled in UFO mode, using the UFO window.\n\n**Min Hold** (default): a quick tap is held for at least the window.\n**Min Gap**: clicks keep at least the window between a release and the next press.\n**Grid**: presses and releases snap to a fixed beat. Clicks can be delayed by up to the window, so it can make some timings impossible to hit.\n\nExperimental. Leave on Min Hold unless you are testing.",
             "default": "Min Hold",
-            "one-of": ["Min Hold", "Min Gap", "Grid"]
+            "one-of": [
+                "Min Hold",
+                "Min Gap",
+                "Grid"
+            ]
         },
         "swing-style": {
             "type": "string",
             "name": "Swing Timing Style (Experimental)",
             "description": "How clicks are handled in swing mode, using the swing window.\n\n**Min Hold** (default): a quick tap is held for at least the window.\n**Min Gap**: clicks keep at least the window between a release and the next press.\n**Grid**: presses and releases snap to a fixed beat. Clicks can be delayed by up to the window, so it can make some timings impossible to hit.\n\nExperimental. Leave on Min Hold unless you are testing.",
             "default": "Min Hold",
-            "one-of": ["Min Hold", "Min Gap", "Grid"]
+            "one-of": [
+                "Min Hold",
+                "Min Gap",
+                "Grid"
+            ]
         },
         "sections": {
             "type": "bool",
@@ -207,7 +312,11 @@
             "default": 240,
             "min": 1,
             "max": 10000,
-            "control": { "input": true, "arrows": false, "slider": false }
+            "control": {
+                "input": true,
+                "arrows": false,
+                "slider": false
+            }
         },
         "debug": {
             "type": "bool",
