@@ -116,3 +116,14 @@ The **Buffer** button on the pause menu opens a small window. **Basic** has the 
 Some lists may not accept input-assist mods. Check your list's rules before submitting a completion.
 
 **Copying sections:** the Sections window can copy a level's sections (and its linked profile) to another level ID. This is recommended for moving your setup from a copy of the level to the main level. It is not experimental and works even if the Level Sections setting is off.
+
+
+## New controls in v1.2.0
+
+- **Master tick controller:** turn it on to make every mode use the same tick window. The value slider supports 0–64 ticks; turning the controller off restores the normal main/per-mode windows.
+- **Activation rate limit:** optional deterministic cadence control. For example, set it to 3 to buffer every third eligible press while the others pass through unchanged. It is off by default.
+- **Sound on successful save:** optional ding on each saved early input.
+- **Extremely Aggressive preset:** applies 32 ticks to all modes (about 133 ms / 8 frames at 60 FPS). This is intentionally very forgiving and may feel delayed.
+- **Lower default overhead:** detailed successful-save log writes now use the existing Debug Logging toggle, rather than writing a console line on every save when debugging is off.
+
+The currently published repository metadata and workflow still target Windows only. These changes do not add an iOS build target or change any rotation hooks.
