@@ -1,3 +1,8 @@
+## v2.78.1
+- Enforced a shared compute budget across the entire input decision, including in-progress ghost simulations; stop starting extra retries after the budget is used.
+- Bounded orb-alignment search to part of the remaining budget so it retains orb assistance without monopolizing the click and starving the normal prediction search.
+- Kept trajectory prediction and orb assistance enabled; on budget exhaustion the mod passes the input through instead of continuing an expensive search.
+
 ## v2.78.0
 - Preserved the trajectory-based prediction engine (ghost simulation, delay search, orb/portal handling and input queue); added an optional activation-rate control without replacing prediction with fixed tick buffering.
 - Activation rate deterministically lets the first eligible press reach prediction, then passes the next N-1 complete press/release pairs directly to the game. Inputs already queued by prediction and inputs skipped by the spam guard are not rate-limited.
