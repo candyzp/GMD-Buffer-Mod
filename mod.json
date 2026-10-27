@@ -4,7 +4,7 @@
         "win": "2.2081",
         "ios": "2.2081"
     },
-    "version": "v2.77.0",
+    "version": "v2.78.0",
     "id": "lyophi.buffermod",
     "name": "Input Buffer",
     "developer": "Lyophi",
@@ -61,6 +61,31 @@
             "default": 50,
             "min": 1,
             "max": 100
+        },
+        "sec-activation-rate": {
+            "type": "title",
+            "name": "Activation rate (optional)",
+            "description": "Limit how often the prediction engine handles fresh presses. The first eligible press goes through prediction; the next N-1 fresh presses pass through as complete press/release pairs. Inputs already queued by the predictor are left alone."
+        },
+        "activation-rate-enabled": {
+            "type": "bool",
+            "name": "Enable activation rate limit",
+            "description": "ON: use the Activation Frequency value below. OFF: every eligible press is handled normally by prediction.",
+            "default": false
+        },
+        "activation-every": {
+            "type": "int",
+            "name": "Activation Frequency (every Nth press)",
+            "description": "When enabled, prediction handles the first eligible press, then every Nth fresh press. Other complete press/release pairs go straight to the game. 1 = every press; 2 = every other press; range 1-10.",
+            "default": 2,
+            "min": 1,
+            "max": 10,
+            "control": {
+                "input": true,
+                "arrows": true,
+                "slider": true,
+                "slider-step": 1
+            }
         },
         "smart-prediction": {
             "type": "bool",
