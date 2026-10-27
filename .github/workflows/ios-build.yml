@@ -45,7 +45,7 @@ jobs:
           # moving bindings main branch.
           bindings-ref: 1605f500d053f8de122bf5c7dc6d17c24866e02e
           configure-args: -DSKIP_BUILDING_CODEGEN=OFF
-          build-config: RelWithDebInfo
+          build-config: Release
 
       - name: Upload iOS package
         uses: actions/upload-artifact@v7

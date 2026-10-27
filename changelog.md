@@ -1,7 +1,7 @@
-## v2.78.1
-- Enforced a shared compute budget across the entire input decision, including in-progress ghost simulations; stop starting extra retries after the budget is used.
-- Bounded orb-alignment search to part of the remaining budget so it retains orb assistance without monopolizing the click and starving the normal prediction search.
-- Kept trajectory prediction and orb assistance enabled; on budget exhaustion the mod passes the input through instead of continuing an expensive search.
+## v2.78.2
+- Restored the complete v2.78.0 prediction/search path: no ghost simulation is cut short, so the predictor retains its original save-decision behavior.
+- Built the iOS package using the optimized Release configuration instead of RelWithDebInfo. This changes compiler optimization, not prediction settings or gameplay rules.
+- Crash investigation note: the supplied scene-transition reports enter QOLMod's SpeedhackScheduler hook. This build also removes the previous mid-simulation cutoff, which could leave only partial simulation state before restoration.
 
 ## v2.78.0
 - Preserved the trajectory-based prediction engine (ghost simulation, delay search, orb/portal handling and input queue); added an optional activation-rate control without replacing prediction with fixed tick buffering.

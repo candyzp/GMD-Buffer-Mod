@@ -1,5 +1,5 @@
 // Click Before Frames v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
-// Build note v2.78.1: click-wide compute budget, bounded orb alignment; trajectory prediction remains the engine.
+// Build note v2.78.2: retain the complete v2.78.0 prediction/search path; performance comes from optimized compilation.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -157,14 +157,6 @@ namespace {
         bool panelOpen = false;  // closed by default, remembered for the session
         bool panelDirty = false; // v2.71: new log lines, the panel is redrawn once on the next step
         bool perfMode = false;   // v2.71: performance mode
-        // Budget prediction as a whole click, not separately per search stage.
-        bool budgetActive = false;
-        bool budgetExhausted = false;
-        // Orb alignment has a smaller slice so it cannot starve normal saves.
-        bool orbBudgetActive = false;
-        bool orbBudgetExhausted = false;
-        double orbBudgetMs = 0.0;
-        std::chrono::steady_clock::time_point orbBudgetStart{};
         double userBudget = 6.0; // v2.75: the budget from the settings (budgetMs is this click's)
         bool autoBudget = true;  // v2.75: budget follows the frame rate
         int keys[6] = { 0, 0, 0, 0, 0, 0 };  // v2.75: stage, menu, export, console, path, forget
@@ -1498,44 +1490,6 @@ namespace {
         }
     }
 
-    // The deadline starts at each real input and is shared by all nested simulations.
-    std::chrono::steady_clock::time_point clickStart;
-    double clickMs();
-
-    bool clickBudgetExpired() {
-        return buf.budgetActive && buf.budgetMs > 0.0 && clickMs() >= buf.budgetMs;
-    }
-
-    bool orbBudgetExpired() {
-        return buf.orbBudgetActive &&
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buf.orbBudgetStart).count() >= buf.orbBudgetMs;
-    }
-
-    // Marks which budget ran out. A completed run remains usable, but no alternatives are started.
-    bool stopPredictionForBudget() {
-        if (buf.budgetActive && (buf.budgetExhausted || clickBudgetExpired())) {
-            buf.budgetExhausted = true;
-            return true;
-        }
-        if (buf.orbBudgetActive && (buf.orbBudgetExhausted || orbBudgetExpired())) {
-            buf.orbBudgetExhausted = true;
-            return true;
-        }
-        return false;
-    }
-
-    struct OrbSearchBudgetScope {
-        explicit OrbSearchBudgetScope(double budgetMs) {
-            buf.orbBudgetStart = std::chrono::steady_clock::now();
-            buf.orbBudgetMs = std::max(0.0, budgetMs);
-            buf.orbBudgetExhausted = false;
-            buf.orbBudgetActive = true;
-        }
-        ~OrbSearchBudgetScope() {
-            buf.orbBudgetActive = false;
-        }
-    };
-
     enum class SimEnd { Ok, StopSearch };
 
     // Returns ticks survived after the input (horizon = fully safe).
@@ -1549,11 +1503,6 @@ namespace {
             static_cast<void*>(layer), static_cast<void*>(p1), static_cast<void*>(p2), dual ? 1 : 0, delay,
             down ? 1 : 0, horizon, releaseAfter, stopAt);
         *end = SimEnd::Ok;
-        // Don't even begin another ghost run after this click's budget is gone.
-        if (stopPredictionForBudget()) {
-            *end = SimEnd::StopSearch;
-            return 0;
-        }
         if (!buf.ghost1) {
             crashdiag::record("SIM_ABORT reason=ghost1 is null");
             return horizon;
@@ -1622,12 +1571,6 @@ namespace {
 
         collectMovers();
         for (; tick < total; ++tick) {
-            // Check periodically to keep the hot loop cheap while preventing one long
-            // ghost run from monopolizing a frame. Four ticks are 1/60 s at 240 Hz physics.
-            if ((tick & 3) == 0 && stopPredictionForBudget()) {
-                *end = SimEnd::StopSearch;
-                break;
-            }
             if (!movers.empty()) {
                 placeMovers(tick + 1);  // where they'll be after this step
             }
@@ -1767,9 +1710,6 @@ namespace {
             buf.ghost2->stopAllActions();
         }
         buf.simulating = false;
-        // A run may finish just over the deadline without hitting a periodic check. Preserve
-        // its completed result, but prevent further variants/search delays on this click.
-        stopPredictionForBudget();
         crashdiag::recordf("SIM_END survived=%d horizon=%d safe=%d died=%d portal=%d tick=%d runs=%d simTicks=%d",
             survived, horizon, safe ? 1 : 0, died ? 1 : 0, buf.ghostHitPortal ? 1 : 0, tick, buf.simRuns, buf.simTicks);
         return safe ? horizon : survived;
@@ -1783,24 +1723,13 @@ namespace {
         buf.orbClick = buf.assumeOrbs;
         buf.touchedOrb = false;
         int first = simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, stopAt, end);
-        if (stopPredictionForBudget()) {
-            buf.orbClick = buf.assumeOrbs;
-            buf.orbClickDelay = 0;
-            return first;
-        }
         if (!buf.tryBothOrbs || !buf.smart || !buf.touchedOrb || first >= stopAt) {
             return first;
         }
         SimEnd firstEnd = *end;
         buf.orbClick = !buf.assumeOrbs;
         int second = simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, stopAt, end);
-        SimEnd secondEnd = *end;
         buf.orbClick = buf.assumeOrbs;
-        if (stopPredictionForBudget()) {
-            buf.orbClickDelay = 0;
-            *end = secondEnd;
-            return secondEnd == SimEnd::StopSearch ? first : std::max(first, second);
-        }
         if (firstEnd != SimEnd::StopSearch) {
             *end = SimEnd::Ok;
         }
@@ -1815,14 +1744,6 @@ namespace {
                 int ret = simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, stopAt, &lateEnd);
                 buf.orbClickDelay = 0;
                 buf.orbClick = buf.assumeOrbs;
-                if (stopPredictionForBudget()) {
-                    *end = lateEnd;
-                    if (lateEnd == SimEnd::StopSearch) {
-                        break; // interrupted run; don't treat its partial survival as a result
-                    }
-                    best = std::max(best, ret);
-                    break; // completed run is usable, but do not try another timing
-                }
                 best = std::max(best, ret);
                 if (best >= stopAt) {
                     break;
@@ -1911,6 +1832,8 @@ namespace {
     // v2.70: when the current click started being processed; the extras after the search
     // (robust check, drift check, path view) are skipped once the click has used up its
     // time, so one click can't stall a frame for long. The search itself keeps its budget.
+    std::chrono::steady_clock::time_point clickStart;
+
     double clickMs() {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count();
     }
@@ -1937,19 +1860,6 @@ namespace {
     int alignOrb(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int horizon, int releaseAfter, int learned, int* landed) {
         int window = st(std::clamp(buf.orbWindow, 1, 64));
         int found = 0;
-        // Orb alignment gets a bounded share of the remaining click budget. This preserves
-        // alignment but leaves time for the ordinary predictive save search afterward.
-        double remainingMs = buf.budgetActive ? std::max(0.0, buf.budgetMs - clickMs()) : 0.0;
-        OrbSearchBudgetScope orbBudgetScope(std::min(2.0, remainingMs * 0.60));
-        auto finishIfBudgetExpired = [&]() {
-            if (!buf.budgetExhausted && !buf.orbBudgetExhausted) {
-                return false;
-            }
-            buf.skipPress = false;
-            buf.orbClickDelay = 0;
-            buf.orbClick = buf.assumeOrbs;
-            return true;
-        };
         SimEnd end;
         buf.orbClick = false;  // the press being tested is the orb click
         buf.orbWasTiming = false;
@@ -1957,13 +1867,10 @@ namespace {
         // v2.26: the orb timing that worked at this spot on earlier runs is tried first.
         if (learned > 0 && learned <= window) {
             int ret = simulate(layer, p1, p2, dual, learned, true, horizon, releaseAfter, horizon, &end);
-            if (buf.orbUsedTick >= 0 && ret >= horizon && end == SimEnd::Ok) {
+            if (buf.orbUsedTick >= 0 && ret >= horizon) {
                 *landed = ret;
                 buf.orbClick = buf.assumeOrbs;
                 return learned;
-            }
-            if (finishIfBudgetExpired()) {
-                return found;
             }
         }
 
@@ -1971,9 +1878,6 @@ namespace {
         buf.skipPress = true;
         simulate(layer, p1, p2, dual, 0, true, window + 2, -1, window + 2, &end);
         buf.skipPress = false;
-        if (finishIfBudgetExpired()) {
-            return found;
-        }
         int touch = buf.firstOrbTick;
         std::string trace;  // v2.42: what was tried, for the explain log
 
@@ -1981,24 +1885,15 @@ namespace {
             // 2. Pressing now already uses an orb (e.g. held into it).
             int now = simulate(layer, p1, p2, dual, 0, true, horizon, releaseAfter, horizon, &end);
             bool nowUses = buf.orbUsedTick >= 0;
-            if (end == SimEnd::StopSearch && finishIfBudgetExpired()) {
-                return found;
-            }
             if (nowUses && now < horizon && buf.orbTiming) {
                 // v2.26: ...but crashes. Where in the orb you click changes where it sends
                 // you, so try clicking 1 to 6 ticks later, still inside the orb; the run
                 // that lives longest (and clearly longer than now) wins.
                 int bestRet = -1;
                 for (int k = 1; k <= std::min(window, st(6)); ++k) {
-                    if (finishIfBudgetExpired()) {
-                        return found;
-                    }
                     int ret = simulate(layer, p1, p2, dual, k, true, horizon, releaseAfter, horizon, &end);
                     if (buf.explain) {
                         trace += fmt::format(" +{}:{}{}", k, ret, buf.orbUsedTick >= 0 ? "o" : "-");
-                    }
-                    if (end == SimEnd::StopSearch && finishIfBudgetExpired()) {
-                        return found;
                     }
                     if (end == SimEnd::StopSearch) {
                         break;
@@ -2022,15 +1917,9 @@ namespace {
                 //    the orb: where in the orb you click changes where the orb sends you.
                 int bestRet = -1;
                 for (int k = std::max(1, touch - 1); k <= std::min(window, touch + st(6)); ++k) {
-                    if (finishIfBudgetExpired()) {
-                        return found;
-                    }
                     int ret = simulate(layer, p1, p2, dual, k, true, horizon, releaseAfter, horizon, &end);
                     if (buf.explain) {
                         trace += fmt::format(" +{}:{}{}", k, ret, buf.orbUsedTick >= 0 ? "o" : "-");
-                    }
-                    if (end == SimEnd::StopSearch && finishIfBudgetExpired()) {
-                        return found;
                     }
                     if (end == SimEnd::StopSearch) {
                         break;
@@ -2915,12 +2804,6 @@ namespace {
 
         clickStart = std::chrono::steady_clock::now();
         clickBudget();
-        buf.budgetExhausted = false;
-        struct ClickBudgetScope {
-            bool& active;
-            explicit ClickBudgetScope(bool& value) : active(value) { active = true; }
-            ~ClickBudgetScope() { active = false; }
-        } clickBudgetScope(buf.budgetActive);
         auto* layer = GameManager::get()->m_playLayer;
         if (!layer) {
             return false;
@@ -3159,10 +3042,6 @@ namespace {
                 queueInput(k - early, down);
                 return true;
             }
-            if (buf.budgetExhausted) {
-                buf.appliedInput = down;
-                return false; // no time left for another prediction search; let this input pass
-            }
         }
 
         buf.sawMover = false;
@@ -3190,11 +3069,6 @@ namespace {
                                  : simulateOrbs(layer, p1, p2, dual, 0, down, horizon, releaseAfter, horizon, &end);
         buf.captureKiller = false;
         buf.trackMovers = false;
-
-        if (buf.budgetExhausted) {
-            buf.appliedInput = down;
-            return false; // the baseline simulation used the click budget; avoid another search
-        }
 
         // v2.30 diagnostics: a ghost that dies within a few ticks while you live means the
         // prediction doesn't match you there. Log what killed it and how both hitboxes compare.
@@ -3360,10 +3234,6 @@ namespace {
                                   : searchDelay(layer, p1, p2, dual, down, anyWave, horizon, maxDelay, releaseAfter, base, &landed,
                                         groundPress);
         }
-        if (saved <= 0 && buf.budgetExhausted) {
-            buf.appliedInput = down;
-            return false; // the search budget expired without a verified save
-        }
         if (saved <= 0) {
             say("no save: {}{} dies in {}t (max {}t, best +{}t -> {}t of {}){}", down ? "press" : "release", tickTag, base, maxDelay,
                 dbgBestK, dbgBestRet, horizon, !crashFixed ? "" : base < st(30) ? " - too late: waiting only makes it crash sooner" : " - same crash at any timing (next obstacle)");
@@ -3396,7 +3266,7 @@ namespace {
                 return true;
             };
             if (clickMs() < buf.budgetMs && !robust(saved)) {
-                for (int k = saved + 1; k <= std::min(maxDelay, saved + st(3)) && !buf.budgetExhausted; ++k) {
+                for (int k = saved + 1; k <= std::min(maxDelay, saved + st(3)); ++k) {
                     SimEnd e;
                     int ret = scoreAt(k, target, &e);
                     if (ret >= target && robust(k)) {
@@ -3409,16 +3279,12 @@ namespace {
             }
         }
 
-        if (buf.avoidMovers && !buf.budgetExhausted) {
+        if (buf.avoidMovers) {
             // One extra run of the chosen delay with the moving-object watch on. (Watching
             // in every search run made cube searches hit the time budget.)
             buf.trackMovers = true;
             simulateOrbs(layer, p1, p2, dual, saved, down, horizon, releaseAfter, horizon, &end);
             buf.trackMovers = false;
-        }
-        if (buf.avoidMovers && buf.budgetExhausted) {
-            buf.appliedInput = down;
-            return false; // couldn't finish the requested moving-object safety check
         }
         if (buf.avoidMovers && buf.sawMover) {
             say("skip +{}t save: moving objects ahead", saved);
@@ -4061,7 +3927,7 @@ $on_mod(Loaded) {
     }
     crashdiag::record("HOOK_SET preserved: upstream BufPlayLayer/BufPlayerObject/BufBaseGameLayer/GameObject/EffectGameObject/HardStreak hooks remain enabled");
     crashdiag::flush();
-    say("v2.78.1 loaded. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.78.2 loaded. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
