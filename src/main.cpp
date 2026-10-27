@@ -1,4 +1,5 @@
 // Click Before Frames v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
+// Build note v2.78.0: activation-rate settings are opt-in; trajectory prediction remains the engine.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
