@@ -1,3 +1,8 @@
+## v2.78.0
+- Preserved the trajectory-based prediction engine (ghost simulation, delay search, orb/portal handling and input queue); added an optional activation-rate control without replacing prediction with fixed tick buffering.
+- Activation rate deterministically lets the first eligible press reach prediction, then passes the next N-1 complete press/release pairs directly to the game. Inputs already queued by prediction and inputs skipped by the spam guard are not rate-limited.
+- Kept the iOS 2.2081 rotation safeguard: the recursive `runNormalRotation` modify is excluded on iOS; native rotation remains untouched.
+
 ## v1.1.0
 - **Fixed:** the buffer did not help when you jumped with a **Jump P2** keybind in a normal one-player level. The game applies that input to player 1, but the mod was helping the hidden second icon, so clicks never got buffered. Thanks to manty987 for the report and the fix.
 - **New Buffer menu:** the pause menu's Buffer button now opens a simple window with **Basic** and **Advanced** tabs. Basic has a Quick setup (Off, Strict, Standard, Relaxed, Very relaxed) and your TPS. Advanced has the experimental switches, shortcuts to Profiles, Sections and all settings, and Reset all.
