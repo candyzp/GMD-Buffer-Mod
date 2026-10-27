@@ -2940,23 +2940,6 @@ namespace {
             return true;
         }
 
-        // Optional deterministic cadence: leave the first eligible press to the
-        // prediction engine and pass the next N-1 press/release pairs straight through.
-        // Inputs already waiting in the predictor queue and spam-guarded inputs are
-        // excluded so their timing and ordering remain unchanged.
-        if (down && newActivationPress && buf.activationRateEnabled && buf.queue.empty()) {
-            int every = std::clamp(buf.activationEvery, 1, 10);
-            ++buf.activationCounter;
-            if (((buf.activationCounter - 1) % every) != 0) {
-                buf.activationBypassActive = true;
-                buf.appliedInput = true;
-                if (buf.explain) {
-                    say("pass press: activation rate {}/{}", ((buf.activationCounter - 1) % every) + 1, every);
-                }
-                return false;
-            }
-        }
-
         // Releases only matter for wave and robot.
         if (!p1Wave) {
             bool robot = p1->m_isRobot;
@@ -2998,6 +2981,23 @@ namespace {
             }
             buf.appliedInput = down;
             return false;
+        }
+
+        // Optional deterministic cadence: leave the first eligible press to the
+        // prediction engine and pass the next N-1 press/release pairs straight through.
+        // Inputs already waiting in the predictor queue and spam-guarded inputs are
+        // excluded so their timing and ordering remain unchanged.
+        if (down && newActivationPress && buf.activationRateEnabled && buf.queue.empty()) {
+            int every = std::clamp(buf.activationEvery, 1, 10);
+            ++buf.activationCounter;
+            if (((buf.activationCounter - 1) % every) != 0) {
+                buf.activationBypassActive = true;
+                buf.appliedInput = true;
+                if (buf.explain) {
+                    say("pass press: activation rate {}/{}", ((buf.activationCounter - 1) % every) + 1, every);
+                }
+                return false;
+            }
         }
 
         // Wave releases are predicted separately, so hold there. Robot jump height depends
