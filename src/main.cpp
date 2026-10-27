@@ -181,6 +181,11 @@ namespace {
         int masterTickLimit = 24;
         bool saveAggression = false;
         int saveAggressionLevel = 50;
+        bool activationRateEnabled = false;
+        int activationEvery = 2;
+        int activationCounter = 0;
+        bool activationPressHeld = false;
+        bool activationBypassActive = false;
 
         std::deque<QueuedInput> queue;
         int shift = 0;  // delay applied to inputs while the queue is active
@@ -425,6 +430,9 @@ namespace {
         buf.queue.clear();
         buf.shift = 0;
         buf.releaseShift = 0;
+        buf.activationCounter = 0;
+        buf.activationPressHeld = false;
+        buf.activationBypassActive = false;
     }
 
     // v2.75: "F6", "G", "7", "None" -> key code (0 = unbound)
@@ -487,6 +495,8 @@ namespace {
         buf.masterTickLimit = static_cast<int>(mod->getSettingValue<int64_t>("master-tick-limit"));
         buf.saveAggression = mod->getSettingValue<bool>("save-aggression");
         buf.saveAggressionLevel = static_cast<int>(mod->getSettingValue<int64_t>("save-aggression-level"));
+        buf.activationRateEnabled = mod->getSettingValue<bool>("activation-rate-enabled");
+        buf.activationEvery = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("activation-every")), 1, 10);
         buf.showAutoTag = mod->getSettingValue<bool>("show-auto-tag");
         buf.debugTools = mod->getSettingValue<bool>("debug-tools");
         buf.console = buf.debugTools;
@@ -2771,6 +2781,26 @@ namespace {
         crashdiag::HookScope __diag("intercept");
         crashdiag::recordf("INPUT_INTERCEPT down=%d p1Side=%d enabled=%d simulating=%d injecting=%d layer=%p",
             down ? 1 : 0, isPlayer1 ? 1 : 0, buf.enabled ? 1 : 0, buf.simulating ? 1 : 0, buf.injecting ? 1 : 0, static_cast<void*>(self));
+
+        // A rate-limited press must bypass prediction as a complete press/release pair.
+        // This check runs before normal prediction so a later release cannot be queued
+        // independently and accidentally change the hold length.
+        if (buf.activationBypassActive) {
+            buf.appliedInput = down;
+            if (!down) {
+                buf.activationBypassActive = false;
+                buf.activationPressHeld = false;
+            }
+            return false;
+        }
+        bool newActivationPress = down && !buf.activationPressHeld;
+        if (down) {
+            buf.activationPressHeld = true;
+        }
+        else {
+            buf.activationPressHeld = false;
+        }
+
         clickStart = std::chrono::steady_clock::now();
         clickBudget();
         auto* layer = GameManager::get()->m_playLayer;
@@ -2908,6 +2938,23 @@ namespace {
             // low latency: a new press isn't shifted, it goes right after what's already queued
             queueInput(buf.lowLatency && down ? after : std::max(buf.shift - early, after), down);
             return true;
+        }
+
+        // Optional deterministic cadence: leave the first eligible press to the
+        // prediction engine and pass the next N-1 press/release pairs straight through.
+        // Inputs already waiting in the predictor queue and spam-guarded inputs are
+        // excluded so their timing and ordering remain unchanged.
+        if (down && newActivationPress && buf.activationRateEnabled && buf.queue.empty()) {
+            int every = std::clamp(buf.activationEvery, 1, 10);
+            ++buf.activationCounter;
+            if (((buf.activationCounter - 1) % every) != 0) {
+                buf.activationBypassActive = true;
+                buf.appliedInput = true;
+                if (buf.explain) {
+                    say("pass press: activation rate {}/{}", ((buf.activationCounter - 1) % every) + 1, every);
+                }
+                return false;
+            }
         }
 
         // Releases only matter for wave and robot.
@@ -3415,6 +3462,7 @@ class BufferMenu : public geode::Popup {
         { "training-mode", "Training (hints only)" },
         { "death-heatmap", "Death heatmap" },
         { "save-ding", "Ding on save" },
+        { "activation-rate-enabled", "Activation rate limit" },
         { "performance-mode", "Performance mode" },
         { "master-tick-control", "Master tick control" },
         { "save-aggression", "Aggressive search" },
@@ -3878,7 +3926,7 @@ $on_mod(Loaded) {
     }
     crashdiag::record("HOOK_SET preserved: upstream BufPlayLayer/BufPlayerObject/BufBaseGameLayer/GameObject/EffectGameObject/HardStreak hooks remain enabled");
     crashdiag::flush();
-    say("v2.77 loaded. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.78 loaded. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -4259,6 +4307,8 @@ class $modify(BufPlayerObject, PlayerObject) {
                 static_cast<int>(settings->getSettingValue<int64_t>("master-tick-limit")) != buf.masterTickLimit ||
                 settings->getSettingValue<bool>("save-aggression") != buf.saveAggression ||
                 static_cast<int>(settings->getSettingValue<int64_t>("save-aggression-level")) != buf.saveAggressionLevel ||
+                settings->getSettingValue<bool>("activation-rate-enabled") != buf.activationRateEnabled ||
+                static_cast<int>(settings->getSettingValue<int64_t>("activation-every")) != buf.activationEvery ||
                 settings->getSettingValue<bool>("show-auto-tag") != buf.showAutoTag ||
                 settings->getSettingValue<bool>("debug-tools") != buf.debugTools;
             if (changed) {
