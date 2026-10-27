@@ -1,3 +1,8 @@
+## v2.78.3
+- Preallocated reusable prediction scratch containers and path storage before gameplay to avoid dynamic allocation/rehash spikes during simulations.
+- Kept the complete v2.78.0 simulation and search flow; no simulation is truncated and prediction decisions are unchanged.
+- Uses the optimized iOS Release build.
+
 ## v2.78.2
 - Restored the complete v2.78.0 prediction/search path: no ghost simulation is cut short, so the predictor retains its original save-decision behavior.
 - Built the iOS package using the optimized Release configuration instead of RelWithDebInfo. This changes compiler optimization, not prediction settings or gameplay rules.

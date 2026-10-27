@@ -1,5 +1,5 @@
 // Click Before Frames v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
-// Build note v2.78.2: retain the complete v2.78.0 prediction/search path; performance comes from optimized compilation.
+// Build note v2.78.3: same complete prediction/search path; Release compilation + preallocated reusable scratch storage.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -1104,6 +1104,21 @@ namespace {
     };
     std::vector<Mover> movers;
 
+    // Preallocate reusable prediction scratch storage before gameplay begins. The same
+    // containers are cleared and reused on every simulation, so reserving here avoids
+    // rehash/reallocation spikes during the actual input window without changing any
+    // prediction result or search ordering.
+    void reservePredictionScratch() {
+        buf.simDisabled.reserve(128);
+        buf.harmless.reserve(128);
+        buf.orbsUsed.reserve(64);
+        buf.simUsed.reserve(256);
+        buf.snapshots.reserve(256);
+        watched.reserve(512);
+        movingNow.reserve(256);
+        movers.reserve(128);
+    }
+
     void collectMovers() {
         movers.clear();
         if (!buf.predictMovers) {
@@ -1757,6 +1772,7 @@ namespace {
     std::vector<CCPoint> recordRun(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon,
         int releaseAfter, bool* died = nullptr) {
         std::vector<CCPoint> path;
+        path.reserve(static_cast<size_t>(std::max(0, delay + horizon)));
         buf.recordPath = &path;
         buf.orbClick = buf.assumeOrbs;
         SimEnd end;
@@ -3927,7 +3943,7 @@ $on_mod(Loaded) {
     }
     crashdiag::record("HOOK_SET preserved: upstream BufPlayLayer/BufPlayerObject/BufBaseGameLayer/GameObject/EffectGameObject/HardStreak hooks remain enabled");
     crashdiag::flush();
-    say("v2.78.2 loaded. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.78.3 loaded. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -3991,6 +4007,7 @@ class $modify(BufPlayLayer, PlayLayer) {
             return false;
         }
         dropGhosts();
+        reservePredictionScratch();
         readSettings();
         applyStage();
         exportLines.clear();
