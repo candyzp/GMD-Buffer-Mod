@@ -17,6 +17,12 @@
 #include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
 
+// iOS rotation-hook safety: this mod intentionally has no PlayerObject::runNormalRotation(bool, float)
+// modify hook. The reported iOS crash came from that override re-entering its own Tulip hook when
+// forwarding to PlayerObject::runNormalRotation. Leave native rotation untouched here; do not add
+// an iOS override or a no-op replacement. This source currently contains no rotation override on
+// either platform, so there is no hook to compile conditionally or alter in the input algorithm.
+
 using namespace geode::prelude;
 
 // ---- settings --------------------------------------------------------
