@@ -340,11 +340,22 @@ namespace {
     // jump could land, so every click looked like a death). `st()` converts a 240-tick
     // amount into physics steps at the current rate. At 60 / 120 / 240 FPS it changes nothing.
     float stepScale() {
-        float dt = buf.tickLength;
-        if (!(dt > 0.001f && dt < 2.f)) {
-            return 1.f;
+        // tickLength stays constant across the synchronous ghost runs for one input.
+        // Reuse the exact scale for repeated st() calls; refresh only when the live
+        // frame-delta estimate changes. This avoids repeated division/clamp work without
+        // changing any timing values or buffer decisions.
+        static float cachedDt = -1.f;
+        static float cachedScale = 1.f;
+        const float dt = buf.tickLength;
+        if (dt == cachedDt) {
+            return cachedScale;
         }
-        return std::clamp(TICK / dt, 0.25f, 8.f);
+
+        cachedDt = dt;
+        cachedScale = (dt > 0.001f && dt < 2.f)
+            ? std::clamp(TICK / dt, 0.25f, 8.f)
+            : 1.f;
+        return cachedScale;
     }
 
     int st(int ticks240) {
