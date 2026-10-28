@@ -1,14 +1,11 @@
 name: Build iOS port
-# Keep source and workflow-only edits on this active branch build-verified.
+# Build the consolidated default branch for iOS-targeted changes.
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - ios-port
-      - ios-perf-log-fix
-      - ios-predictive-experiment
-      - ios-crash-cleanup-experiment
+      - main
     paths:
       - 'src/**'
       - 'mod.json'
