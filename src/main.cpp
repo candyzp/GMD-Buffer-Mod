@@ -4305,12 +4305,12 @@ class $modify(BufRingObject, RingObject) {
         (void)self.setHookPriority("RingObject::spawnCircle", HOOK_PRIORITY);
     }
 
-    void powerOnObject() {
+    void powerOnObject(int state) {
         crashdiag::ActiveScope __diag("BufRingObject::powerOnObject");
         if (buf.simulating) {
             return;
         }
-        RingObject::powerOnObject();
+        RingObject::powerOnObject(state);
     }
 
     void spawnCircle() {
