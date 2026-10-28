@@ -1,4 +1,5 @@
 name: Build Windows Mod (Geometry Dash 2.2081)
+# Keep source and workflow-only edits on this active branch build-verified.
 
 on:
   workflow_dispatch:
