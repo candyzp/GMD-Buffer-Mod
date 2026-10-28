@@ -1,5 +1,5 @@
 // Click Before Frames v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
-// Build note v2.78.5: per-level object metadata cache + bounded cache lifecycle logs; level-owned scratch is released on exit.
+// Build note v2.78.6: early PlayLayer::onExit cleanup for level-owned prediction cache and ghost state.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -4138,7 +4138,7 @@ $on_mod(Loaded) {
     }
     crashdiag::record("HOOK_SET preserved: upstream BufPlayLayer/BufPlayerObject/BufBaseGameLayer/GameObject/EffectGameObject/HardStreak hooks remain enabled");
     crashdiag::flush();
-    say("v2.78.5 loaded. Per-level prediction cache + cache lifecycle logging enabled; F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.78.6 loaded. Early scene-exit cleanup + per-level prediction cache logging enabled; F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
