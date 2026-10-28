@@ -4146,6 +4146,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         crashdiag::record("HOOK_REGISTER BufPlayLayer priority=Priority::VeryEarly");
         (void)self.setHookPriority("PlayLayer::destroyPlayer", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayLayer::playEndAnimationToPos", HOOK_PRIORITY);
+        (void)self.setHookPriority("PlayLayer::onExit", HOOK_PRIORITY);
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
@@ -4355,6 +4356,24 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.rapid = 0;
         forgetPress();
         return true;
+    }
+
+    // Clean level-owned prediction data before Cocos recursively exits the node tree.
+    // QOLMod's scheduler hook inspects CCNode metadata during that teardown, so do not let
+    // any cached GameObject pointers or detached prediction ghosts survive until after onExit.
+    void onExit() {
+        crashdiag::HookScope __diag("BufPlayLayer::onExit");
+        crashdiag::recordf("PLAY_EXIT_BEGIN simulating=%d injecting=%d ghost1=%p ghost2=%p cache_owner=%p cached=%zu",
+            buf.simulating ? 1 : 0, buf.injecting ? 1 : 0, static_cast<void*>(buf.ghost1),
+            static_cast<void*>(buf.ghost2), static_cast<void*>(buf.cacheOwner), buf.levelObjectCache.size());
+        buf.hintLabel = nullptr;
+        buf.heatNode = nullptr;
+        clearLevelPredictionCache("onExit");
+        memoryKey.clear();
+        dropGhosts();
+        crashdiag::record("PLAY_EXIT_CLEANUP_DONE");
+        crashdiag::flush();
+        PlayLayer::onExit();
     }
 
     void onQuit() {
