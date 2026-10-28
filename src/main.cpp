@@ -1,5 +1,5 @@
 // Click Before Frames v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
-// Build note v2.78.3: same complete prediction/search path; Release compilation + preallocated reusable scratch storage.
+// Build note v2.78.5: per-level object metadata cache + bounded cache lifecycle logs; level-owned scratch is released on exit.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -136,6 +136,29 @@ namespace {
         int ticksLeft;
         bool down;
     };
+
+    // Only immutable object metadata is cached. Positions, hitboxes, activation states,
+    // moving-object paths, and trigger state are still read from the live level/simulation.
+    struct CachedObjectInfo {
+        unsigned type = 0;
+        int objectID = 0;
+        uint64_t bit = 0;
+        bool stop = false;
+        bool size = false;
+        float speed = 0.f;
+    };
+
+    CachedObjectInfo classifyObject(GameObject* object) {
+        CachedObjectInfo info;
+        if (!object) return info;
+        info.type = static_cast<unsigned>(object->m_objectType);
+        info.objectID = object->m_objectID;
+        info.bit = info.type < 64 ? (1ull << info.type) : 0;
+        info.stop = (STOP_TYPES & info.bit) != 0;
+        info.size = (SIZE_TYPES & info.bit) != 0;
+        info.speed = (info.stop || info.size) ? 0.f : speedPortalValue(info.objectID);
+        return info;
+    }
 
     struct ObjSnapshot {
         GameObject* object;
@@ -295,6 +318,17 @@ namespace {
 
         std::unordered_set<GameObject*> simUsed;
         std::vector<ObjSnapshot> snapshots;
+
+        // Built once after PlayLayer::init; used by every prediction in this level only.
+        PlayLayer* cacheOwner = nullptr;
+        std::unordered_map<GameObject*, CachedObjectInfo> levelObjectCache;
+        gd::vector<GameObject*> relevantObjects;
+        int cacheLevelId = 0;
+        std::string cacheLevelName;
+        uint64_t cacheGeneration = 0;
+        uint64_t cacheHits = 0, cacheMisses = 0, cacheTypeRefreshes = 0;
+        uint64_t cacheCollisionCalls = 0, cacheCandidateObjects = 0;
+        size_t cacheLevelObjectCount = 0, cacheCollidingObjects = 0, cacheSpecialObjects = 0;
     } buf;
 
     std::string stageText();
@@ -648,6 +682,11 @@ namespace {
         text += fmt::format("{} | physics ~{:.0f} steps/s\n", stageText(), 60.f / dt);
         text += fmt::format("budget {:g} ms | smart {} | full state {} | robust {} | late crash {}\n", buf.budgetMs,
             buf.smart, buf.fullState, buf.robustSaves, buf.lateCrash);
+        text += fmt::format("prediction cache gen {}: {}/{} objects | hits {} misses {} refreshes {} | calls {} candidates {} | scratch cap {}\n",
+            buf.cacheGeneration, buf.levelObjectCache.size(), buf.cacheLevelObjectCount,
+            buf.cacheHits, buf.cacheMisses, buf.cacheTypeRefreshes, buf.cacheCollisionCalls,
+            buf.cacheCandidateObjects, buf.relevantObjects.capacity());
+        text += fmt::format("cache log: {}\n", (Mod::get()->getSaveDir() / "prediction-cache.log").string());
         text += fmt::format("orbs: align {} (ground {}, {}t) timing {} assume {} both {} | memory {} ({} spots)\n", buf.orbAlign,
             buf.orbAlignGround, buf.orbWindow, buf.orbTiming, buf.assumeOrbs, buf.tryBothOrbs, buf.learn, memorySpots());
         text += fmt::format("wave: v4.6 {} margin {} horizon {} spam gap {} | robot smart {} | spider smart {} | ship {} (max {}t)\n",
@@ -1117,6 +1156,7 @@ namespace {
         buf.orbsUsed.reserve(64);
         buf.simUsed.reserve(256);
         buf.snapshots.reserve(256);
+        buf.relevantObjects.reserve(256);
         watched.reserve(512);
         movingNow.reserve(256);
         movers.reserve(128);
@@ -1443,6 +1483,134 @@ namespace {
     bool memoryRisky(int slice) {
         auto spot = spotAround(slice);
         return spot.deaths >= 3;
+    }
+
+    void appendPredictionCacheLog(std::string const& line) {
+        std::error_code ec;
+        auto dir = Mod::get()->getSaveDir();
+        std::filesystem::create_directories(dir, ec);
+        std::ofstream out(dir / "prediction-cache.log", std::ios::app);
+        if (out) {
+            out << line << '\n';
+        }
+        else {
+            geode::log::warn("[InputBuffer] Could not append prediction-cache.log");
+        }
+    }
+
+    CachedObjectInfo cachedObjectInfo(GameObject* object) {
+        if (!object) return {};
+        auto it = buf.levelObjectCache.find(object);
+        unsigned currentType = static_cast<unsigned>(object->m_objectType);
+        if (it != buf.levelObjectCache.end() && it->second.type == currentType) {
+            ++buf.cacheHits;
+            return it->second;
+        }
+
+        CachedObjectInfo info = classifyObject(object);
+        if (it != buf.levelObjectCache.end()) {
+            it->second = info;
+            ++buf.cacheTypeRefreshes;
+        }
+        else {
+            ++buf.cacheMisses;
+            if (buf.cacheOwner) {
+                buf.levelObjectCache.emplace(object, info);
+            }
+        }
+        return info;
+    }
+
+    void buildLevelPredictionCache(PlayLayer* layer) {
+        if (!layer) return;
+        auto start = std::chrono::steady_clock::now();
+        buf.cacheOwner = layer;
+        ++buf.cacheGeneration;
+        buf.cacheLevelId = layer->m_level ? layer->m_level->m_levelID.value() : 0;
+        buf.cacheLevelName = layer->m_level ? std::string(layer->m_level->m_levelName) : std::string("<unknown>");
+        buf.cacheHits = buf.cacheMisses = buf.cacheTypeRefreshes = 0;
+        buf.cacheCollisionCalls = buf.cacheCandidateObjects = 0;
+        buf.cacheLevelObjectCount = buf.cacheCollidingObjects = buf.cacheSpecialObjects = 0;
+
+        auto* source = layer->m_objects;
+        if (source) {
+            buf.cacheLevelObjectCount = source->count();
+            buf.levelObjectCache.reserve(buf.cacheLevelObjectCount);
+            for (auto object : geode::cocos::CCArrayExt<GameObject, false>(source)) {
+                if (!object) continue;
+                auto info = classifyObject(object);
+                buf.levelObjectCache.insert_or_assign(object, info);
+                if ((COLLIDING_TYPES | INTERACT_TYPES) & info.bit) {
+                    ++buf.cacheCollidingObjects;
+                }
+                else if (info.stop || info.size || info.speed > 0.f) {
+                    ++buf.cacheSpecialObjects;
+                }
+            }
+        }
+
+        double elapsedMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        auto line = fmt::format(
+            "PRED_CACHE_BUILD generation={} level_id={} level='{}' layer={} objects={} cached={} colliding_interactive={} special_portals={} elapsed_ms={:.2f}",
+            buf.cacheGeneration, buf.cacheLevelId, buf.cacheLevelName, static_cast<void*>(layer),
+            buf.cacheLevelObjectCount, buf.levelObjectCache.size(), buf.cacheCollidingObjects,
+            buf.cacheSpecialObjects, elapsedMs);
+        geode::log::info("[InputBuffer] {}", line);
+        crashdiag::recordf("%s", line.c_str());
+        appendPredictionCacheLog(line);
+        say("cache build #{}: {} objects, {} collision/interactive, {} special portal ({:.2f} ms)",
+            buf.cacheGeneration, buf.cacheLevelObjectCount, buf.cacheCollidingObjects,
+            buf.cacheSpecialObjects, elapsedMs);
+    }
+
+    void clearLevelPredictionCache(char const* reason) {
+        if (!buf.cacheOwner && buf.levelObjectCache.empty() && buf.relevantObjects.empty()) {
+            return;
+        }
+
+        saveMemory();
+        auto line = fmt::format(
+            "PRED_CACHE_CLEAR generation={} reason={} level_id={} level='{}' objects={} cached={} hits={} misses={} type_refreshes={} collision_calls={} candidate_objects={} relevant_capacity={} watched={} moving_now_capacity={} mover_capacity={} snapshot_capacity={}",
+            buf.cacheGeneration, reason ? reason : "unspecified", buf.cacheLevelId, buf.cacheLevelName,
+            buf.cacheLevelObjectCount, buf.levelObjectCache.size(), buf.cacheHits, buf.cacheMisses,
+            buf.cacheTypeRefreshes, buf.cacheCollisionCalls, buf.cacheCandidateObjects,
+            buf.relevantObjects.capacity(), watched.size(), movingNow.capacity(), movers.capacity(),
+            buf.snapshots.capacity());
+        geode::log::info("[InputBuffer] {}", line);
+        crashdiag::recordf("%s", line.c_str());
+        appendPredictionCacheLog(line);
+        say("cache clear #{} ({}): {} hits, {} misses, {} simulated collision calls",
+            buf.cacheGeneration, reason ? reason : "unspecified", buf.cacheHits, buf.cacheMisses,
+            buf.cacheCollisionCalls);
+
+        // Release high-water allocations from this level instead of keeping dense-level
+        // capacity alive for every later level on iOS.
+        std::unordered_map<GameObject*, CachedObjectInfo>().swap(buf.levelObjectCache);
+        gd::vector<GameObject*>().swap(buf.relevantObjects);
+        std::unordered_set<GameObject*>().swap(buf.simDisabled);
+        std::unordered_set<GameObject*>().swap(buf.harmless);
+        std::unordered_set<GameObject*>().swap(buf.orbsUsed);
+        std::unordered_set<GameObject*>().swap(buf.simUsed);
+        std::vector<ObjSnapshot>().swap(buf.snapshots);
+        std::unordered_map<GameObject*, Watched>().swap(watched);
+        std::vector<GameObject*>().swap(movingNow);
+        std::vector<Mover>().swap(movers);
+        std::vector<CCPoint>().swap(drift.path);
+        drift.active = false;
+
+        memory.clear();
+        std::unordered_map<int, Spot>().swap(memory);
+        memoryDirty = false;
+        memoryUpdates = 0;
+        pending.active = false;
+
+        buf.cacheOwner = nullptr;
+        buf.cacheLevelId = 0;
+        buf.cacheLevelName.clear();
+        buf.cacheHits = buf.cacheMisses = buf.cacheTypeRefreshes = 0;
+        buf.cacheCollisionCalls = buf.cacheCandidateObjects = 0;
+        buf.cacheLevelObjectCount = buf.cacheCollidingObjects = buf.cacheSpecialObjects = 0;
     }
 
     void snapshotObject(GameObject* object) {
@@ -3970,7 +4138,7 @@ $on_mod(Loaded) {
     }
     crashdiag::record("HOOK_SET preserved: upstream BufPlayLayer/BufPlayerObject/BufBaseGameLayer/GameObject/EffectGameObject/HardStreak hooks remain enabled");
     crashdiag::flush();
-    say("v2.78.3 loaded. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.78.5 loaded. Per-level prediction cache + cache lifecycle logging enabled; F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -4029,12 +4197,14 @@ class $modify(BufPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         crashdiag::HookScope __diag("BufPlayLayer::init");
         crashdiag::recordf("PLAY_INIT_BEGIN level=%p replay=%d dontCreateObjects=%d", static_cast<void*>(level), useReplay ? 1 : 0, dontCreateObjects ? 1 : 0);
+        clearLevelPredictionCache("play-init-replaced");
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
             crashdiag::record("PLAY_INIT_BASE_FAILED");
             return false;
         }
         dropGhosts();
         reservePredictionScratch();
+        buildLevelPredictionCache(this);
         readSettings();
         applyStage();
         exportLines.clear();
@@ -4202,6 +4372,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         restoreGlobals();
         buf.hintLabel = nullptr;
         buf.heatNode = nullptr;
+        clearLevelPredictionCache("onQuit");
         memoryKey.clear();
         dropGhosts();
         PlayLayer::onQuit();
@@ -4656,7 +4827,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             GJBaseGameLayer::collisionCheckObjects(player, objects, objectCount, dt);
             return;
         }
-        static gd::vector<GameObject*> relevant;
+        ++buf.cacheCollisionCalls;
+        buf.cacheCandidateObjects += static_cast<uint64_t>(std::max(0, objectCount));
+        auto& relevant = buf.relevantObjects;
         relevant.clear();
         if (static_cast<int>(relevant.capacity()) < objectCount) {
             relevant.reserve(objectCount);
@@ -4673,8 +4846,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             if (!object) {
                 continue;
             }
-            auto type = static_cast<unsigned>(object->m_objectType);
-            uint64_t bit = type < 64 ? (1ull << type) : 0;
+            auto info = cachedObjectInfo(object);
+            unsigned type = info.type;
+            uint64_t bit = info.bit;
             if (keep & bit) {
                 // v2.31: a hazard you're touching right now while alive is one the game doesn't
                 // let kill you (a spike made to follow the player, noclip...). Seen in GRIEF:
@@ -4706,9 +4880,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             if (!buf.smart) {
                 continue;
             }
-            bool stop = (STOP_TYPES & bit) != 0;
-            bool size = (SIZE_TYPES & bit) != 0;
-            float speed = (stop || size) ? 0.f : speedPortalValue(object->m_objectID);
+            bool stop = info.stop;
+            bool size = info.size;
+            float speed = info.speed;
             if (!stop && !size && speed <= 0.f) {
                 continue;
             }
@@ -4721,7 +4895,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     buf.ghostHitPortal = true;
                 }
                 else if (size) {
-                    bool mini = object->m_objectType == GameObjectType::MiniSizePortal;
+                    bool mini = type == static_cast<unsigned>(GameObjectType::MiniSizePortal);
                     if ((player->m_vehicleSize < 1.f) != mini) {
                         player->togglePlayerScale(mini, true);
                     }
