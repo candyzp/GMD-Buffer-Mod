@@ -1,3 +1,8 @@
+## v2.78.9
+- Skip prediction-cache timing, string formatting, console output and `prediction-cache.log` writes when Debug Tools is off. Explicit DIAG capture still retains cache events in the crash-diagnostic ring without enabling cache telemetry files.
+- Avoid per-click clock reads and prediction-stat counter updates unless Debug Tools' performance report is enabled; measurements remain unchanged when enabled.
+- Preserve prediction order, timing decisions, queued-input behavior, and gameplay features.
+
 ## v2.78.3
 - Preallocated reusable prediction scratch containers and path storage before gameplay to avoid dynamic allocation/rehash spikes during simulations.
 - Kept the complete v2.78.0 simulation and search flow; no simulation is truncated and prediction decisions are unchanged.
