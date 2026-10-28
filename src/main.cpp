@@ -816,12 +816,12 @@ namespace {
 
     void sendButton(PlayLayer* layer, bool down) {
         crashdiag::ActiveScope __diag("sendButton -> PlayLayer::handleButton");
-        crashdiag::recordf("INPUT_INJECT_BEGIN layer=%p down=%d player1=%d", static_cast<void*>(layer), down ? 1 : 0, buf.isPlayer1 ? 1 : 0);
+        crashdiag::recordfVerbose("INPUT_INJECT_BEGIN layer=%p down=%d player1=%d", static_cast<void*>(layer), down ? 1 : 0, buf.isPlayer1 ? 1 : 0);
         buf.injecting = true;
         buf.appliedInput = down;
         layer->handleButton(down, 1, buf.isPlayer1);
         buf.injecting = false;
-        crashdiag::recordf("INPUT_INJECT_END down=%d", down ? 1 : 0);
+        crashdiag::recordfVerbose("INPUT_INJECT_END down=%d", down ? 1 : 0);
     }
 
     void pressGhost(PlayerObject* ghost, bool down) {
