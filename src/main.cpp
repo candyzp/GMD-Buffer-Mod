@@ -1564,7 +1564,7 @@ namespace {
             buf.cacheSpecialObjects, elapsedMs);
     }
 
-    void clearLevelPredictionCache(char const* reason) {
+    void clearLevelPredictionCache(char const* reason, bool quiet = false) {
         if (!buf.cacheOwner && buf.levelObjectCache.empty() && buf.relevantObjects.empty()) {
             return;
         }
@@ -1580,9 +1580,11 @@ namespace {
         geode::log::info("[InputBuffer] {}", line);
         crashdiag::recordf("%s", line.c_str());
         appendPredictionCacheLog(line);
-        say("cache clear #{} ({}): {} hits, {} misses, {} simulated collision calls",
-            buf.cacheGeneration, reason ? reason : "unspecified", buf.cacheHits, buf.cacheMisses,
-            buf.cacheCollisionCalls);
+        if (!quiet) {
+            say("cache clear #{} ({}): {} hits, {} misses, {} simulated collision calls",
+                buf.cacheGeneration, reason ? reason : "unspecified", buf.cacheHits, buf.cacheMisses,
+                buf.cacheCollisionCalls);
+        }
 
         // Release high-water allocations from this level instead of keeping dense-level
         // capacity alive for every later level on iOS.
@@ -4368,7 +4370,7 @@ class $modify(BufPlayLayer, PlayLayer) {
             static_cast<void*>(buf.ghost2), static_cast<void*>(buf.cacheOwner), buf.levelObjectCache.size());
         buf.hintLabel = nullptr;
         buf.heatNode = nullptr;
-        clearLevelPredictionCache("onExit");
+        clearLevelPredictionCache("onExit", true);
         memoryKey.clear();
         dropGhosts();
         crashdiag::record("PLAY_EXIT_CLEANUP_DONE");
