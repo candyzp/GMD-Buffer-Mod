@@ -1,5 +1,5 @@
 // Click Before Frames v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
-// Build note v2.78.6: early PlayLayer::onExit cleanup for level-owned prediction cache and ghost state.
+// Build note v2.78.7: reverted early onExit cleanup; preserve ghost prediction state through scene transitions.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -1564,7 +1564,7 @@ namespace {
             buf.cacheSpecialObjects, elapsedMs);
     }
 
-    void clearLevelPredictionCache(char const* reason, bool quiet = false) {
+    void clearLevelPredictionCache(char const* reason) {
         if (!buf.cacheOwner && buf.levelObjectCache.empty() && buf.relevantObjects.empty()) {
             return;
         }
@@ -1580,11 +1580,9 @@ namespace {
         geode::log::info("[InputBuffer] {}", line);
         crashdiag::recordf("%s", line.c_str());
         appendPredictionCacheLog(line);
-        if (!quiet) {
-            say("cache clear #{} ({}): {} hits, {} misses, {} simulated collision calls",
-                buf.cacheGeneration, reason ? reason : "unspecified", buf.cacheHits, buf.cacheMisses,
-                buf.cacheCollisionCalls);
-        }
+        say("cache clear #{} ({}): {} hits, {} misses, {} simulated collision calls",
+            buf.cacheGeneration, reason ? reason : "unspecified", buf.cacheHits, buf.cacheMisses,
+            buf.cacheCollisionCalls);
 
         // Release high-water allocations from this level instead of keeping dense-level
         // capacity alive for every later level on iOS.
@@ -4140,7 +4138,7 @@ $on_mod(Loaded) {
     }
     crashdiag::record("HOOK_SET preserved: upstream BufPlayLayer/BufPlayerObject/BufBaseGameLayer/GameObject/EffectGameObject/HardStreak hooks remain enabled");
     crashdiag::flush();
-    say("v2.78.6 loaded. Early scene-exit cleanup + per-level prediction cache logging enabled; F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.78.7 loaded. Per-level prediction cache + bounded cache lifecycle logs enabled; F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -4148,7 +4146,6 @@ class $modify(BufPlayLayer, PlayLayer) {
         crashdiag::record("HOOK_REGISTER BufPlayLayer priority=Priority::VeryEarly");
         (void)self.setHookPriority("PlayLayer::destroyPlayer", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayLayer::playEndAnimationToPos", HOOK_PRIORITY);
-        (void)self.setHookPriority("PlayLayer::onExit", HOOK_PRIORITY);
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
@@ -4358,24 +4355,6 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.rapid = 0;
         forgetPress();
         return true;
-    }
-
-    // Clean level-owned prediction data before Cocos recursively exits the node tree.
-    // QOLMod's scheduler hook inspects CCNode metadata during that teardown, so do not let
-    // any cached GameObject pointers or detached prediction ghosts survive until after onExit.
-    void onExit() {
-        crashdiag::HookScope __diag("BufPlayLayer::onExit");
-        crashdiag::recordf("PLAY_EXIT_BEGIN simulating=%d injecting=%d ghost1=%p ghost2=%p cache_owner=%p cached=%zu",
-            buf.simulating ? 1 : 0, buf.injecting ? 1 : 0, static_cast<void*>(buf.ghost1),
-            static_cast<void*>(buf.ghost2), static_cast<void*>(buf.cacheOwner), buf.levelObjectCache.size());
-        buf.hintLabel = nullptr;
-        buf.heatNode = nullptr;
-        clearLevelPredictionCache("onExit", true);
-        memoryKey.clear();
-        dropGhosts();
-        crashdiag::record("PLAY_EXIT_CLEANUP_DONE");
-        crashdiag::flush();
-        PlayLayer::onExit();
     }
 
     void onQuit() {
