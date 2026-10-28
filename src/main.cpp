@@ -36,6 +36,7 @@
 #include <Geode/ui/Popup.hpp>
 #include <map>
 #include <Geode/modify/PlayerObject.hpp>
+#include <Geode/modify/RingObject.hpp>
 #if defined(_WIN32)
 #include <Windows.h>
 #endif
@@ -284,6 +285,8 @@ namespace {
         int simTick = 0;             // v2.6: tick of the current run
         int firstOrbTick = -1;       // v2.6: first tick the current run touched an orb
         int orbUsedTick = -1;        // v2.6: first tick the current run actually used an orb
+        RingObject* firstTouchedOrb = nullptr; // exact target for this simulation run
+        RingObject* firstUsedOrb = nullptr;     // exact orb that actually affected ghost motion
         bool driftCheck = false;     // v2.4: log how far the real player strays from the prediction
         std::vector<CCPoint>* recordPath = nullptr;  // v2.4: ghost1 positions of the current run
         bool showPath = false;       // v2.11: draw the predicted path (F10)
@@ -1532,6 +1535,8 @@ namespace {
         buf.ghostHitPortal = false;
         buf.firstOrbTick = -1;
         buf.orbUsedTick = -1;
+        buf.firstTouchedOrb = nullptr;
+        buf.firstUsedOrb = nullptr;
 
         bool second = dual && buf.ghost2 && p2;
         buf.haveRealRect = buf.ignoreTouching;
@@ -1880,48 +1885,63 @@ namespace {
         buf.orbClick = false;  // the press being tested is the orb click
         buf.orbWasTiming = false;
 
-        // First confirm that the no-input path reaches an orb inside the alignment window.
-        // A learned delay is only valid at an orb-local position: trying it before this probe
-        // lets stale memory match an unrelated orb farther along the prediction horizon.
+        // Probe contact without a press, so the target is an actual nearby orb rather than
+        // a stale learned delay that can activate a different orb farther along the horizon.
         buf.skipPress = true;
         simulate(layer, p1, p2, dual, 0, true, window + 2, -1, window + 2, &end);
         buf.skipPress = false;
         int touch = buf.firstOrbTick;
+        RingObject* target = buf.firstTouchedOrb;
         std::string trace;  // v2.42: what was tried, for the explain log
-        if (touch < 0 || touch > window) {
+        if (touch < 0 || touch > window || !target) {
             buf.orbClick = buf.assumeOrbs;
             return 0;
         }
 
-        // Only reuse a learned delay after nearby orb contact is confirmed, and only if this
-        // run actually uses that nearby orb, not a different orb later in the horizon.
-        if (learned > 0 && learned <= window) {
+        // This path runs before the normal delay search. Stop its optional simulations when
+        // the existing per-click budget is spent; a single orb shouldn't trigger a pile of
+        // extra full-horizon ghost runs after the budget has already expired.
+        if (clickMs() >= buf.budgetMs) {
+            buf.orbClick = buf.assumeOrbs;
+            return 0;
+        }
+
+        // Reuse a learned delay only when it actually activates the same orb found by the probe.
+        if (learned > 0 && learned <= window && clickMs() < buf.budgetMs) {
             int ret = simulate(layer, p1, p2, dual, learned, true, horizon, releaseAfter, horizon, &end);
-            if (buf.orbUsedTick >= 0 && buf.orbUsedTick <= touch + st(6) && ret >= horizon) {
+            if (buf.firstUsedOrb == target && buf.orbUsedTick >= 0 &&
+                buf.orbUsedTick <= touch + st(6) && ret >= horizon) {
                 *landed = ret;
                 buf.orbClick = buf.assumeOrbs;
                 return learned;
             }
         }
+        if (clickMs() >= buf.budgetMs) {
+            buf.orbClick = buf.assumeOrbs;
+            return 0;
+        }
 
         if (touch >= 0 && touch <= window) {
-            // 2. Pressing now already uses an orb (e.g. held into it).
+            // Pressing now already uses the target orb (for example, when held into it).
             int now = simulate(layer, p1, p2, dual, 0, true, horizon, releaseAfter, horizon, &end);
-            bool nowUses = buf.orbUsedTick >= 0;
+            bool nowUses = buf.orbUsedTick >= 0 && buf.firstUsedOrb == target;
             if (nowUses && now < horizon && buf.orbTiming) {
-                // v2.26: ...but crashes. Where in the orb you click changes where it sends
-                // you, so try clicking 1 to 6 ticks later, still inside the orb; the run
-                // that lives longest (and clearly longer than now) wins.
+                // Where inside the orb the click lands can change its trajectory. Try late
+                // clicks only while this decision still has budget.
                 int bestRet = -1;
                 for (int k = 1; k <= std::min(window, st(6)); ++k) {
+                    if (clickMs() >= buf.budgetMs) {
+                        break;
+                    }
                     int ret = simulate(layer, p1, p2, dual, k, true, horizon, releaseAfter, horizon, &end);
                     if (buf.explain) {
-                        trace += fmt::format(" +{}:{}{}", k, ret, buf.orbUsedTick >= 0 ? "o" : "-");
+                        trace += fmt::format(" +{}:{}{}", k, ret, buf.firstUsedOrb == target ? "o" : "-");
                     }
                     if (end == SimEnd::StopSearch) {
                         break;
                     }
-                    if (buf.orbUsedTick < 0 || ret < std::min(horizon, now + st(12)) || ret <= bestRet) {
+                    if (buf.firstUsedOrb != target || buf.orbUsedTick < 0 ||
+                        ret < std::min(horizon, now + st(12)) || ret <= bestRet) {
                         continue;
                     }
                     bestRet = ret;
@@ -1934,20 +1954,21 @@ namespace {
                 }
             }
             else if (!nowUses) {
-                // 3. Every delay while you're inside the orb whose press really uses it and
-                //    doesn't crash sooner than missing it would. v2.16: the one that lives
-                //    longest wins (earliest on a tie), instead of simply the first that hits
-                //    the orb: where in the orb you click changes where the orb sends you.
+                // Try delays around contact, but accept only runs that actually use the target
+                // orb. A different orb later in the horizon is not a valid alignment result.
                 int bestRet = -1;
                 for (int k = std::max(1, touch - 1); k <= std::min(window, touch + st(6)); ++k) {
+                    if (clickMs() >= buf.budgetMs) {
+                        break;
+                    }
                     int ret = simulate(layer, p1, p2, dual, k, true, horizon, releaseAfter, horizon, &end);
                     if (buf.explain) {
-                        trace += fmt::format(" +{}:{}{}", k, ret, buf.orbUsedTick >= 0 ? "o" : "-");
+                        trace += fmt::format(" +{}:{}{}", k, ret, buf.firstUsedOrb == target ? "o" : "-");
                     }
                     if (end == SimEnd::StopSearch) {
                         break;
                     }
-                    if (buf.orbUsedTick < 0 || ret < std::min(now, horizon)) {
+                    if (buf.firstUsedOrb != target || buf.orbUsedTick < 0 || ret < std::min(now, horizon)) {
                         continue;
                     }
                     if (ret > bestRet) {
@@ -1960,10 +1981,9 @@ namespace {
                     }
                 }
             }
-            // v2.42 explain: "+k:ret o" = press k ticks later lives ret ticks and used the orb
-            // ("-" = missed it); a pick needs to use the orb and live at least as long as now.
+            // v2.42 explain: "+k:ret o" means the target orb was used; "-" means it was not.
             if (buf.explain) {
-                say("orb: touch at t{}, press now {} -> {}t |{} => {}", touch, nowUses ? "uses it" : "misses it", now,
+                say("orb: touch at t{}, press now {} -> {}t |{} => {}", touch, nowUses ? "uses target" : "misses target", now,
                     trace.empty() ? " (nothing to try)" : trace, found > 0 ? fmt::format("+{}t", found) : std::string("no pick"));
             }
         }
@@ -4276,6 +4296,32 @@ class $modify(BufGameObject, GameObject) {
     }
 };
 
+// The ghost still runs the real ring-touch and ring-jump logic, but its repeated
+// predictions must not play orb activation visuals on the live level objects.
+class $modify(BufRingObject, RingObject) {
+    static void onModify(auto& self) {
+        crashdiag::record("HOOK_REGISTER BufRingObject visual suppression priority=Priority::VeryEarly");
+        (void)self.setHookPriority("RingObject::powerOnObject", HOOK_PRIORITY);
+        (void)self.setHookPriority("RingObject::spawnCircle", HOOK_PRIORITY);
+    }
+
+    void powerOnObject() {
+        crashdiag::ActiveScope __diag("BufRingObject::powerOnObject");
+        if (buf.simulating) {
+            return;
+        }
+        RingObject::powerOnObject();
+    }
+
+    void spawnCircle() {
+        crashdiag::ActiveScope __diag("BufRingObject::spawnCircle");
+        if (buf.simulating) {
+            return;
+        }
+        RingObject::spawnCircle();
+    }
+};
+
 class $modify(BufPlayerObject, PlayerObject) {
     static void onModify(auto& self) {
         crashdiag::record("HOOK_REGISTER BufPlayerObject priority=Priority::VeryEarly");
@@ -4496,6 +4542,7 @@ class $modify(BufPlayerObject, PlayerObject) {
                 buf.orbsUsed.insert(ring);
                 if (buf.orbUsedTick < 0) {
                     buf.orbUsedTick = buf.simTick;
+                    buf.firstUsedOrb = ring;
                 }
             }
             return;
@@ -4510,6 +4557,7 @@ class $modify(BufPlayerObject, PlayerObject) {
             buf.orbsUsed.insert(ring);
             if (buf.orbUsedTick < 0) {
                 buf.orbUsedTick = buf.simTick;
+                buf.firstUsedOrb = ring;
             }
         }
         PlayerObject::startDashing(ring);
@@ -4729,6 +4777,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             buf.touchedOrb = true;
             if (buf.firstOrbTick < 0) {
                 buf.firstOrbTick = buf.simTick;
+                buf.firstTouchedOrb = ring;
             }
         }
         GJBaseGameLayer::playerTouchedRing(player, ring);
