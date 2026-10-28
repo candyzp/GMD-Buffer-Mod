@@ -7,6 +7,7 @@ on:
       - ios-port
       - ios-perf-log-fix
       - ios-predictive-experiment
+      - ios-crash-cleanup-experiment
     paths:
       - 'src/**'
       - 'mod.json'
