@@ -1535,7 +1535,13 @@ namespace {
 
     void buildLevelPredictionCache(PlayLayer* layer) {
         if (!layer) return;
-        auto start = std::chrono::steady_clock::now();
+        // Cache telemetry is diagnostic-only; avoid clock reads and string formatting
+        // during ordinary gameplay when Debug Tools and DIAG capture are both off.
+        const bool captureCacheDiagnostics = buf.debugTools || buf.diagnosticCaptureRequested;
+        std::chrono::steady_clock::time_point start{};
+        if (captureCacheDiagnostics) {
+            start = std::chrono::steady_clock::now();
+        }
         buf.cacheOwner = layer;
         ++buf.cacheGeneration;
         buf.cacheLevelId = layer->m_level ? layer->m_level->m_levelID.value() : 0;
@@ -1561,19 +1567,23 @@ namespace {
             }
         }
 
-        double elapsedMs = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - start).count();
-        auto line = fmt::format(
-            "PRED_CACHE_BUILD generation={} level_id={} level='{}' layer={} objects={} cached={} colliding_interactive={} special_portals={} elapsed_ms={:.2f}",
-            buf.cacheGeneration, buf.cacheLevelId, buf.cacheLevelName, static_cast<void*>(layer),
-            buf.cacheLevelObjectCount, buf.levelObjectCache.size(), buf.cacheCollidingObjects,
-            buf.cacheSpecialObjects, elapsedMs);
-        geode::log::info("[InputBuffer] {}", line);
-        crashdiag::recordf("%s", line.c_str());
-        appendPredictionCacheLog(line);
-        say("cache build #{}: {} objects, {} collision/interactive, {} special portal ({:.2f} ms)",
-            buf.cacheGeneration, buf.cacheLevelObjectCount, buf.cacheCollidingObjects,
-            buf.cacheSpecialObjects, elapsedMs);
+        if (captureCacheDiagnostics) {
+            const double elapsedMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            const auto line = fmt::format(
+                "PRED_CACHE_BUILD generation={} level_id={} level='{}' layer={} objects={} cached={} colliding_interactive={} special_portals={} elapsed_ms={:.2f}",
+                buf.cacheGeneration, buf.cacheLevelId, buf.cacheLevelName, static_cast<void*>(layer),
+                buf.cacheLevelObjectCount, buf.levelObjectCache.size(), buf.cacheCollidingObjects,
+                buf.cacheSpecialObjects, elapsedMs);
+            crashdiag::recordf("%s", line.c_str());
+            if (buf.debugTools) {
+                geode::log::info("[InputBuffer] {}", line);
+                appendPredictionCacheLog(line);
+                say("cache build #{}: {} objects, {} collision/interactive, {} special portal ({:.2f} ms)",
+                    buf.cacheGeneration, buf.cacheLevelObjectCount, buf.cacheCollidingObjects,
+                    buf.cacheSpecialObjects, elapsedMs);
+            }
+        }
     }
 
     void clearLevelPredictionCache(char const* reason) {
@@ -1582,19 +1592,23 @@ namespace {
         }
 
         saveMemory();
-        auto line = fmt::format(
-            "PRED_CACHE_CLEAR generation={} reason={} level_id={} level='{}' objects={} cached={} hits={} misses={} type_refreshes={} collision_calls={} candidate_objects={} relevant_capacity={} watched={} moving_now_capacity={} mover_capacity={} snapshot_capacity={}",
-            buf.cacheGeneration, reason ? reason : "unspecified", buf.cacheLevelId, buf.cacheLevelName,
-            buf.cacheLevelObjectCount, buf.levelObjectCache.size(), buf.cacheHits, buf.cacheMisses,
-            buf.cacheTypeRefreshes, buf.cacheCollisionCalls, buf.cacheCandidateObjects,
-            buf.relevantObjects.capacity(), watched.size(), movingNow.capacity(), movers.capacity(),
-            buf.snapshots.capacity());
-        geode::log::info("[InputBuffer] {}", line);
-        crashdiag::recordf("%s", line.c_str());
-        appendPredictionCacheLog(line);
-        say("cache clear #{} ({}): {} hits, {} misses, {} simulated collision calls",
-            buf.cacheGeneration, reason ? reason : "unspecified", buf.cacheHits, buf.cacheMisses,
-            buf.cacheCollisionCalls);
+        if (buf.debugTools || buf.diagnosticCaptureRequested) {
+            const auto line = fmt::format(
+                "PRED_CACHE_CLEAR generation={} reason={} level_id={} level='{}' objects={} cached={} hits={} misses={} type_refreshes={} collision_calls={} candidate_objects={} relevant_capacity={} watched={} moving_now_capacity={} mover_capacity={} snapshot_capacity={}",
+                buf.cacheGeneration, reason ? reason : "unspecified", buf.cacheLevelId, buf.cacheLevelName,
+                buf.cacheLevelObjectCount, buf.levelObjectCache.size(), buf.cacheHits, buf.cacheMisses,
+                buf.cacheTypeRefreshes, buf.cacheCollisionCalls, buf.cacheCandidateObjects,
+                buf.relevantObjects.capacity(), watched.size(), movingNow.capacity(), movers.capacity(),
+                buf.snapshots.capacity());
+            crashdiag::recordf("%s", line.c_str());
+            if (buf.debugTools) {
+                geode::log::info("[InputBuffer] {}", line);
+                appendPredictionCacheLog(line);
+                say("cache clear #{} ({}): {} hits, {} misses, {} simulated collision calls",
+                    buf.cacheGeneration, reason ? reason : "unspecified", buf.cacheHits, buf.cacheMisses,
+                    buf.cacheCollisionCalls);
+            }
+        }
 
         // Release high-water allocations from this level instead of keeping dense-level
         // capacity alive for every later level on iOS.
@@ -1896,8 +1910,11 @@ namespace {
             placeMovers(0);  // back exactly where they were
             movers.clear();
         }
-        ++buf.simRuns;
-        buf.simTicks += tick + 1;
+        // These counters exist only for Debug Tools' per-click performance report.
+        if (buf.perfLog) {
+            ++buf.simRuns;
+            buf.simTicks += tick + 1;
+        }
 
         // Died or hit an unsimulated portal before the delayed input even fired:
         // longer delays can't do better, stop searching.
@@ -4150,7 +4167,7 @@ $on_mod(Loaded) {
     }
     crashdiag::record("HOOK_SET preserved: upstream BufPlayLayer/BufPlayerObject/BufBaseGameLayer/GameObject/EffectGameObject/HardStreak hooks remain enabled");
     crashdiag::flush();
-    say("v2.78.8 loaded. Crash capture kept lightweight; per-click traces require Debug Tools; F6 cycles: F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.78.9 loaded. Cache telemetry files and performance measurements require Debug Tools; DIAG keeps crash capture available. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -4935,10 +4952,16 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             // v2.21 performance log: what this click cost, measured around the whole decision.
             buf.simRuns = 0;
             buf.simTicks = 0;
-            auto start = std::chrono::steady_clock::now();
+            // Avoid a clock read on every real click unless the user enabled the
+            // optional performance report. Timing output is unchanged when enabled.
+            const bool measurePerformance = buf.perfLog;
+            std::chrono::steady_clock::time_point start{};
+            if (measurePerformance) {
+                start = std::chrono::steady_clock::now();
+            }
             bool held = intercept(this, down, isPlayer1);
             sweepGhostLayer();
-            if (buf.perfLog && buf.simRuns > 0) {
+            if (measurePerformance && buf.simRuns > 0) {
                 double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
                 say("perf: {:.2f} ms, {} runs, {} ghost ticks ({:.1f} us/tick)", ms, buf.simRuns, buf.simTicks,
                     ms * 1000.0 / static_cast<double>(std::max(1L, buf.simTicks)));
