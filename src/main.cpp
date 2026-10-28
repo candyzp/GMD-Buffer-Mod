@@ -1880,22 +1880,29 @@ namespace {
         buf.orbClick = false;  // the press being tested is the orb click
         buf.orbWasTiming = false;
 
-        // v2.26: the orb timing that worked at this spot on earlier runs is tried first.
-        if (learned > 0 && learned <= window) {
-            int ret = simulate(layer, p1, p2, dual, learned, true, horizon, releaseAfter, horizon, &end);
-            if (buf.orbUsedTick >= 0 && ret >= horizon) {
-                *landed = ret;
-                buf.orbClick = buf.assumeOrbs;
-                return learned;
-            }
-        }
-
-        // 1. Cheap probe: without pressing, does the ghost reach an orb soon?
+        // First confirm that the no-input path reaches an orb inside the alignment window.
+        // A learned delay is only valid at an orb-local position: trying it before this probe
+        // lets stale memory match an unrelated orb farther along the prediction horizon.
         buf.skipPress = true;
         simulate(layer, p1, p2, dual, 0, true, window + 2, -1, window + 2, &end);
         buf.skipPress = false;
         int touch = buf.firstOrbTick;
         std::string trace;  // v2.42: what was tried, for the explain log
+        if (touch < 0 || touch > window) {
+            buf.orbClick = buf.assumeOrbs;
+            return 0;
+        }
+
+        // Only reuse a learned delay after nearby orb contact is confirmed, and only if this
+        // run actually uses that nearby orb, not a different orb later in the horizon.
+        if (learned > 0 && learned <= window) {
+            int ret = simulate(layer, p1, p2, dual, learned, true, horizon, releaseAfter, horizon, &end);
+            if (buf.orbUsedTick >= 0 && buf.orbUsedTick <= touch + st(6) && ret >= horizon) {
+                *landed = ret;
+                buf.orbClick = buf.assumeOrbs;
+                return learned;
+            }
+        }
 
         if (touch >= 0 && touch <= window) {
             // 2. Pressing now already uses an orb (e.g. held into it).
