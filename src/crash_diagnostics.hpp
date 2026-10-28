@@ -46,6 +46,9 @@ namespace crashdiag {
     inline std::filesystem::path g_lastCrashPath;
     inline bool g_installed = false;
     inline bool g_recordingEnabled = false;
+    // Verbose per-input / per-prediction tracing is separate from crash capture.
+    // It is enabled only by the user's Debug Tools setting.
+    inline bool g_verboseEnabled = false;
 
 #if defined(__APPLE__) || defined(__unix__)
     inline int g_fd = -1;
@@ -224,6 +227,28 @@ namespace crashdiag {
         record(message);
     }
 
+    // High-frequency traces (button hooks, each prediction run) are optional.
+    // Even when crash capture is requested, don't format or enqueue these records
+    // unless Debug Tools is enabled; otherwise they can swamp the ring and hitch play.
+    inline void recordVerbose(const char* message) {
+        if (!g_verboseEnabled || !g_recordingEnabled) return;
+        record(message);
+    }
+
+    inline void recordfVerbose(const char* format, ...) {
+        if (!g_verboseEnabled || !g_recordingEnabled) return;
+        char message[EVENT_SIZE];
+        va_list args;
+        va_start(args, format);
+        std::vsnprintf(message, sizeof(message), format ? format : "<null format>", args);
+        va_end(args);
+        record(message);
+    }
+
+    inline void setVerboseEnabled(bool enabled) {
+        g_verboseEnabled = enabled;
+    }
+
     inline void setRecordingEnabled(bool enabled) {
         bool wasEnabled = g_recordingEnabled;
         g_recordingEnabled = enabled;
@@ -253,13 +278,13 @@ namespace crashdiag {
     class HookScope {
     public:
         explicit HookScope(const char* name) : m_name(name), m_active(name) {
-            recordf("HOOK_ENTER %s", m_name);
+            recordfVerbose("HOOK_ENTER %s", m_name);
         }
         HookScope(const HookScope&) = delete;
         HookScope& operator=(const HookScope&) = delete;
         ~HookScope() {
             setActive(m_name);
-            recordf("HOOK_RETURN %s", m_name);
+            recordfVerbose("HOOK_RETURN %s", m_name);
         }
     private:
         const char* m_name;
