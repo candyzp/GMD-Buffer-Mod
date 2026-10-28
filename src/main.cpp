@@ -537,6 +537,7 @@ namespace {
         buf.activationEvery = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("activation-every")), 1, 10);
         buf.showAutoTag = mod->getSettingValue<bool>("show-auto-tag");
         buf.debugTools = mod->getSettingValue<bool>("debug-tools");
+        crashdiag::setVerboseEnabled(buf.debugTools);
         buf.console = buf.debugTools;
         buf.driftCheck = buf.debugTools;
         buf.perfLog = buf.debugTools;
@@ -836,7 +837,7 @@ namespace {
     void copyState(PlayerObject* ghost, PlayerObject* real) {
         crashdiag::ActiveScope __diag("copyState(ghost, real)");
         if (!ghost || !real) {
-            crashdiag::recordf("COPY_STATE_SKIPPED ghost=%p real=%p", static_cast<void*>(ghost), static_cast<void*>(real));
+            crashdiag::recordfVerbose("COPY_STATE_SKIPPED ghost=%p real=%p", static_cast<void*>(ghost), static_cast<void*>(real));
             return;
         }
         ghost->setVisible(false);
@@ -1685,20 +1686,20 @@ namespace {
     int simulate(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter,
         int stopAt, SimEnd* end) {
         crashdiag::HookScope __diag("simulate");
-        crashdiag::recordf("SIM_BEGIN layer=%p p1=%p p2=%p dual=%d delay=%d down=%d horizon=%d releaseAfter=%d stopAt=%d",
+        crashdiag::recordfVerbose("SIM_BEGIN layer=%p p1=%p p2=%p dual=%d delay=%d down=%d horizon=%d releaseAfter=%d stopAt=%d",
             static_cast<void*>(layer), static_cast<void*>(p1), static_cast<void*>(p2), dual ? 1 : 0, delay,
             down ? 1 : 0, horizon, releaseAfter, stopAt);
         *end = SimEnd::Ok;
         if (!buf.ghost1) {
-            crashdiag::record("SIM_ABORT reason=ghost1 is null");
+            crashdiag::recordVerbose("SIM_ABORT reason=ghost1 is null");
             return horizon;
         }
         if (!layer || !p1) {
-            crashdiag::recordf("SIM_ABORT reason=null play/player layer=%p p1=%p", static_cast<void*>(layer), static_cast<void*>(p1));
+            crashdiag::recordfVerbose("SIM_ABORT reason=null play/player layer=%p p1=%p", static_cast<void*>(layer), static_cast<void*>(p1));
             return 0;
         }
         buf.simulating = true;
-        crashdiag::recordf("SIM_STATE simulating=1 ghost1=%p ghost2=%p", static_cast<void*>(buf.ghost1), static_cast<void*>(buf.ghost2));
+        crashdiag::recordfVerbose("SIM_STATE simulating=1 ghost1=%p ghost2=%p", static_cast<void*>(buf.ghost1), static_cast<void*>(buf.ghost2));
         buf.ghostDied = false;
         buf.ghostHitPortal = false;
         buf.firstOrbTick = -1;
@@ -1898,7 +1899,7 @@ namespace {
             buf.ghost2->stopAllActions();
         }
         buf.simulating = false;
-        crashdiag::recordf("SIM_END survived=%d horizon=%d safe=%d died=%d portal=%d tick=%d runs=%d simTicks=%d",
+        crashdiag::recordfVerbose("SIM_END survived=%d horizon=%d safe=%d died=%d portal=%d tick=%d runs=%d simTicks=%d",
             survived, horizon, safe ? 1 : 0, died ? 1 : 0, buf.ghostHitPortal ? 1 : 0, tick, buf.simRuns, buf.simTicks);
         return safe ? horizon : survived;
     }
@@ -2991,7 +2992,7 @@ namespace {
 
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
         crashdiag::HookScope __diag("intercept");
-        crashdiag::recordf("INPUT_INTERCEPT down=%d p1Side=%d enabled=%d simulating=%d injecting=%d layer=%p",
+        crashdiag::recordfVerbose("INPUT_INTERCEPT down=%d p1Side=%d enabled=%d simulating=%d injecting=%d layer=%p",
             down ? 1 : 0, isPlayer1 ? 1 : 0, buf.enabled ? 1 : 0, buf.simulating ? 1 : 0, buf.injecting ? 1 : 0, static_cast<void*>(self));
 
         // A rate-limited press must bypass prediction as a complete press/release pair.
@@ -4138,7 +4139,7 @@ $on_mod(Loaded) {
     }
     crashdiag::record("HOOK_SET preserved: upstream BufPlayLayer/BufPlayerObject/BufBaseGameLayer/GameObject/EffectGameObject/HardStreak hooks remain enabled");
     crashdiag::flush();
-    say("v2.78.7 loaded. Per-level prediction cache + bounded cache lifecycle logs enabled; F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.78.8 loaded. Crash capture kept lightweight; per-click traces require Debug Tools; F6 cycles: F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -4150,7 +4151,7 @@ class $modify(BufPlayLayer, PlayLayer) {
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         crashdiag::HookScope __diag("BufPlayLayer::destroyPlayer");
-        crashdiag::recordf("DESTROY_PLAYER player=%p object=%p ghost=%d simulating=%d", static_cast<void*>(player),
+        crashdiag::recordfVerbose("DESTROY_PLAYER player=%p object=%p ghost=%d simulating=%d", static_cast<void*>(player),
             static_cast<void*>(object), isGhost(player) ? 1 : 0, buf.simulating ? 1 : 0);
         if (buf.simulating && isGhost(player)) {
             buf.ghostDied = true;
@@ -4910,7 +4911,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void handleButton(bool down, int button, bool isPlayer1) {
         crashdiag::HookScope __diag("BufBaseGameLayer::handleButton");
-        crashdiag::recordf("HANDLE_BUTTON down=%d button=%d p1Side=%d simulating=%d injecting=%d", down ? 1 : 0, button,
+        crashdiag::recordfVerbose("HANDLE_BUTTON down=%d button=%d p1Side=%d simulating=%d injecting=%d", down ? 1 : 0, button,
             isPlayer1 ? 1 : 0, buf.simulating ? 1 : 0, buf.injecting ? 1 : 0);
         if (!buf.simulating && button == 1 && !buf.injecting) {
             auto* p1 = this->m_player1;
