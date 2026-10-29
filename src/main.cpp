@@ -1942,7 +1942,7 @@ namespace {
         buf.orbClick = buf.assumeOrbs;
         buf.touchedOrb = false;
         int first = simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, stopAt, end);
-        if (!buf.tryBothOrbs || !buf.smart || !buf.touchedOrb || first >= stopAt) {
+        if (!buf.tryBothOrbs || !buf.smart || !buf.touchedOrb || first >= stopAt || clickOverTime()) {
             return first;
         }
         SimEnd firstEnd = *end;
@@ -1955,7 +1955,7 @@ namespace {
         int best = std::max(first, second);
         // v2.26: some orbs only work when clicked at a specific moment inside them (levels
         // like Orbit). The ghost's orb clicks are also tried 3 and 6 ticks into the orb.
-        if (buf.orbTiming && best < stopAt) {
+        if (buf.orbTiming && best < stopAt && !clickOverTime()) {
             for (int late : { 3, 6 }) {
                 buf.orbClick = true;
                 buf.orbClickDelay = st(late);
@@ -1964,7 +1964,7 @@ namespace {
                 buf.orbClickDelay = 0;
                 buf.orbClick = buf.assumeOrbs;
                 best = std::max(best, ret);
-                if (best >= stopAt) {
+                if (best >= stopAt || clickOverTime()) {
                     break;
                 }
             }
@@ -2051,10 +2051,33 @@ namespace {
     // After every buffer decision: drift check + path view for the input the game gets.
     // v2.70: when the current click started being processed; extras are skipped once the budget is used.
     std::chrono::steady_clock::time_point clickStart;
+    bool clickTimed = false;
 
     double clickMs() {
-        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count();
+        return clickTimed
+            ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count()
+            : 0.0;
     }
+
+    // One real input owns one shared prediction budget. Nested search stages must not
+    // restart the timer or each consume a fresh copy of the full budget.
+    bool clickOverTime() {
+        return clickMs() > buf.budgetMs * 1.25;
+    }
+
+    double searchBudget() {
+        return clickTimed ? std::max(0.0, buf.budgetMs - clickMs()) : buf.budgetMs;
+    }
+
+    struct ClickTimer {
+        ClickTimer() {
+            clickStart = std::chrono::steady_clock::now();
+            clickTimed = true;
+        }
+        ~ClickTimer() {
+            clickTimed = false;
+        }
+    };
 
     void decided(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter) {
         memoryNote(p1, delay);
@@ -2327,6 +2350,7 @@ namespace {
         if (budget < 0.0) {
             budget = buf.budgetMs;
         }
+        budget = std::min(budget, searchBudget());
         using clock = std::chrono::steady_clock;
         auto start = clock::now();
         int target = needFull ? horizon : std::min(horizon, base + st(12));
@@ -2365,13 +2389,13 @@ namespace {
     int searchTwoPass(int horizon, int maxDelay, int base, int* landed, std::function<int(int, int, SimEnd*)> const& score,
         bool needFull = false) {
         quickScore = true;
-        int k = searchSmallest(horizon, maxDelay, base, landed, score, buf.budgetMs * 0.5, true, needFull);
+        int k = searchSmallest(horizon, maxDelay, base, landed, score, searchBudget() * 0.5, true, needFull);
         quickScore = false;
         if (k > 0) {
             return k;
         }
         crashFixed = false;
-        double left = buf.budgetMs - clickMs();
+        double left = searchBudget();
         if (left < 0.5) {
             say("prediction budget hit (quick pass only)");
             return 0;
@@ -2450,6 +2474,7 @@ namespace {
         marginUsed = false;
         using clock = std::chrono::steady_clock;
         auto start = clock::now();
+        double budget = searchBudget();
         int target = std::min(horizon, base + st(12));
         dbgBestK = 0;
         dbgBestRet = -1;
@@ -2479,7 +2504,7 @@ namespace {
                 }
                 return k;
             }
-            if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > buf.budgetMs) {
+            if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > budget) {
                 say("prediction budget hit at +{} ticks", k);
                 return 0;
             }
@@ -2492,8 +2517,9 @@ namespace {
         int releaseAfter, int base, int* landed, bool needFull = false) {
         using clock = std::chrono::steady_clock;
         auto start = clock::now();
+        double budget = searchBudget();
         auto overBudget = [&] {
-            return std::chrono::duration<double, std::milli>(clock::now() - start).count() > buf.budgetMs;
+            return std::chrono::duration<double, std::milli>(clock::now() - start).count() > budget;
         };
 
         int target = needFull ? horizon : std::min(horizon, base + st(12));
@@ -3042,7 +3068,7 @@ namespace {
             buf.activationPressHeld = false;
         }
 
-        clickStart = std::chrono::steady_clock::now();
+        ClickTimer timer;
         clickBudget();
         auto* layer = GameManager::get()->m_playLayer;
         if (!layer) {
