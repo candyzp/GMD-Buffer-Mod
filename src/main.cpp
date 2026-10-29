@@ -4503,6 +4503,19 @@ class $modify(BufRingObject, RingObject) {
         crashdiag::record("HOOK_REGISTER BufRingObject visual suppression priority=Priority::VeryEarly");
         (void)self.setHookPriority("RingObject::powerOnObject", HOOK_PRIORITY);
         (void)self.setHookPriority("RingObject::spawnCircle", HOOK_PRIORITY);
+        (void)self.setHookPriority("RingObject::triggerActivated", HOOK_PRIORITY);
+    }
+
+    // The prediction ghost shares the real level's RingObject instances. The
+    // base playerTouchedRing/ringJump path can call triggerActivated even though
+    // powerOnObject, spawnCircle, and playShineEffect are suppressed. Don't let
+    // ghost-only activations emit persistent effects on the real orb.
+    void triggerActivated(float xPosition) {
+        crashdiag::ActiveScope __diag("BufRingObject::triggerActivated");
+        if (buf.simulating) {
+            return;
+        }
+        RingObject::triggerActivated(xPosition);
     }
 
     void powerOnObject(int state) {
