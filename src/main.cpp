@@ -171,6 +171,8 @@ namespace {
     };
 
     double clickMs();
+    // Forward declaration: the orb simulation helper is defined before the timer helpers.
+    bool clickOverTime();
 
     struct Buffer {
         PlayerObject* ghost1 = nullptr;
