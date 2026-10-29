@@ -169,17 +169,7 @@ namespace {
         bool byP2;
     };
 
-    // Click timing is shared only by a real input decision. Simulations used by
-    // the performance bench and auto-release path run with the click budget guard off.
-    std::chrono::steady_clock::time_point clickStart;
-    bool enforceClickBudget = false;
     double clickMs();
-
-    struct ClickBudgetEnforcementScope {
-        bool previous;
-        ClickBudgetEnforcementScope() : previous(enforceClickBudget) { enforceClickBudget = true; }
-        ~ClickBudgetEnforcementScope() { enforceClickBudget = previous; }
-    };
 
     struct Buffer {
         PlayerObject* ghost1 = nullptr;
@@ -654,12 +644,6 @@ namespace {
             if (interval > 0.0 && frame > std::max(interval * 2.0, 20.0)) {
                 budget = std::min(budget, 4.0);
             }
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-            // On iOS, an input prediction runs synchronously on the render thread.
-            // Cap automatic budgeting at 4 ms even if the user selected an aggressive
-            // preset; an in-simulation guard prevents a single run exceeding that cap.
-            budget = std::min(budget, 4.0);
-#endif
         }
         buf.budgetMs = budget;
     }
@@ -1798,22 +1782,11 @@ namespace {
         int airTicks = 0;
         int groundTicks = 0;
         int tick = 0;
-        int stepsExecuted = 0;
         bool died = false;
         bool safe = false;
-        bool budgetExpired = false;
 
         collectMovers();
         for (; tick < total; ++tick) {
-            // A search budget checked only between whole simulations can still hitch
-            // for one complete horizon on a dense level. Check every four ghost ticks,
-            // but only while handling a real input; offline/auto-release sims keep their
-            // normal horizon. On timeout the caller must pass the real input through.
-            if (enforceClickBudget && (tick % 4 == 0) && clickMs() >= buf.budgetMs) {
-                budgetExpired = true;
-                break;
-            }
-            ++stepsExecuted;
             if (!movers.empty()) {
                 placeMovers(tick + 1);  // where they'll be after this step
             }
@@ -1942,7 +1915,7 @@ namespace {
         // These counters exist only for Debug Tools' per-click performance report.
         if (buf.perfLog) {
             ++buf.simRuns;
-            buf.simTicks += stepsExecuted;
+            buf.simTicks += tick + 1;
         }
 
         // Died or hit an unsimulated portal before the delayed input even fired:
@@ -1956,14 +1929,6 @@ namespace {
             buf.ghost2->stopAllActions();
         }
         buf.simulating = false;
-        if (budgetExpired) {
-            // Never turn an incomplete prediction into a delayed input. It is safer
-            // to leave this click untouched than to buffer from a truncated trajectory.
-            *end = SimEnd::StopSearch;
-            crashdiag::recordfVerbose("SIM_END reason=click-budget-expired tick=%d runs=%d simTicks=%d",
-                tick, buf.simRuns, buf.simTicks);
-            return 0;
-        }
         crashdiag::recordfVerbose("SIM_END survived=%d horizon=%d safe=%d died=%d portal=%d tick=%d runs=%d simTicks=%d",
             survived, horizon, safe ? 1 : 0, died ? 1 : 0, buf.ghostHitPortal ? 1 : 0, tick, buf.simRuns, buf.simTicks);
         return safe ? horizon : survived;
@@ -2084,7 +2049,9 @@ namespace {
     }
 
     // After every buffer decision: drift check + path view for the input the game gets.
-    // v2.70: extras after the search are skipped once the click budget is used.
+    // v2.70: when the current click started being processed; extras are skipped once the budget is used.
+    std::chrono::steady_clock::time_point clickStart;
+
     double clickMs() {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count();
     }
@@ -3077,7 +3044,6 @@ namespace {
 
         clickStart = std::chrono::steady_clock::now();
         clickBudget();
-        ClickBudgetEnforcementScope clickBudgetScope;
         auto* layer = GameManager::get()->m_playLayer;
         if (!layer) {
             return false;
@@ -4546,19 +4512,6 @@ class $modify(BufRingObject, RingObject) {
         crashdiag::record("HOOK_REGISTER BufRingObject visual suppression priority=Priority::VeryEarly");
         (void)self.setHookPriority("RingObject::powerOnObject", HOOK_PRIORITY);
         (void)self.setHookPriority("RingObject::spawnCircle", HOOK_PRIORITY);
-        (void)self.setHookPriority("RingObject::triggerActivated", HOOK_PRIORITY);
-    }
-
-    // The prediction ghost shares the real level's RingObject instances. The
-    // base playerTouchedRing/ringJump path can call triggerActivated even though
-    // powerOnObject, spawnCircle, and playShineEffect are suppressed. Don't let
-    // ghost-only activations emit persistent effects on the real orb.
-    void triggerActivated(float xPosition) {
-        crashdiag::ActiveScope __diag("BufRingObject::triggerActivated");
-        if (buf.simulating) {
-            return;
-        }
-        RingObject::triggerActivated(xPosition);
     }
 
     void powerOnObject(int state) {
