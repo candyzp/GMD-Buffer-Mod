@@ -52,6 +52,7 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1292,6 +1293,7 @@ namespace {
         uint32_t bad = 0;       // saves here followed by a death
         uint32_t deaths = 0;    // deaths after any decision here
         uint32_t delaySum = 0;  // sum of the delays of the saves that worked
+        uint32_t last = 0;      // latest successful delay at this spot (240/s), 0 = none
     };
 
     std::unordered_map<int, Spot> memory;
@@ -1345,7 +1347,7 @@ namespace {
         std::filesystem::create_directories(memoryFile().parent_path(), ec);
         std::ofstream out(memoryFile(), std::ios::trunc);
         for (auto const& [slice, spot] : memory) {
-            out << slice << ' ' << spot.ok << ' ' << spot.bad << ' ' << spot.deaths << ' ' << spot.delaySum << '\n';
+            out << slice << ' ' << spot.ok << ' ' << spot.bad << ' ' << spot.deaths << ' ' << spot.delaySum << ' ' << spot.last << '\n';
         }
         memoryDirty = false;
     }
@@ -1373,9 +1375,17 @@ namespace {
             memoryKey = "local_" + name;
         }
         std::ifstream in(memoryFile());
-        int slice;
-        Spot spot;
-        while (in >> slice >> spot.ok >> spot.bad >> spot.deaths >> spot.delaySum) {
+        // Older memory files have five columns; the optional sixth column stores the last
+        // successful delay. Parse one line at a time so old and new files remain compatible.
+        std::string line;
+        while (std::getline(in, line)) {
+            std::istringstream fields(line);
+            int slice;
+            Spot spot;
+            if (!(fields >> slice >> spot.ok >> spot.bad >> spot.deaths >> spot.delaySum)) {
+                continue;
+            }
+            fields >> spot.last;
             memory[slice] = spot;
         }
         // v2.75: memory fades. Opened again more than 12 hours later, everything learned counts
@@ -1416,7 +1426,12 @@ namespace {
         if (pending.delay > 0) {
             auto& spot = memory[pending.slice];
             ++spot.ok;
-            spot.delaySum += static_cast<uint32_t>(std::lround(pending.delay / stepScale()));  // stored at 240/s
+            uint32_t delay = static_cast<uint32_t>(std::lround(pending.delay / stepScale()));  // stored at 240/s
+            spot.delaySum += delay;
+            spot.last = delay;
+            if (spot.bad > 0) {
+                --spot.bad;
+            }
             memoryChanged();
         }
     }
@@ -1482,10 +1497,17 @@ namespace {
         return spot.bad >= 2 && spot.bad > spot.ok;
     }
 
-    // The delay that has worked here before (average of the saves you survived), or 0.
+    // Prefer the last delay that actually worked here, then nearby slices. The average is a
+    // fallback for old memory files or spots without a remembered successful delay.
     int memoryDelay(int slice) {
         if (!buf.learn) {
             return 0;
+        }
+        for (int sl : { slice, slice - 1, slice + 1 }) {
+            auto it = memory.find(sl);
+            if (it != memory.end() && it->second.last > 0) {
+                return st(static_cast<int>(it->second.last));
+            }
         }
         auto spot = spotAround(slice);
         if (spot.ok < 2) {
