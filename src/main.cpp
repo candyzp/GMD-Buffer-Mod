@@ -3612,7 +3612,7 @@ namespace {
     // letting go now clearly survives longer, let go for you. Your own release later is
     // swallowed, and your next press works as normal.
     void tryAutoRelease(PlayLayer* layer, PlayerObject* p1) {
-        if ((!buf.autoRelease && !buf.robotAutoRelease && !buf.dashAutoRelease) || buf.autoReleased || layer->m_isPlatformer) {
+        if (buf.autoReleased || layer->m_isPlatformer) {
             return;
         }
         if (!buf.queue.empty() || !buf.realInput || !buf.appliedInput || !buf.isPlayer1 || !buf.ghost1) {
@@ -3626,7 +3626,16 @@ namespace {
         bool dash = p1->m_isDashing || (p2 && p2->m_isDashing);
         bool wave = !dash && (p1->m_isDart || (p2 && p2->m_isDart));
         bool robot = !dash && !wave && (p1->m_isRobot || (p2 && p2->m_isRobot));
-        if (p1->m_isDead || !((dash && buf.dashAutoRelease) || (wave && buf.autoRelease) || (robot && buf.robotAutoRelease))) {
+
+        // The cached flags are refreshed only periodically. Read the active mode's
+        // setting at the moment we'd release so disabling Wave Auto Release in the
+        // settings takes effect immediately, without waiting for the next poll.
+        auto* settings = Mod::get();
+        bool autoReleaseEnabled = dash ? settings->getSettingValue<bool>("dash-auto-release")
+            : wave ? settings->getSettingValue<bool>("wave-auto-release")
+            : robot ? settings->getSettingValue<bool>("robot-auto-release")
+            : false;
+        if (p1->m_isDead || !autoReleaseEnabled) {
             return;
         }
         bool mini = (p1->m_isDart && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
@@ -4628,6 +4637,10 @@ class $modify(BufPlayerObject, PlayerObject) {
                 settings->getSettingValue<bool>("activation-rate-enabled") != buf.activationRateEnabled ||
                 static_cast<int>(settings->getSettingValue<int64_t>("activation-every")) != buf.activationEvery ||
                 settings->getSettingValue<bool>("show-auto-tag") != buf.showAutoTag ||
+                settings->getSettingValue<bool>("wave-auto-release") != buf.autoRelease ||
+                settings->getSettingValue<bool>("robot-auto-release") != buf.robotAutoRelease ||
+                settings->getSettingValue<bool>("dash-auto-release") != buf.dashAutoRelease ||
+                static_cast<int>(settings->getSettingValue<int64_t>("auto-release-window")) != buf.autoWindow ||
                 settings->getSettingValue<bool>("debug-tools") != buf.debugTools;
             if (changed) {
                 readSettings();
