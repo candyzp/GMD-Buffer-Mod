@@ -4243,6 +4243,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         crashdiag::record("HOOK_REGISTER BufPlayLayer priority=Priority::VeryEarly");
         (void)self.setHookPriority("PlayLayer::destroyPlayer", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayLayer::playEndAnimationToPos", HOOK_PRIORITY);
+        (void)self.setHookPriority("PlayLayer::spawnCircle", HOOK_PRIORITY);
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
@@ -4508,6 +4509,16 @@ class $modify(BufPlayLayer, PlayLayer) {
         }
         PlayLayer::playEndAnimationToPos(position);
     }
+
+    // v2.79: the live level's orb/pad circle is visual-only and must not be
+    // spawned by repeated prediction ghosts.
+    void spawnCircle() {
+        crashdiag::ActiveScope __diag("BufPlayLayer::spawnCircle");
+        if (buf.simulating) {
+            return;
+        }
+        PlayLayer::spawnCircle();
+    }
 };
 
 class $modify(BufEditorLayer, LevelEditorLayer) {
@@ -4538,6 +4549,7 @@ class $modify(BufEffectGameObject, EffectGameObject) {
     static void onModify(auto& self) {
         crashdiag::record("HOOK_REGISTER BufEffectGameObject priority=Priority::VeryEarly");
         (void)self.setHookPriority("EffectGameObject::triggerObject", HOOK_PRIORITY);
+        (void)self.setHookPriority("EffectGameObject::playTriggerEffect", HOOK_PRIORITY);
     }
 
     void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
@@ -4562,6 +4574,7 @@ class $modify(BufGameObject, GameObject) {
     static void onModify(auto& self) {
         crashdiag::record("HOOK_REGISTER BufGameObject priority=Priority::VeryEarly");
         (void)self.setHookPriority("GameObject::playShineEffect", HOOK_PRIORITY);
+        (void)self.setHookPriority("GameObject::playDestroyObjectAnim", HOOK_PRIORITY);
     }
 
     void playShineEffect() {
@@ -4570,6 +4583,15 @@ class $modify(BufGameObject, GameObject) {
             return;
         }
         GameObject::playShineEffect();
+    }
+
+    // v2.79: a prediction must not leave a destruction animation on the real level.
+    void playDestroyObjectAnim(GJBaseGameLayer* layer) {
+        crashdiag::ActiveScope __diag("BufGameObject::playDestroyObjectAnim");
+        if (buf.simulating) {
+            return;
+        }
+        GameObject::playDestroyObjectAnim(layer);
     }
 };
 
@@ -4580,6 +4602,7 @@ class $modify(BufRingObject, RingObject) {
         crashdiag::record("HOOK_REGISTER BufRingObject visual suppression priority=Priority::VeryEarly");
         (void)self.setHookPriority("RingObject::powerOnObject", HOOK_PRIORITY);
         (void)self.setHookPriority("RingObject::spawnCircle", HOOK_PRIORITY);
+        (void)self.setHookPriority("RingObject::triggerActivated", HOOK_PRIORITY);
     }
 
     void powerOnObject(int state) {
@@ -4596,6 +4619,16 @@ class $modify(BufRingObject, RingObject) {
             return;
         }
         RingObject::spawnCircle();
+    }
+
+    // v2.79: this is the orb's used/activation animation. Ghost predictions share
+    // the real RingObject, so suppress it while simulating without changing ring physics.
+    void triggerActivated(float xPosition) {
+        crashdiag::ActiveScope __diag("BufRingObject::triggerActivated");
+        if (buf.simulating) {
+            return;
+        }
+        RingObject::triggerActivated(xPosition);
     }
 };
 
