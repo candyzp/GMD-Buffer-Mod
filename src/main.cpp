@@ -52,6 +52,7 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -92,6 +93,12 @@ namespace {
         typeBit(GameObjectType::UfoPortal) | typeBit(GameObjectType::WavePortal) | typeBit(GameObjectType::RobotPortal) |
         typeBit(GameObjectType::SpiderPortal) | typeBit(GameObjectType::SwingPortal) | typeBit(GameObjectType::DualPortal) |
         typeBit(GameObjectType::SoloPortal) | typeBit(GameObjectType::TeleportPortal) | typeBit(GameObjectType::TeleportOrb);
+
+    // Mode portals can be followed by the hidden player when full-state copying is enabled.
+    constexpr uint64_t MODE_TYPES =
+        typeBit(GameObjectType::ShipPortal) | typeBit(GameObjectType::CubePortal) | typeBit(GameObjectType::BallPortal) |
+        typeBit(GameObjectType::UfoPortal) | typeBit(GameObjectType::WavePortal) | typeBit(GameObjectType::RobotPortal) |
+        typeBit(GameObjectType::SpiderPortal) | typeBit(GameObjectType::SwingPortal);
 
     // v2.8: size portals are applied to the ghost instead of ending the prediction.
     // (Mirror portals only flip the screen, so the ghost simply ignores them.)
@@ -173,6 +180,7 @@ namespace {
         PlayerObject* ghost1 = nullptr;
         PlayerObject* ghost2 = nullptr;
         CCLayer* ghostLayer = nullptr;
+        PlayLayer* owner = nullptr; // Active PlayLayer that owns this level's prediction state.
         unsigned ghostLayerBase = 0;  // v2.24: children the ghost layer has right after the ghosts are made
 
         CCNode* panel = nullptr;
@@ -191,6 +199,7 @@ namespace {
         bool injecting = false;
         bool ghostDied = false;
         bool ghostHitPortal = false;
+        bool ghostSwitched = false; // A prediction crossed a mode portal.
         bool realInput = false;
         bool appliedInput = false;
         bool isPlayer1 = true;
@@ -304,6 +313,8 @@ namespace {
         bool usedThisAttempt = false;      // the buffer was on at some point of this attempt
         bool learn = true;           // v2.13: per-level memory learned from your runs
         bool fullState = true;       // v2.11.1: copy the full v2.8 player state into the ghost
+        bool portalPredict = true;   // Predict through mode portals using the ghost's switched mode.
+        bool haveStartRects = false;
         int orbWindow = 16;          // v2.6: how far ahead (ticks) an orb may be for that
         int simTick = 0;             // v2.6: tick of the current run
         int firstOrbTick = -1;       // v2.6: first tick the current run touched an orb
@@ -565,6 +576,7 @@ namespace {
         buf.orbTiming = mod->getSettingValue<bool>("orb-timing");
         buf.orbAlignGround = mod->getSettingValue<bool>("orb-align-ground");
         buf.fullState = mod->getSettingValue<bool>("full-ghost-state");
+        buf.portalPredict = mod->getSettingValue<bool>("predict-through-portals");
         buf.learn = mod->getSettingValue<bool>("level-memory");
         buf.robotSmart = mod->getSettingValue<bool>("robot-smart");
         buf.spiderSmart = mod->getSettingValue<bool>("spider-smart");
@@ -753,6 +765,9 @@ namespace {
         buf.rapid = 0;
         buf.autoReleased = false;
         buf.recordPath = nullptr;
+        buf.realInput = false;
+        buf.appliedInput = false;
+        buf.owner = nullptr;
         watched.clear();
         drift.active = false;
         resetPending();
@@ -821,6 +836,17 @@ namespace {
         layer->handleButton(down, 1, buf.isPlayer1);
         buf.injecting = false;
         crashdiag::recordf("INPUT_INJECT_END down=%d", down ? 1 : 0);
+    }
+
+    bool gameHolds(PlayerObject* player) {
+        if (!player) return false;
+        auto it = player->m_holdingButtons.find(static_cast<int>(PlayerButton::Jump));
+        return it != player->m_holdingButtons.end() && it->second;
+    }
+
+    void syncHeld(PlayLayer* layer) {
+        resetPending();
+        buf.realInput = buf.appliedInput = layer && gameHolds(layer->m_player1);
     }
 
     void pressGhost(PlayerObject* ghost, bool down) {
@@ -1278,6 +1304,7 @@ namespace {
         uint32_t bad = 0;       // saves here followed by a death
         uint32_t deaths = 0;    // deaths after any decision here
         uint32_t delaySum = 0;  // sum of the delays of the saves that worked
+        uint32_t last = 0;      // exact delay of the most recent successful save (240/s)
     };
 
     std::unordered_map<int, Spot> memory;
@@ -1331,7 +1358,7 @@ namespace {
         std::filesystem::create_directories(memoryFile().parent_path(), ec);
         std::ofstream out(memoryFile(), std::ios::trunc);
         for (auto const& [slice, spot] : memory) {
-            out << slice << ' ' << spot.ok << ' ' << spot.bad << ' ' << spot.deaths << ' ' << spot.delaySum << '\n';
+            out << slice << ' ' << spot.ok << ' ' << spot.bad << ' ' << spot.deaths << ' ' << spot.delaySum << ' ' << spot.last << '\n';
         }
         memoryDirty = false;
     }
@@ -1359,9 +1386,16 @@ namespace {
             memoryKey = "local_" + name;
         }
         std::ifstream in(memoryFile());
-        int slice;
-        Spot spot;
-        while (in >> slice >> spot.ok >> spot.bad >> spot.deaths >> spot.delaySum) {
+        // Read both the older five-field format and the newer format with the last working delay.
+        std::string line;
+        while (std::getline(in, line)) {
+            std::istringstream fields(line);
+            int slice;
+            Spot spot;
+            if (!(fields >> slice >> spot.ok >> spot.bad >> spot.deaths >> spot.delaySum)) {
+                continue;
+            }
+            fields >> spot.last;
             memory[slice] = spot;
         }
         // v2.75: memory fades. Opened again more than 12 hours later, everything learned counts
@@ -1375,6 +1409,7 @@ namespace {
                 uint32_t ok = s.ok * 3 / 4;
                 s.delaySum = s.ok > 0 ? static_cast<uint32_t>(static_cast<uint64_t>(s.delaySum) * ok / s.ok) : 0;
                 s.ok = ok;
+                if (ok == 0) s.last = 0;
                 s.bad = s.bad * 3 / 4;
                 s.deaths = s.deaths * 3 / 4;
                 it = (s.ok | s.bad | s.deaths) == 0 ? memory.erase(it) : std::next(it);
@@ -1387,11 +1422,11 @@ namespace {
         }
     }
 
+    // Keep active level memory in RAM during play; flush once when the level is exited.
+    // Periodic file writes during repeated inputs can cause avoidable frame-time spikes.
     void memoryChanged() {
         memoryDirty = true;
-        if (++memoryUpdates % 10 == 0) {
-            saveMemory();
-        }
+        ++memoryUpdates;
     }
 
     void creditPending() {
@@ -1401,8 +1436,11 @@ namespace {
         pending.active = false;
         if (pending.delay > 0) {
             auto& spot = memory[pending.slice];
+            auto delay = static_cast<uint32_t>(std::lround(pending.delay / stepScale())); // stored at 240/s
             ++spot.ok;
-            spot.delaySum += static_cast<uint32_t>(std::lround(pending.delay / stepScale()));  // stored at 240/s
+            spot.delaySum += delay;
+            spot.last = delay;
+            if (spot.bad > 0) --spot.bad;
             memoryChanged();
         }
     }
@@ -1468,10 +1506,17 @@ namespace {
         return spot.bad >= 2 && spot.bad > spot.ok;
     }
 
-    // The delay that has worked here before (average of the saves you survived), or 0.
+    // Reuse the most recent successful delay at this spot, then its neighbours.
+    // Older five-field records fall back to their average until a new save succeeds.
     int memoryDelay(int slice) {
         if (!buf.learn) {
             return 0;
+        }
+        for (int sl : { slice, slice - 1, slice + 1 }) {
+            auto it = memory.find(sl);
+            if (it != memory.end() && it->second.last > 0) {
+                return st(static_cast<int>(it->second.last));
+            }
         }
         auto spot = spotAround(slice);
         if (spot.ok < 2) {
@@ -1656,6 +1701,40 @@ namespace {
         layer->checkCollisions(ghost, dt, false);
     }
 
+    // Mirror the vehicle-mode transition on the hidden player without creating real-level effects.
+    void setGhostMode(PlayerObject* ghost, GameObjectType type) {
+        using T = GameObjectType;
+        bool already = (type == T::ShipPortal && ghost->m_isShip) ||
+            (type == T::BallPortal && ghost->m_isBall) ||
+            (type == T::UfoPortal && ghost->m_isBird) ||
+            (type == T::WavePortal && ghost->m_isDart) ||
+            (type == T::RobotPortal && ghost->m_isRobot) ||
+            (type == T::SpiderPortal && ghost->m_isSpider) ||
+            (type == T::SwingPortal && ghost->m_isSwing) ||
+            (type == T::CubePortal && !ghost->m_isShip && !ghost->m_isBall && !ghost->m_isBird &&
+                !ghost->m_isDart && !ghost->m_isRobot && !ghost->m_isSpider && !ghost->m_isSwing);
+        if (already) return;
+
+        buf.ghostSwitched = true;
+        if (ghost->m_isShip) ghost->toggleFlyMode(false, true);
+        if (ghost->m_isBall) ghost->toggleRollMode(false, true);
+        if (ghost->m_isBird) ghost->toggleBirdMode(false, true);
+        if (ghost->m_isDart) ghost->toggleDartMode(false, true);
+        if (ghost->m_isRobot) ghost->toggleRobotMode(false, true);
+        if (ghost->m_isSpider) ghost->toggleSpiderMode(false, true);
+        if (ghost->m_isSwing) ghost->toggleSwingMode(false, true);
+        switch (type) {
+            case T::ShipPortal: ghost->toggleFlyMode(true, true); break;
+            case T::BallPortal: ghost->toggleRollMode(true, true); break;
+            case T::UfoPortal: ghost->toggleBirdMode(true, true); break;
+            case T::WavePortal: ghost->toggleDartMode(true, true); break;
+            case T::RobotPortal: ghost->toggleRobotMode(true, true); break;
+            case T::SpiderPortal: ghost->toggleSpiderMode(true, true); break;
+            case T::SwingPortal: ghost->toggleSwingMode(true, true); break;
+            default: break;
+        }
+    }
+
     bool isFlying(PlayerObject* player) {
         return player->m_isDart || player->m_isBird || player->m_isSwing || player->m_isShip;
     }
@@ -1701,18 +1780,19 @@ namespace {
         crashdiag::recordf("SIM_STATE simulating=1 ghost1=%p ghost2=%p", static_cast<void*>(buf.ghost1), static_cast<void*>(buf.ghost2));
         buf.ghostDied = false;
         buf.ghostHitPortal = false;
+        buf.ghostSwitched = false;
         buf.firstOrbTick = -1;
         buf.orbUsedTick = -1;
         buf.firstTouchedOrb = nullptr;
         buf.firstUsedOrb = nullptr;
 
         bool second = dual && buf.ghost2 && p2;
+        // Portal overlap is checked independently from the optional ignore-touching setting.
+        buf.haveStartRects = true;
+        buf.realRect1 = p1->getObjectRect();
+        buf.realRect2 = second ? p2->getObjectRect() : buf.realRect1;
         buf.haveRealRect = buf.ignoreTouching;
         buf.harmless.clear();
-        if (buf.haveRealRect) {
-            buf.realRect1 = p1->getObjectRect();
-            buf.realRect2 = second ? p2->getObjectRect() : buf.realRect1;
-        }
         copyState(buf.ghost1, p1);
         if (second) {
             copyState(buf.ghost2, p2);
@@ -1846,7 +1926,8 @@ namespace {
             if (survived >= stopAt) {
                 break;
             }
-            if (flying && !ufoRun) {
+            // Vehicle landing heuristics do not apply after a mode portal was crossed.
+            if ((flying && !ufoRun) || buf.ghostSwitched) {
                 continue;
             }
 
@@ -1897,11 +1978,20 @@ namespace {
         if (buf.ghost2) {
             buf.ghost2->stopAllActions();
         }
+        // Orb/dash predictions can start particle systems on the detached ghosts. Stop them
+        // after each run so repeated retries cannot accumulate paused emitters.
+        if (buf.firstOrbTick >= 0) {
+            buf.ghost1->stopParticles();
+            if (buf.ghost2) buf.ghost2->stopParticles();
+        }
         buf.simulating = false;
         crashdiag::recordf("SIM_END survived=%d horizon=%d safe=%d died=%d portal=%d tick=%d runs=%d simTicks=%d",
             survived, horizon, safe ? 1 : 0, died ? 1 : 0, buf.ghostHitPortal ? 1 : 0, tick, buf.simRuns, buf.simTicks);
         return safe ? horizon : survived;
     }
+
+    // All orb retries share the same per-input budget as the main search.
+    double clickMs();
 
     // v2.4: simulate() with the orb setting; if that run touched an orb and didn't make
     // it, also try the other choice (click it / skip it) and keep whichever lives longer,
@@ -1911,7 +2001,7 @@ namespace {
         buf.orbClick = buf.assumeOrbs;
         buf.touchedOrb = false;
         int first = simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, stopAt, end);
-        if (!buf.tryBothOrbs || !buf.smart || !buf.touchedOrb || first >= stopAt) {
+        if (!buf.tryBothOrbs || !buf.smart || !buf.touchedOrb || first >= stopAt || clickMs() >= buf.budgetMs) {
             return first;
         }
         SimEnd firstEnd = *end;
@@ -1926,6 +2016,7 @@ namespace {
         // like Orbit). The ghost's orb clicks are also tried 3 and 6 ticks into the orb.
         if (buf.orbTiming && best < stopAt) {
             for (int late : { 3, 6 }) {
+                if (clickMs() >= buf.budgetMs) break;
                 buf.orbClick = true;
                 buf.orbClickDelay = st(late);
                 SimEnd lateEnd;
@@ -4138,7 +4229,7 @@ $on_mod(Loaded) {
     }
     crashdiag::record("HOOK_SET preserved: upstream BufPlayLayer/BufPlayerObject/BufBaseGameLayer/GameObject/EffectGameObject/HardStreak hooks remain enabled");
     crashdiag::flush();
-    say("v2.78.5 loaded. Per-level prediction cache + cache lifecycle logging enabled; F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.79.0 loaded. Session level-memory cache + bounded prediction retries enabled; F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -4181,6 +4272,10 @@ class $modify(BufPlayLayer, PlayLayer) {
         PlayLayer::destroyPlayer(player, object);
         if (!player || wasDead || !player->m_isDead) {
             return;
+        }
+        if (buf.appliedInput && buf.owner == this) {
+            // A delayed release may still be queued when the real player dies.
+            sendButton(this, false);
         }
         resetPending();
         buf.appliedInput = false;
@@ -4354,6 +4449,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.sinceInput = 999;
         buf.rapid = 0;
         forgetPress();
+        buf.owner = this;
         return true;
     }
 
@@ -4386,6 +4482,14 @@ class $modify(BufPlayLayer, PlayLayer) {
         benchNeedStart = true;
         endAttempt();
         buf.usedThisAttempt = false;
+        // The level may already be tearing down when a stale reset arrives from another layer.
+        if (buf.owner != this) {
+            PlayLayer::resetLevel();
+            return;
+        }
+        if (buf.appliedInput && !buf.realInput) {
+            sendButton(this, false);
+        }
         resetPending();
         forgetPress();
         refreshAutoTag();
@@ -4395,6 +4499,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.autoReleased = false;
         drift.active = false;
         PlayLayer::resetLevel();
+        syncHeld(this);
     }
 
     void togglePracticeMode(bool practiceMode) {
@@ -4410,6 +4515,14 @@ class $modify(BufPlayLayer, PlayLayer) {
             return;
         }
         PlayLayer::playEndAnimationToPos(position);
+    }
+
+    // A repeated hidden prediction must not spawn activation circles on the real level.
+    void spawnCircle() {
+        if (buf.simulating) {
+            return;
+        }
+        PlayLayer::spawnCircle();
     }
 };
 
@@ -4892,6 +5005,23 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             }
             if (ghostRect.intersectsRect(object->getObjectRect())) {
                 if (stop) {
+                    // A portal the real player is already inside was taken before this click;
+                    // do not stop every new prediction immediately after crossing it.
+                    if (buf.harmless.contains(object)) {
+                        continue;
+                    }
+                    auto const& objectRect = object->getObjectRect();
+                    if (buf.haveStartRects && buf.simTick <= 1 &&
+                        object->m_objectType != GameObjectType::TeleportOrb &&
+                        (objectRect.intersectsRect(buf.realRect1) || objectRect.intersectsRect(buf.realRect2))) {
+                        buf.harmless.insert(object);
+                        continue;
+                    }
+                    if (buf.portalPredict && buf.fullState && (MODE_TYPES & bit)) {
+                        setGhostMode(player, object->m_objectType);
+                        buf.harmless.insert(object);
+                        continue;
+                    }
                     buf.ghostHitPortal = true;
                 }
                 else if (size) {
