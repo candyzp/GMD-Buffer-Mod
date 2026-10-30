@@ -4,7 +4,7 @@
         "win": "2.2081",
         "ios": "2.2081"
     },
-    "version": "v2.78.5",
+    "version": "v2.79.0",
     "id": "lyophi.buffermod",
     "name": "Input Buffer",
     "developer": "Lyophi",
@@ -29,8 +29,8 @@
         "sim-budget-ms": {
             "type": "float",
             "name": "Prediction time budget (ms)",
-            "description": "Max time spent predicting per click. Higher = finds longer saves on big windows, but may hitch on dense levels.",
-            "default": 8,
+            "description": "Maximum prediction time per input. The 5 ms default reduces frame hitches while keeping robust saves and orb timing enabled. Higher values can find more saves but may hitch on dense levels.",
+            "default": 5,
             "min": 1,
             "max": 30
         },
@@ -185,6 +185,12 @@
             "type": "bool",
             "name": "Full ghost state (v2.8)",
             "description": "Copy the full player state (slopes, timers, forces, dash...) into the prediction ghost. Turn off to go back to the v2.7 ghost if predictions feel worse.",
+            "default": true
+        },
+        "predict-through-portals": {
+            "type": "bool",
+            "name": "Predict through mode portals",
+            "description": "The hidden player changes mode at ship, cube, ball, UFO, wave, robot, spider and swing portals, so predictions can continue across them. Requires Full ghost state.",
             "default": true
         },
         "robot-smart": {
