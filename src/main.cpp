@@ -1346,6 +1346,100 @@ namespace {
         return Mod::get()->getSaveDir() / "memory" / (memoryKey + "_v3.txt");
     }
 
+    // Keep only the ten most recently opened level-memory records. The active file is
+    // always protected, including when two files have the same filesystem timestamp.
+    void pruneMemoryFiles() {
+        auto directory = memoryFile().parent_path();
+        std::error_code ec;
+        if (!std::filesystem::exists(directory, ec) || ec) {
+            return;
+        }
+
+        struct Entry {
+            std::filesystem::file_time_type modified;
+            std::filesystem::path path;
+            bool active;
+        };
+        std::vector<Entry> files;
+        auto const activePath = memoryFile();
+        constexpr char suffix[] = "_v3.txt";
+        for (std::filesystem::directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code itemError;
+            if (!it->is_regular_file(itemError) || itemError) {
+                continue;
+            }
+            auto name = it->path().filename().string();
+            if (name.size() < sizeof(suffix) - 1 ||
+                name.compare(name.size() - (sizeof(suffix) - 1), sizeof(suffix) - 1, suffix) != 0) {
+                continue;
+            }
+            auto modified = it->last_write_time(itemError);
+            if (itemError) {
+                continue;
+            }
+            files.push_back({ modified, it->path(), it->path() == activePath });
+        }
+        if (ec) {
+            geode::log::warn("[InputBuffer] Could not enumerate level-memory cache: {}", ec.message());
+            return;
+        }
+        if (files.size() <= 10) {
+            return;
+        }
+
+        std::sort(files.begin(), files.end(), [](Entry const& a, Entry const& b) {
+            if (a.modified != b.modified) {
+                return a.modified < b.modified;
+            }
+            return a.active < b.active; // Prefer retaining the active level on timestamp ties.
+        });
+        size_t remaining = files.size();
+        for (auto const& entry : files) {
+            if (remaining <= 10) {
+                break;
+            }
+            if (entry.active) {
+                continue;
+            }
+            std::error_code removeError;
+            if (std::filesystem::remove(entry.path, removeError)) {
+                --remaining;
+                geode::log::info("[InputBuffer] Evicted oldest level memory: {}", entry.path.filename().string());
+            }
+            else if (removeError) {
+                geode::log::warn("[InputBuffer] Could not evict level memory {}: {}",
+                    entry.path.filename().string(), removeError.message());
+            }
+        }
+    }
+
+    // Touch on every level entry (not every death/restart), so recency means last played.
+    // Creating an empty file also reserves a slot for a level before it has learned anything.
+    void touchMemoryFile() {
+        if (memoryKey.empty()) {
+            return;
+        }
+        std::error_code ec;
+        auto path = memoryFile();
+        std::filesystem::create_directories(path.parent_path(), ec);
+        if (ec) {
+            geode::log::warn("[InputBuffer] Could not create level-memory directory: {}", ec.message());
+            return;
+        }
+        {
+            std::ofstream marker(path, std::ios::app);
+            if (!marker) {
+                geode::log::warn("[InputBuffer] Could not touch level-memory file: {}", path.filename().string());
+                return;
+            }
+        }
+        std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
+        if (ec) {
+            geode::log::warn("[InputBuffer] Could not update level-memory recency: {}", ec.message());
+        }
+        pruneMemoryFiles();
+    }
+
     size_t memorySpots() {
         return memory.size();
     }
@@ -1357,10 +1451,17 @@ namespace {
         std::error_code ec;
         std::filesystem::create_directories(memoryFile().parent_path(), ec);
         std::ofstream out(memoryFile(), std::ios::trunc);
+        if (!out) {
+            geode::log::warn("[InputBuffer] Could not save level memory: {}", memoryFile().string());
+            return;
+        }
         for (auto const& [slice, spot] : memory) {
             out << slice << ' ' << spot.ok << ' ' << spot.bad << ' ' << spot.deaths << ' ' << spot.delaySum << ' ' << spot.last << '\n';
         }
+        out.close();
         memoryDirty = false;
+        std::filesystem::last_write_time(memoryFile(), std::filesystem::file_time_type::clock::now(), ec);
+        pruneMemoryFiles();
     }
 
     void loadMemory(GJGameLevel* level) {
@@ -1417,6 +1518,9 @@ namespace {
             memoryDirty = true;
             saveMemory();
         }
+        // Count this level as recently played and evict the oldest record if this is
+        // the eleventh distinct level opened. The live map stays in RAM until level exit.
+        touchMemoryFile();
         if (!memory.empty()) {
             say("memory: {} spots learned on this level", memory.size());
         }
