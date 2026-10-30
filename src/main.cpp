@@ -2113,9 +2113,12 @@ namespace {
     // (robust check, drift check, path view) are skipped once the click has used up its
     // time, so one click can't stall a frame for long. The search itself keeps its budget.
     std::chrono::steady_clock::time_point clickStart;
+    bool clickTimed = false;
 
     double clickMs() {
-        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count();
+        return clickTimed
+            ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count()
+            : 0.0;
     }
 
     void decided(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter) {
@@ -3105,6 +3108,7 @@ namespace {
         }
 
         clickStart = std::chrono::steady_clock::now();
+        clickTimed = true;
         clickBudget();
         auto* layer = GameManager::get()->m_playLayer;
         if (!layer) {
@@ -5055,6 +5059,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             buf.simTicks = 0;
             auto start = std::chrono::steady_clock::now();
             bool held = intercept(this, down, isPlayer1);
+            clickTimed = false;
             sweepGhostLayer();
             if (buf.perfLog && buf.simRuns > 0) {
                 double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
