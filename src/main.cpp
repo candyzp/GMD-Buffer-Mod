@@ -1952,6 +1952,15 @@ namespace {
         if (buf.ghost2) {
             buf.ghost2->stopAllActions();
         }
+        // Upstream v2.79: orb/dash predictions start particle systems on the ghost.
+        // Stop them before the next prediction so repeated orb retries cannot accumulate
+        // particle work over the course of a long session.
+        if (buf.firstOrbTick >= 0) {
+            buf.ghost1->stopParticles();
+            if (buf.ghost2) {
+                buf.ghost2->stopParticles();
+            }
+        }
         buf.simulating = false;
         crashdiag::recordfVerbose("SIM_END survived=%d horizon=%d safe=%d died=%d portal=%d tick=%d runs=%d simTicks=%d",
             survived, horizon, safe ? 1 : 0, died ? 1 : 0, buf.ghostHitPortal ? 1 : 0, tick, buf.simRuns, buf.simTicks);
@@ -4537,6 +4546,15 @@ class $modify(BufEffectGameObject, EffectGameObject) {
             return;
         }
         EffectGameObject::triggerObject(layer, uniqueID, remapKeys);
+    }
+
+    // Upstream v2.79: this effect is visual-only and must not be emitted by prediction ghosts.
+    void playTriggerEffect() {
+        crashdiag::ActiveScope __diag("BufEffectGameObject::playTriggerEffect");
+        if (buf.simulating) {
+            return;
+        }
+        EffectGameObject::playTriggerEffect();
     }
 };
 
