@@ -2102,8 +2102,8 @@ namespace {
         }
         // Orb/dash predictions can start particle systems on the detached ghosts. Stop them
         // after each run so repeated retries cannot accumulate paused emitters.
-        // Dash rings use startDashing() rather than playerTouchedRing(), so they
-        // set orbUsedTick without firstOrbTick. Clean their ghost emitters too.
+        // Dash-ring prediction records orbUsedTick in startDashing(); it may not
+        // set the generic firstOrbTick marker. Clean those ghost emitters too.
         if (buf.firstOrbTick >= 0 || buf.orbUsedTick >= 0) {
             buf.ghost1->stopParticles();
             if (buf.ghost2) buf.ghost2->stopParticles();
