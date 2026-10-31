@@ -1117,18 +1117,28 @@ namespace {
             watched.clear();
         }
         movingNow.clear();
-        // v2.41: objects far from you (passed long ago, or far ahead) are dropped instead of
-        // being checked every step; predictions never reach further than ~300 units.
+        // v2.79.2: only poll objects that can still enter a prediction. Keep a generous
+        // margin and assume the fastest portal speed, so this is a storage/CPU bound rather
+        // than a change to which objects can affect the actual look-ahead.
         double px = 0.0;
+        double watchDistance = 800.0;
         bool prune = false;
         if (auto* layer = GameManager::get()->m_playLayer; layer && layer->m_player1) {
-            px = layer->m_player1->getPosition().x;
+            auto* player = layer->m_player1;
+            px = player->getPosition().x;
+            int horizon = std::max(
+                st(std::clamp(buf.groundHorizon, 48, 240)),
+                st(std::clamp(buf.waveHorizon, 20, 160)));
+            int maxDelay = std::max({ buf.ticksAll, buf.ticksWave, buf.shipMaxDelay });
+            double worstCaseSpeed = std::max(1.6, std::abs(static_cast<double>(player->m_playerSpeed)));
+            double predictedReach = (horizon + maxDelay) * (311.58 / 240.0) * (worstCaseSpeed / 0.9);
+            watchDistance = std::clamp(120.0 + predictedReach, 400.0, 800.0);
             prune = true;
         }
         for (auto it = watched.begin(); it != watched.end();) {
             auto* object = it->first;
             auto& w = it->second;
-            if (prune && std::abs(object->m_positionX - px) > 800.0) {
+            if (prune && std::abs(object->m_positionX - px) > watchDistance) {
                 it = watched.erase(it);
                 continue;
             }
@@ -1311,6 +1321,7 @@ namespace {
     std::string memoryKey;
     bool memoryDirty = false;
     int memoryUpdates = 0;
+    constexpr size_t MAX_LEVEL_MEMORY_FILES = 50;
 
     struct PendingOutcome {
         bool active = false;
@@ -1346,7 +1357,7 @@ namespace {
         return Mod::get()->getSaveDir() / "memory" / (memoryKey + "_v3.txt");
     }
 
-    // Keep only the ten most recently opened level-memory records. The active file is
+    // Keep only the 50 most recently opened level-memory records. The active file is
     // always protected, including when two files have the same filesystem timestamp.
     void pruneMemoryFiles() {
         auto directory = memoryFile().parent_path();
@@ -1383,7 +1394,7 @@ namespace {
             geode::log::warn("[InputBuffer] Could not enumerate level-memory cache: {}", ec.message());
             return;
         }
-        if (files.size() <= 10) {
+        if (files.size() <= MAX_LEVEL_MEMORY_FILES) {
             return;
         }
 
@@ -1395,7 +1406,7 @@ namespace {
         });
         size_t remaining = files.size();
         for (auto const& entry : files) {
-            if (remaining <= 10) {
+            if (remaining <= MAX_LEVEL_MEMORY_FILES) {
                 break;
             }
             if (entry.active) {
@@ -1455,6 +1466,7 @@ namespace {
             geode::log::warn("[InputBuffer] Could not save level memory: {}", memoryFile().string());
             return;
         }
+        out << "# slice successful_saves failed_saves deaths sum_successful_delay_ticks last_successful_delay_ticks\n";
         for (auto const& [slice, spot] : memory) {
             out << slice << ' ' << spot.ok << ' ' << spot.bad << ' ' << spot.deaths << ' ' << spot.delaySum << ' ' << spot.last << '\n';
         }
@@ -1519,7 +1531,7 @@ namespace {
             saveMemory();
         }
         // Count this level as recently played and evict the oldest record if this is
-        // the eleventh distinct level opened. The live map stays in RAM until level exit.
+        // the 51st distinct level opened. The live map stays in RAM until level exit.
         touchMemoryFile();
         if (!memory.empty()) {
             say("memory: {} spots learned on this level", memory.size());
