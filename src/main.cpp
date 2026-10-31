@@ -2096,7 +2096,9 @@ namespace {
         }
         // Orb/dash predictions can start particle systems on the detached ghosts. Stop them
         // after each run so repeated retries cannot accumulate paused emitters.
-        if (buf.firstOrbTick >= 0) {
+        // Dash rings use startDashing() rather than playerTouchedRing(), so they
+        // set orbUsedTick without firstOrbTick. Clean their ghost emitters too.
+        if (buf.firstOrbTick >= 0 || buf.orbUsedTick >= 0) {
             buf.ghost1->stopParticles();
             if (buf.ghost2) buf.ghost2->stopParticles();
         }
@@ -4705,8 +4707,19 @@ class $modify(BufGameObject, GameObject) {
 class $modify(BufRingObject, RingObject) {
     static void onModify(auto& self) {
         crashdiag::record("HOOK_REGISTER BufRingObject visual suppression priority=Priority::VeryEarly");
+        (void)self.setHookPriority("RingObject::triggerActivated", HOOK_PRIORITY);
         (void)self.setHookPriority("RingObject::powerOnObject", HOOK_PRIORITY);
         (void)self.setHookPriority("RingObject::spawnCircle", HOOK_PRIORITY);
+    }
+
+    // Ghost contact still drives the ghost player's physics, but must not activate
+    // the real level object's visuals/triggers ahead of the visible player.
+    void triggerActivated(float xPosition) {
+        crashdiag::ActiveScope __diag("BufRingObject::triggerActivated");
+        if (buf.simulating) {
+            return;
+        }
+        RingObject::triggerActivated(xPosition);
     }
 
     void powerOnObject(int state) {
@@ -4958,6 +4971,12 @@ class $modify(BufPlayerObject, PlayerObject) {
     void startDashing(DashRingObject* ring) {
         crashdiag::ActiveScope __diag("BufPlayerObject::startDashing");
         if (buf.simulating && isGhost(this)) {
+            // A dash ring is contact-triggered, not a click choice. The same overlap
+            // can be reported on consecutive collision passes; consume it once per run.
+            if (buf.orbsUsed.contains(ring)) {
+                return;
+            }
+            snapshotObject(ring);
             buf.orbsUsed.insert(ring);
             if (buf.orbUsedTick < 0) {
                 buf.orbUsedTick = buf.simTick;
@@ -5194,15 +5213,22 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void playerTouchedRing(PlayerObject* player, RingObject* ring) {
         crashdiag::ActiveScope __diag("BufBaseGameLayer::playerTouchedRing");
+        bool dashOrb = ring &&
+            (ring->m_objectType == GameObjectType::DashRing ||
+             ring->m_objectType == GameObjectType::GravityDashRing);
         if (buf.simulating) {
             if (!buf.smart || !isGhost(player)) {
                 return;
             }
             snapshotObject(ring);
-            buf.touchedOrb = true;
-            if (buf.firstOrbTick < 0) {
-                buf.firstOrbTick = buf.simTick;
-                buf.firstTouchedOrb = ring;
+            // Dash rings auto-trigger on contact. Do not treat them like optional
+            // jump orbs in orb-choice / late-click retries.
+            if (!dashOrb) {
+                buf.touchedOrb = true;
+                if (buf.firstOrbTick < 0) {
+                    buf.firstOrbTick = buf.simTick;
+                    buf.firstTouchedOrb = ring;
+                }
             }
         }
         GJBaseGameLayer::playerTouchedRing(player, ring);
@@ -5210,7 +5236,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         // v2.2 calculation mode: assume you click every orb you touch, on time. Without
         // this the ghost (which only has the one click being tested) misses the next orb in a
         // chain, falls, and the mod thinks a perfectly good click is a death.
-        if (buf.simulating && buf.orbClick) {
+        if (buf.simulating && buf.orbClick && !dashOrb) {
             bool first = player == buf.ghost1;
             bool& held = first ? buf.held1 : buf.held2;
             bool& autoClick = first ? buf.auto1 : buf.auto2;
