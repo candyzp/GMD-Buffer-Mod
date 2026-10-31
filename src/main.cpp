@@ -328,6 +328,8 @@ namespace {
         int pathHoldUntil = 0;       // v2.65: live path waits while a click's path is on screen
 
         std::unordered_set<GameObject*> simUsed;
+        // Dash rings can affect both ghosts independently in dual mode.
+        std::unordered_set<GameObject*> dashOrbsUsed1, dashOrbsUsed2;
         std::vector<ObjSnapshot> snapshots;
 
         // Built once after PlayLayer::init; used by every prediction in this level only.
@@ -1752,6 +1754,8 @@ namespace {
         std::unordered_set<GameObject*>().swap(buf.simDisabled);
         std::unordered_set<GameObject*>().swap(buf.harmless);
         std::unordered_set<GameObject*>().swap(buf.orbsUsed);
+        std::unordered_set<GameObject*>().swap(buf.dashOrbsUsed1);
+        std::unordered_set<GameObject*>().swap(buf.dashOrbsUsed2);
         std::unordered_set<GameObject*>().swap(buf.simUsed);
         std::vector<ObjSnapshot>().swap(buf.snapshots);
         std::unordered_map<GameObject*, Watched>().swap(watched);
@@ -1801,6 +1805,8 @@ namespace {
         buf.snapshots.clear();
         buf.simUsed.clear();
         buf.orbsUsed.clear();
+        buf.dashOrbsUsed1.clear();
+        buf.dashOrbsUsed2.clear();
         buf.simDisabled.clear();
     }
 
@@ -4973,11 +4979,12 @@ class $modify(BufPlayerObject, PlayerObject) {
         if (buf.simulating && isGhost(this)) {
             // A dash ring is contact-triggered, not a click choice. The same overlap
             // can be reported on consecutive collision passes; consume it once per run.
-            if (buf.orbsUsed.contains(ring)) {
+            auto& usedDashRings = this == buf.ghost2 ? buf.dashOrbsUsed2 : buf.dashOrbsUsed1;
+            if (usedDashRings.contains(ring)) {
                 return;
             }
             snapshotObject(ring);
-            buf.orbsUsed.insert(ring);
+            usedDashRings.insert(ring);
             if (buf.orbUsedTick < 0) {
                 buf.orbUsedTick = buf.simTick;
                 buf.firstUsedOrb = ring;
