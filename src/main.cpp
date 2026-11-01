@@ -4708,6 +4708,12 @@ class $modify(BufGameObject, GameObject) {
     }
 };
 
+// RingObject visual suppression is isolated from orb prediction itself.
+// The iOS 2.2081 RingObject overrides were introduced in v2.78.4 and are the first
+// new orb-specific hooks in the crash regression window. Keep the native RingObject
+// methods on iOS; PlayerObject::ringJump and GJBaseGameLayer::playerTouchedRing still
+// run the complete ghost orb prediction and alignment logic.
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
 // The ghost still runs the real ring-touch and ring-jump logic, but its repeated
 // predictions must not play orb activation visuals on the live level objects.
 class $modify(BufRingObject, RingObject) {
@@ -4744,6 +4750,7 @@ class $modify(BufRingObject, RingObject) {
         RingObject::spawnCircle();
     }
 };
+#endif // !TARGET_OS_IPHONE
 
 class $modify(BufPlayerObject, PlayerObject) {
     static void onModify(auto& self) {
