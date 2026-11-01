@@ -87,6 +87,15 @@ namespace {
         typeBit(GameObjectType::InverseGravityPortal) | typeBit(GameObjectType::NormalGravityPortal) |
         typeBit(GameObjectType::GravityTogglePortal);
 
+    // Ring-like interactions share live RingObject instances with the real level.
+    // iOS predictions stop at these objects instead of invoking their callbacks on a ghost.
+    constexpr uint64_t RING_INTERACT_TYPES =
+        typeBit(GameObjectType::YellowJumpRing) | typeBit(GameObjectType::PinkJumpRing) |
+        typeBit(GameObjectType::RedJumpRing) | typeBit(GameObjectType::GravityRing) |
+        typeBit(GameObjectType::GreenRing) | typeBit(GameObjectType::DropRing) |
+        typeBit(GameObjectType::CustomRing) | typeBit(GameObjectType::DashRing) |
+        typeBit(GameObjectType::GravityDashRing) | typeBit(GameObjectType::SpiderOrb);
+
     // Portals that change too much state to simulate: reaching one ends prediction as "safe".
     constexpr uint64_t STOP_TYPES =
         typeBit(GameObjectType::ShipPortal) | typeBit(GameObjectType::CubePortal) | typeBit(GameObjectType::BallPortal) |
@@ -4708,7 +4717,8 @@ class $modify(BufGameObject, GameObject) {
     }
 };
 
-// The ghost still runs the real ring-touch and ring-jump logic, but its repeated
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
+// The ghost still runs the real ring-touch and ring-jump logic on desktop, but its repeated
 // predictions must not play orb activation visuals on the live level objects.
 class $modify(BufRingObject, RingObject) {
     static void onModify(auto& self) {
@@ -4744,6 +4754,7 @@ class $modify(BufRingObject, RingObject) {
         RingObject::spawnCircle();
     }
 };
+#endif // !TARGET_OS_IPHONE
 
 class $modify(BufPlayerObject, PlayerObject) {
     static void onModify(auto& self) {
@@ -4753,7 +4764,9 @@ class $modify(BufPlayerObject, PlayerObject) {
         // its full dt, and CBF's mid-tick clicks arrive while inRealUpdate is set.
         (void)self.setHookPriority("PlayerObject::update", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayerObject::incrementJumps", HOOK_PRIORITY);
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
         (void)self.setHookPriority("PlayerObject::ringJump", HOOK_PRIORITY);
+#endif
     }
 
     // Runs 240x/sec per player. Ghost steps (during a simulation) skip straight to
@@ -4945,6 +4958,7 @@ class $modify(BufPlayerObject, PlayerObject) {
         PlayerObject::playSpiderDashEffect(from, to);
     }
 
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
     void ringJump(RingObject* ring, bool skipCheck) {
         crashdiag::ActiveScope __diag("BufPlayerObject::ringJump");
         if (buf.simulating) {
@@ -4972,6 +4986,7 @@ class $modify(BufPlayerObject, PlayerObject) {
         }
         PlayerObject::ringJump(ring, skipCheck);
     }
+#endif // !TARGET_OS_IPHONE
 
     // Dash orbs don't go through ringJump.
     void startDashing(DashRingObject* ring) {
@@ -5047,7 +5062,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         (void)self.setHookPriority("GJBaseGameLayer::canBeActivatedByPlayer", HOOK_PRIORITY);
         (void)self.setHookPriority("GJBaseGameLayer::handleButton", HOOK_PRIORITY);
         (void)self.setHookPriority("GJBaseGameLayer::collisionCheckObjects", HOOK_PRIORITY);
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
         (void)self.setHookPriority("GJBaseGameLayer::playerTouchedRing", HOOK_PRIORITY);
+#endif
         (void)self.setHookPriority("GJBaseGameLayer::flipGravity", HOOK_PRIORITY);
         (void)self.setHookPriority("GJBaseGameLayer::gameEventTriggered", HOOK_PRIORITY);
         (void)self.setHookPriority("GJBaseGameLayer::playerWillSwitchMode", HOOK_PRIORITY);
@@ -5097,6 +5114,11 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         // Hot loop: runs for every nearby object, every ghost tick. One type lookup per
         // object, no bounds-checked at(), and the ghost rect is only fetched if needed.
         uint64_t keep = buf.smart ? (COLLIDING_TYPES | INTERACT_TYPES) : COLLIDING_TYPES;
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+        // Keep real orb interactions native on iOS. A hidden PlayerObject must not run
+        // RingObject callbacks against the same live level objects as the real player.
+        keep &= ~RING_INTERACT_TYPES;
+#endif
         bool haveRect = false;
         CCRect ghostRect;
         auto& list = *objects;
@@ -5108,6 +5130,20 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             auto info = cachedObjectInfo(object);
             unsigned type = info.type;
             uint64_t bit = info.bit;
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+            if (RING_INTERACT_TYPES & bit) {
+                if (!haveRect) {
+                    ghostRect = player->getObjectRect();
+                    haveRect = true;
+                }
+                if (ghostRect.intersectsRect(object->getObjectRect())) {
+                    // End this prediction at the first orb boundary. The real player still
+                    // receives the game's untouched native ring handling.
+                    buf.ghostHitPortal = true;
+                }
+                continue;
+            }
+#endif
             if (keep & bit) {
                 // v2.31: a hazard you're touching right now while alive is one the game doesn't
                 // let kill you (a spike made to follow the player, noclip...). Seen in GRIEF:
@@ -5218,6 +5254,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
     void playerTouchedRing(PlayerObject* player, RingObject* ring) {
         crashdiag::ActiveScope __diag("BufBaseGameLayer::playerTouchedRing");
         bool dashOrb = ring &&
@@ -5259,6 +5296,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             }
         }
     }
+#endif // !TARGET_OS_IPHONE
 
     // Gravity portals / blue pads / blue orbs: flip only the ghost, no layer effects.
     void flipGravity(PlayerObject* player, bool flip, bool noEffects) {
