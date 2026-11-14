@@ -27,7 +27,7 @@
 // flushed during gameplay; fatal POSIX signals dump it using write() only,
 // on an alternate signal stack, before chaining to the previous handler.
 namespace crashdiag {
-    inline constexpr size_t EVENT_CAPACITY = 256;
+    inline constexpr size_t EVENT_CAPACITY = 512;
     inline constexpr size_t EVENT_SIZE = 224;
     inline constexpr size_t ACTIVE_SIZE = 112;
 

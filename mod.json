@@ -90,8 +90,14 @@
         "smart-prediction": {
             "type": "bool",
             "name": "Orb / pad / portal prediction",
-            "description": "Let the ghost use orbs, pads, gravity portals and speed portals. Turn off if you see glitches with objects.",
+            "description": "Let the ghost use jump pads, gravity portals and speed portals. Optional jump-orb interactions have their own switch: Predict jump orbs.",
             "default": true
+        },
+        "orb-prediction": {
+            "type": "bool",
+            "name": "Predict jump orbs",
+            "description": "OFF by default for smoother input. When off, the ghost ignores optional jump orbs and skips alternate-choice and late-orb simulation retries. Obstacle, pad and portal prediction remain enabled. Turn it on for levels where a save requires a jump orb.",
+            "default": false
         },
         "ground-horizon": {
             "type": "int",
@@ -347,6 +353,18 @@
             "type": "bool",
             "name": "Debug tools (verbose logging)",
             "description": "OFF by default for performance. ON enables detailed event, performance, death and drift logging plus the Windows console. Tap DIAG during a level to enable crash capture without enabling these extra analysis tools.",
+            "default": false
+        },
+        "performance-diagnostics": {
+            "type": "bool",
+            "name": "Performance diagnostics",
+            "description": "Record a detailed, bounded trace in the mod save folder: per-input decision reason, time and budget, ghost simulations/ticks, collision and candidate counts, orb activity, budget cutoffs, long physics-update gaps, and crash signal context. OFF by default.",
+            "default": false
+        },
+        "disable-logs": {
+            "type": "bool",
+            "name": "Disable diagnostic logs",
+            "description": "Suppress persistent event, performance and debug logging to reduce logging overhead. The fatal-signal detector remains installed and can still write basic crash metadata, but detailed event history will be unavailable. This setting overrides Performance diagnostics and Debug tools.",
             "default": false
         },
         "performance-mode": {

@@ -87,6 +87,13 @@ namespace {
         typeBit(GameObjectType::InverseGravityPortal) | typeBit(GameObjectType::NormalGravityPortal) |
         typeBit(GameObjectType::GravityTogglePortal);
 
+    // Optional jump-orb interactions are independent from pads and portals.
+    constexpr uint64_t JUMP_ORB_TYPES =
+        typeBit(GameObjectType::YellowJumpRing) | typeBit(GameObjectType::PinkJumpRing) |
+        typeBit(GameObjectType::RedJumpRing) | typeBit(GameObjectType::GravityRing) |
+        typeBit(GameObjectType::GreenRing) | typeBit(GameObjectType::DropRing) |
+        typeBit(GameObjectType::CustomRing) | typeBit(GameObjectType::SpiderOrb);
+
     // Portals that change too much state to simulate: reaching one ends prediction as "safe".
     constexpr uint64_t STOP_TYPES =
         typeBit(GameObjectType::ShipPortal) | typeBit(GameObjectType::CubePortal) | typeBit(GameObjectType::BallPortal) |
@@ -229,6 +236,7 @@ namespace {
         int rapid = 0;
 
         bool smart = true;
+        bool orbPrediction = false;
         bool console = false;
         double budgetMs = 6.0;
         int groundHorizon = 130;     // v2.1: how far ahead cube/ball/spider predictions look
@@ -284,6 +292,12 @@ namespace {
         bool perfLog = false;        // v2.21: log time / runs / ghost ticks per click
         int simRuns = 0;             // v2.21: predictions run for the current click
         long simTicks = 0;           // v2.21: ghost ticks stepped for the current click
+        bool clickSawOrb = false;
+        int clickOrbRuns = 0;
+        int diagnosticBase = -1, diagnosticSavedDelay = 0, diagnosticLanded = -1;
+        int diagnosticHorizon = 0, diagnosticMaxDelay = 0;
+        int diagnosticBestDelay = 0, diagnosticBestSurvival = -1;
+        char const* diagnosticReason = "not-run";
         bool cbfSync = true;         // v2.18: line the ghost up with Click Between Frames' mid-tick clicks
         float firstStep = 1.f;       // v2.18: fraction of a tick the ghost's first step lasts
         bool inRealUpdate = false;   // v2.18: inside P1's physics step (a CBF click lands here)
@@ -309,6 +323,8 @@ namespace {
         CCLabelBMFont* autoTag = nullptr;  // optional on-screen auto-release tag
         bool showAutoTag = false;
         bool debugTools = false;
+        bool performanceDiagnostics = false;
+        bool disableLogs = false;
         bool diagnosticCaptureRequested = false; // DIAG can enable crash capture without extra analysis work
         bool usedThisAttempt = false;      // the buffer was on at some point of this attempt
         bool learn = true;           // v2.13: per-level memory learned from your runs
@@ -345,6 +361,7 @@ namespace {
     } buf;
 
     std::string stageText();
+    double clickMs();
 
     // v2.23 unlocked FPS: GD runs round(max(1, frameTime * 240)) physics steps per frame,
     // so only 60 / 120 / 240 FPS give 240 steps a second (144 FPS -> 288, 360 FPS -> 360).
@@ -454,7 +471,7 @@ namespace {
 
     template <class... Args>
     void say(fmt::format_string<Args...> f, Args&&... args) {
-        if (!buf.debugTools) return;
+        if (!buf.debugTools || buf.disableLogs) return;
         auto msg = fmt::format(f, std::forward<Args>(args)...);
         crashdiag::recordf("BUFFER_EVENT step=%d %s", logClock, msg.c_str());
         exportLines.push_back(fmt::format("[{:>6}] {}", logClock, msg));
@@ -550,12 +567,14 @@ namespace {
         buf.activationEvery = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("activation-every")), 1, 10);
         buf.showAutoTag = mod->getSettingValue<bool>("show-auto-tag");
         buf.debugTools = mod->getSettingValue<bool>("debug-tools");
+        buf.performanceDiagnostics = mod->getSettingValue<bool>("performance-diagnostics");
+        buf.disableLogs = mod->getSettingValue<bool>("disable-logs");
         buf.console = buf.debugTools;
         buf.driftCheck = buf.debugTools;
         buf.perfLog = buf.debugTools;
         buf.deathLog = buf.debugTools;
         buf.explain = buf.debugTools;
-        crashdiag::setRecordingEnabled(buf.debugTools || buf.diagnosticCaptureRequested);
+        crashdiag::setRecordingEnabled((buf.debugTools || buf.performanceDiagnostics || buf.diagnosticCaptureRequested) && !buf.disableLogs);
         if (!buf.debugTools) {
             buf.showPath = false;
         }
@@ -567,15 +586,16 @@ namespace {
                 buf.waveHorizon + (160 - buf.waveHorizon) * amount)), 20, 160);
             buf.budgetMs = std::max(buf.budgetMs, 4.0 + 8.0 * amount);
         }
+        buf.orbPrediction = mod->getSettingValue<bool>("orb-prediction");
         buf.assumeOrbs = mod->getSettingValue<bool>("orb-assume-hit");
-        buf.orbClick = buf.assumeOrbs;
-        buf.tryBothOrbs = mod->getSettingValue<bool>("orb-try-both");
+        buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
+        buf.tryBothOrbs = mod->getSettingValue<bool>("orb-try-both") && buf.orbPrediction;
         buf.avoidMovers = mod->getSettingValue<bool>("avoid-moving-objects");
         buf.autoRelease = mod->getSettingValue<bool>("wave-auto-release");
         buf.autoWindow = static_cast<int>(mod->getSettingValue<int64_t>("auto-release-window"));
         buf.spamGap = static_cast<int>(mod->getSettingValue<int64_t>("wave-spam-gap"));
-        buf.orbAlign = mod->getSettingValue<bool>("orb-align");
-        buf.orbTiming = mod->getSettingValue<bool>("orb-timing");
+        buf.orbAlign = mod->getSettingValue<bool>("orb-align") && buf.orbPrediction;
+        buf.orbTiming = mod->getSettingValue<bool>("orb-timing") && buf.orbPrediction;
         buf.orbAlignGround = mod->getSettingValue<bool>("orb-align-ground");
         buf.fullState = mod->getSettingValue<bool>("full-ghost-state");
         buf.portalPredict = mod->getSettingValue<bool>("predict-through-portals");
@@ -1958,9 +1978,16 @@ namespace {
         int tick = 0;
         bool died = false;
         bool safe = false;
+        bool budgetExceeded = false;
+        uint64_t collisionCallsBefore = buf.cacheCollisionCalls;
+        uint64_t candidateObjectsBefore = buf.cacheCandidateObjects;
 
         collectMovers();
         for (; tick < total; ++tick) {
+            if (clickTimed && clickMs() >= buf.budgetMs) {
+                budgetExceeded = true;
+                break;
+            }
             if (!movers.empty()) {
                 placeMovers(tick + 1);  // where they'll be after this step
             }
@@ -2090,11 +2117,22 @@ namespace {
         ++buf.simRuns;
         buf.simTicks += tick + 1;
 
-        // Died or hit an unsimulated portal before the delayed input even fired:
-        // longer delays can't do better, stop searching.
-        if ((died || buf.ghostHitPortal) && tick < delay) {
+        // A budget cutoff is neither a death nor a valid partial save. Stop searching,
+        // then restore all snapshotted live objects before returning.
+        if (budgetExceeded) {
+            *end = SimEnd::StopSearch;
+            crashdiag::recordf("SIM_BUDGET_ABORT tick=%d delay=%d horizon=%d elapsedMs=%.3f budgetMs=%.3f",
+                tick, delay, horizon, clickMs(), buf.budgetMs);
+        }
+        else if ((died || buf.ghostHitPortal) && tick < delay) {
             *end = SimEnd::StopSearch;
         }
+        int touchedOrbId = buf.firstTouchedOrb ? buf.firstTouchedOrb->m_objectID : 0;
+        int usedOrbId = buf.firstUsedOrb ? buf.firstUsedOrb->m_objectID : 0;
+        int touchedOrbTick = buf.firstOrbTick;
+        int usedOrbTick = buf.orbUsedTick;
+        bool usedOrbPrediction = buf.orbClick;
+        int orbDelay = buf.orbClickDelay;
         restoreObjects();
         buf.ghost1->stopAllActions();
         if (buf.ghost2) {
@@ -2109,29 +2147,34 @@ namespace {
             if (buf.ghost2) buf.ghost2->stopParticles();
         }
         buf.simulating = false;
-        crashdiag::recordf("SIM_END survived=%d horizon=%d safe=%d died=%d portal=%d tick=%d runs=%d simTicks=%d",
-            survived, horizon, safe ? 1 : 0, died ? 1 : 0, buf.ghostHitPortal ? 1 : 0, tick, buf.simRuns, buf.simTicks);
-        return safe ? horizon : survived;
+        crashdiag::recordf("SIM_END survived=%d horizon=%d safe=%d died=%d portal=%d tick=%d runs=%d simTicks=%d budgetAbort=%d orbClick=%d orbDelay=%d touchTick=%d usedTick=%d touchID=%d usedID=%d collisionCalls=%llu candidates=%llu",
+            survived, horizon, safe ? 1 : 0, died ? 1 : 0, buf.ghostHitPortal ? 1 : 0, tick, buf.simRuns, buf.simTicks,
+            budgetExceeded ? 1 : 0, usedOrbPrediction ? 1 : 0, orbDelay, touchedOrbTick, usedOrbTick, touchedOrbId, usedOrbId,
+            static_cast<unsigned long long>(buf.cacheCollisionCalls - collisionCallsBefore),
+            static_cast<unsigned long long>(buf.cacheCandidateObjects - candidateObjectsBefore));
+        return budgetExceeded ? 0 : (safe ? horizon : survived);
     }
 
     // All orb retries share the same per-input budget as the main search.
-    double clickMs();
-
     // v2.4: simulate() with the orb setting; if that run touched an orb and didn't make
     // it, also try the other choice (click it / skip it) and keep whichever lives longer,
     // like a player who only clicks the orb when they need it.
     int simulateOrbs(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter,
         int stopAt, SimEnd* end) {
-        buf.orbClick = buf.assumeOrbs;
+        buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
         buf.touchedOrb = false;
         int first = simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, stopAt, end);
-        if (!buf.tryBothOrbs || !buf.smart || !buf.touchedOrb || first >= stopAt || clickMs() >= buf.budgetMs) {
+        if (buf.touchedOrb) {
+            buf.clickSawOrb = true;
+            ++buf.clickOrbRuns;
+        }
+        if (!buf.orbPrediction || !buf.tryBothOrbs || !buf.smart || !buf.touchedOrb || first >= stopAt || clickMs() >= buf.budgetMs) {
             return first;
         }
         SimEnd firstEnd = *end;
         buf.orbClick = !buf.assumeOrbs;
         int second = simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, stopAt, end);
-        buf.orbClick = buf.assumeOrbs;
+        buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
         if (firstEnd != SimEnd::StopSearch) {
             *end = SimEnd::Ok;
         }
@@ -2146,7 +2189,7 @@ namespace {
                 SimEnd lateEnd;
                 int ret = simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, stopAt, &lateEnd);
                 buf.orbClickDelay = 0;
-                buf.orbClick = buf.assumeOrbs;
+                buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
                 best = std::max(best, ret);
                 if (best >= stopAt) {
                     break;
@@ -2162,7 +2205,7 @@ namespace {
         std::vector<CCPoint> path;
         path.reserve(static_cast<size_t>(std::max(0, delay + horizon)));
         buf.recordPath = &path;
-        buf.orbClick = buf.assumeOrbs;
+        buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
         SimEnd end;
         simulate(layer, p1, p2, dual, delay, down, horizon, releaseAfter, delay + horizon, &end);
         buf.recordPath = nullptr;
@@ -2280,7 +2323,7 @@ namespace {
         RingObject* target = buf.firstTouchedOrb;
         std::string trace;  // v2.42: what was tried, for the explain log
         if (touch < 0 || touch > window || !target) {
-            buf.orbClick = buf.assumeOrbs;
+            buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
             return 0;
         }
 
@@ -2288,7 +2331,7 @@ namespace {
         // the existing per-click budget is spent; a single orb shouldn't trigger a pile of
         // extra full-horizon ghost runs after the budget has already expired.
         if (clickMs() >= buf.budgetMs) {
-            buf.orbClick = buf.assumeOrbs;
+            buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
             return 0;
         }
 
@@ -2298,12 +2341,12 @@ namespace {
             if (buf.firstUsedOrb == target && buf.orbUsedTick >= 0 &&
                 buf.orbUsedTick <= touch + st(6) && ret >= horizon) {
                 *landed = ret;
-                buf.orbClick = buf.assumeOrbs;
+                buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
                 return learned;
             }
         }
         if (clickMs() >= buf.budgetMs) {
-            buf.orbClick = buf.assumeOrbs;
+            buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
             return 0;
         }
 
@@ -2373,7 +2416,7 @@ namespace {
                     trace.empty() ? " (nothing to try)" : trace, found > 0 ? fmt::format("+{}t", found) : std::string("no pick"));
             }
         }
-        buf.orbClick = buf.assumeOrbs;
+        buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
         return found;
     }
 
@@ -2934,7 +2977,7 @@ namespace {
         restoreObjects();
         buf.ghost1->stopAllActions();
         buf.simulating = false;
-        buf.orbClick = buf.assumeOrbs;
+        buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clockStart).count();
         int matched = firstOff < 0 ? t : firstOff;
         lastBench = fmt::format("{}/{} steps ({:.0f}%) match, stopped at {}", matched, r.track.size(),
@@ -3209,6 +3252,14 @@ namespace {
 
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
         crashdiag::HookScope __diag("intercept");
+        buf.diagnosticBase = -1;
+        buf.diagnosticSavedDelay = 0;
+        buf.diagnosticLanded = -1;
+        buf.diagnosticHorizon = 0;
+        buf.diagnosticMaxDelay = 0;
+        buf.diagnosticBestDelay = 0;
+        buf.diagnosticBestSurvival = -1;
+        buf.diagnosticReason = "pass-through";
         crashdiag::recordf("INPUT_INTERCEPT down=%d p1Side=%d enabled=%d simulating=%d injecting=%d layer=%p",
             down ? 1 : 0, isPlayer1 ? 1 : 0, buf.enabled ? 1 : 0, buf.simulating ? 1 : 0, buf.injecting ? 1 : 0, static_cast<void*>(self));
 
@@ -3216,6 +3267,7 @@ namespace {
         // This check runs before normal prediction so a later release cannot be queued
         // independently and accidentally change the hold length.
         if (buf.activationBypassActive) {
+            buf.diagnosticReason = "activation-rate-bypass";
             buf.appliedInput = down;
             if (!down) {
                 buf.activationBypassActive = false;
@@ -3236,6 +3288,7 @@ namespace {
         clickBudget();
         auto* layer = GameManager::get()->m_playLayer;
         if (!layer) {
+            buf.diagnosticReason = "no-play-layer";
             return false;
         }
 
@@ -3244,6 +3297,7 @@ namespace {
         // v2.55: a P2-side input in a two-player level only steers Player 2 while dual mode is
         // on; before that it moves Player 1 (Relief's wave parts), so it's buffered like a P1 input.
         if (twoPlayer && !isPlayer1 && layer->m_gameState.m_isDualMode) {
+            buf.diagnosticReason = "p2-side-bypass";
             return false;
         }
         // In two-player levels P2 is someone else: never simulate P1's input on it.
@@ -3256,15 +3310,18 @@ namespace {
             buf.autoReleased = false;
             buf.autoDash = false;
             if (!down) {
+                buf.diagnosticReason = "auto-release-swallowed-input";
                 return true;
             }
         }
         if (!buf.enabled) {
+            buf.diagnosticReason = "buffer-disabled";
             buf.appliedInput = down;
             return false;
         }
         // v2.4: the ghost never presses left/right, so platformer predictions are meaningless.
         if (layer->m_isPlatformer) {
+            buf.diagnosticReason = "platformer-bypass";
             buf.appliedInput = down;
             return false;
         }
@@ -3291,6 +3348,7 @@ namespace {
 
         bool anyShip = p1 && (p1->m_isShip || (p2 && p2->m_isShip));
         if (!p1 || p1->m_isDead || (anyShip && !buf.shipBuffer)) {
+            buf.diagnosticReason = "invalid-player-or-ship-disabled";
             resetPending();
             buf.appliedInput = down;
             return false;
@@ -3324,6 +3382,7 @@ namespace {
         bool anySwing = p1->m_isSwing || (p2 && p2->m_isSwing);
         if ((anyWave || anyShip || (anyUfo && buf.ufoSmart) || (anyBall && buf.ballSmart) || (anySwing && buf.swingSmart)) &&
             buf.rapid >= SPAM_STREAK) {
+            buf.diagnosticReason = "spam-guard";
             if (buf.explain) {
                 say("pass {}: spam ({} fast inputs in a row, gap < {}t)", down ? "press" : "release", buf.rapid, spamGap);
             }
@@ -3406,7 +3465,10 @@ namespace {
         if (buf.lowLatency) {
             maxDelay = std::min(maxDelay, st(4));  // at most 1 frame (60 fps) of delay
         }
+        buf.diagnosticHorizon = horizon;
+        buf.diagnosticMaxDelay = maxDelay;
         if (maxDelay <= 0) {
+            buf.diagnosticReason = "zero-delay-limit";
             if (buf.explain) {
                 say("pass {}: max delay is 0 for this mode", down ? "press" : "release");
             }
@@ -3450,7 +3512,7 @@ namespace {
             int window = st(std::clamp(buf.orbWindow, 1, 64));
             simulate(layer, p1, p2, dual, 0, true, window + 2, -1, window + 2, &probeEnd);
             buf.skipPress = false;
-            buf.orbClick = buf.assumeOrbs;
+            buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
             if (buf.firstOrbTick >= 0 && buf.firstOrbTick <= window) {
                 say("orb: you'd touch an orb at t{}, but this press is from the ground ('also from the ground' is off)",
                     buf.firstOrbTick);
@@ -3460,11 +3522,17 @@ namespace {
             int orbLanded = 0;
             int k = memorySaysSkip(sliceOf(p1)) ? 0 : alignOrb(layer, p1, p2, dual, horizon, releaseAfter, memoryDelay(sliceOf(p1)), &orbLanded);
             if (k > 0 && trainInstead(layer, k, down, "orb")) {
+                buf.diagnosticReason = "training-orb-alignment";
+                buf.diagnosticSavedDelay = k;
+                buf.diagnosticLanded = orbLanded;
                 decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
                 buf.appliedInput = down;
                 return false;
             }
             if (k > 0) {
+                buf.diagnosticReason = "orb-alignment-save";
+                buf.diagnosticSavedDelay = k;
+                buf.diagnosticLanded = orbLanded;
                 say("ORB {} +{}t ({:g}f) -> {}t", buf.orbWasTiming ? "timing" : "press", k, k * TICK, orbLanded);
                 noteSave(layer, k);
                 decided(layer, p1, p2, dual, k, down, horizon, releaseAfter);
@@ -3499,6 +3567,9 @@ namespace {
                                  : simulateOrbs(layer, p1, p2, dual, 0, down, horizon, releaseAfter, horizon, &end);
         buf.captureKiller = false;
         buf.trackMovers = false;
+        buf.diagnosticBase = base;
+        buf.diagnosticBestDelay = dbgBestK;
+        buf.diagnosticBestSurvival = dbgBestRet;
 
         // v2.30 diagnostics: a ghost that dies within a few ticks while you live means the
         // prediction doesn't match you there. Log what killed it and how both hitboxes compare.
@@ -3533,6 +3604,7 @@ namespace {
         // v2.36: with CBF, where inside the tick the click landed (0 = on the tick)
         std::string tickTag = midTick > 0.f ? fmt::format(" @{:.2f}", midTick) : std::string();
         if (base >= horizon) {
+            buf.diagnosticReason = "press-now-survives";
             // v2.43 more time at death spots. This input is only safe if your next input comes
             // in time, and level memory has seen you die here repeatedly: try small delays
             // that push the crash further away (or remove it), so you get more time to react.
@@ -3565,6 +3637,9 @@ namespace {
                     }
                 }
                 if (bestK > 0 && !buf.train) {
+                    buf.diagnosticReason = "more-time-save";
+                    buf.diagnosticSavedDelay = bestK;
+                    buf.diagnosticLanded = bestCrash;
                     noteSave(layer, bestK);
                     say("MORE TIME {}{} +{}t: crash t{} -> {} (died here {}x)", down ? "press" : "release", tickTag, bestK, crash0,
                         bestCrash < 0 ? std::string("none") : fmt::format("t{}", bestCrash), spotAround(sliceOf(p1)).deaths);
@@ -3595,6 +3670,7 @@ namespace {
         // v2.63: only once the jump came back down. A long jump (Acheron's first: ~94 ticks in
         // the air, then onto a spike) crashes late too, and that crash *is* this click's.
         if (groundPress && buf.lateCrash > 0 && base >= st(buf.lateCrash) && buf.baseTouchedDown) {
+            buf.diagnosticReason = "late-crash-rule";
             if (buf.explain) {
                 say("pass press: crash only at {}t, after the jump would land (late crash rule)", base);
             }
@@ -3607,6 +3683,7 @@ namespace {
         // trusted here. Leave the input alone.
         int slice = sliceOf(p1);
         if (memorySaysSkip(slice)) {
+            buf.diagnosticReason = "level-memory-skip";
             say("memory: saves here failed before, input left alone");
             decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
             pending.skipped = true;
@@ -3664,7 +3741,10 @@ namespace {
                                   : searchDelay(layer, p1, p2, dual, down, anyWave, horizon, maxDelay, releaseAfter, base, &landed,
                                         groundPress);
         }
+        buf.diagnosticBestDelay = dbgBestK;
+        buf.diagnosticBestSurvival = dbgBestRet;
         if (saved <= 0) {
+            buf.diagnosticReason = clickMs() >= buf.budgetMs ? "prediction-budget-exhausted" : "no-safe-delay-found";
             say("no save: {}{} dies in {}t (max {}t, best +{}t -> {}t of {}){}", down ? "press" : "release", tickTag, base, maxDelay,
                 dbgBestK, dbgBestRet, horizon, !crashFixed ? "" : base < st(30) ? " - too late: waiting only makes it crash sooner" : " - same crash at any timing (next obstacle)");
             decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
@@ -3717,6 +3797,7 @@ namespace {
             buf.trackMovers = false;
         }
         if (buf.avoidMovers && buf.sawMover) {
+            buf.diagnosticReason = "moving-object-skip";
             say("skip +{}t save: moving objects ahead", saved);
             decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
             buf.appliedInput = down;
@@ -3724,6 +3805,9 @@ namespace {
         }
 
         if (trainInstead(layer, saved, down, swingPress ? "swing" : "")) {
+            buf.diagnosticReason = "training-mode-hint";
+            buf.diagnosticSavedDelay = saved;
+            buf.diagnosticLanded = landed;
             decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
             buf.appliedInput = down;
             return false;
@@ -3731,6 +3815,9 @@ namespace {
         if (robotPress) {
             releaseAfter = robotUsedHold;  // the path view / drift check show the hold that works
         }
+        buf.diagnosticReason = fromMemory ? "saved-from-level-memory" : "saved";
+        buf.diagnosticSavedDelay = saved;
+        buf.diagnosticLanded = landed;
         noteSave(layer, saved);
         say("SAVED {}{} +{}t ({:g}f)  {}->{}  [max {}]{}", down ? "press" : "release", tickTag, saved, saved * TICK, base, landed, maxDelay,
             robustNote ? std::string("  (robust)")
@@ -3790,7 +3877,7 @@ namespace {
         int window = st(std::clamp(buf.autoWindow, 2, 24));
         buf.sawMover = false;
         buf.skipPress = true;
-        buf.orbClick = buf.assumeOrbs;
+        buf.orbClick = buf.assumeOrbs && buf.orbPrediction;
         SimEnd end;
         int hold = simulate(layer, p1, p2, dual, 0, true, window, -1, window, &end);
         buf.skipPress = false;
@@ -3881,7 +3968,7 @@ class BufferMenu : public geode::Popup {
         { "low-latency", "Low latency" },
         { "robust-saves", "Robust saves" },
         { "orb-align", "Orb alignment" },
-        { "orb-timing", "Orb timing" },
+        { "orb-prediction", "Predict jump orbs" },
         { "level-memory", "Level memory" },
         { "more-time-death-spots", "More time (death spots)" },
         { "ship-buffer", "Ship buffering" },
@@ -4165,7 +4252,7 @@ protected:
         m_mainLayer->addChildAtPosition(m_stage, Anchor::Top, { 0.f, -52.f });
 
         // switches, two columns
-        constexpr int ROWS = 10;
+        constexpr int ROWS = 11;
         for (int i = 0; i < static_cast<int>(std::size(OPTIONS)); ++i) {
             int col = i / ROWS;
             int row = i % ROWS;
@@ -4289,7 +4376,7 @@ class $modify(BufPauseLayer, PauseLayer) {
         crashdiag::HookScope __diag("BufPauseLayer::onDiagnostics");
         // DIAG is an explicit request for crash capture; it does not turn on the
         // CPU-heavy in-game analysis tools.
-        if (!buf.debugTools) {
+        if (!buf.debugTools && !buf.disableLogs) {
             buf.diagnosticCaptureRequested = true;
             crashdiag::setRecordingEnabled(true);
         }
@@ -4299,14 +4386,19 @@ class $modify(BufPauseLayer, PauseLayer) {
         crashdiag::recordf("DIAGNOSTICS_EXPORT bytes=%zu clipboardCopied=%d", diagnostics.size(), copied ? 1 : 0);
         crashdiag::flush();
         FLAlertLayer::create("Input Buffer Diagnostics",
-            copied ? "Crash diagnostics copied to the clipboard. Paste the full text into the chat so we can inspect the exact crash path."
-                    : "Clipboard copy failed. The logs are still saved in the Input Buffer mod save folder.",
+            buf.disableLogs
+                ? "Diagnostic logging is disabled in settings. The fatal-signal detector remains installed, but detailed event history is not being recorded. Turn off Disable diagnostic logs and enable Performance diagnostics to capture the next lag spike."
+                : copied ? "Detailed diagnostics copied to the clipboard. The event trace is also saved in the Input Buffer mod save folder."
+                         : "Clipboard copy failed. The diagnostics remain saved in the Input Buffer mod save folder.",
             "OK")->show();
     }
 };
 
 $on_mod(Loaded) {
-    crashdiag::setRecordingEnabled(Mod::get()->getSettingValue<bool>("debug-tools"));
+    auto* mod = Mod::get();
+    bool logsEnabled = !mod->getSettingValue<bool>("disable-logs") &&
+        (mod->getSettingValue<bool>("debug-tools") || mod->getSettingValue<bool>("performance-diagnostics"));
+    crashdiag::setRecordingEnabled(logsEnabled);
     crashdiag::install();
     crashdiag::record("MOD_LOADED callback entered");
     auto allMods = Loader::get()->getAllMods();
@@ -4799,6 +4891,28 @@ class $modify(BufPlayerObject, PlayerObject) {
         }
 
         bool isP1 = layer && this == layer->m_player1;
+        if (isP1 && buf.performanceDiagnostics && !buf.disableLogs) {
+            static bool havePreviousP1Update = false;
+            static std::chrono::steady_clock::time_point previousP1Update;
+            auto now = std::chrono::steady_clock::now();
+            if (havePreviousP1Update) {
+                double gapMs = std::chrono::duration<double, std::milli>(now - previousP1Update).count();
+                double expectedMs = std::max(1.0, static_cast<double>(dt) * 1000.0);
+                double thresholdMs = std::max(12.0, expectedMs * 2.5);
+                if (gapMs > thresholdMs) {
+                    auto* p1 = layer ? layer->m_player1 : nullptr;
+                    char const* mode = !p1 ? "none" : p1->m_isDart ? "wave" : p1->m_isShip ? "ship" :
+                        p1->m_isBird ? "ufo" : p1->m_isBall ? "ball" : p1->m_isRobot ? "robot" :
+                        p1->m_isSpider ? "spider" : p1->m_isSwing ? "swing" : "cube";
+                    crashdiag::recordf("FRAME_GAP gapMs=%.2f expectedMs=%.2f thresholdMs=%.2f dt=%.5f tick=%d mode=%s lastSimRuns=%d lastGhostTicks=%ld orbPrediction=%d orbTouched=%d lastDecision=%s lastBase=%d lastSaved=%d",
+                        gapMs, expectedMs, thresholdMs, dt, tickCount, mode, buf.simRuns, buf.simTicks,
+                        buf.orbPrediction ? 1 : 0, buf.clickSawOrb ? 1 : 0, buf.diagnosticReason,
+                        buf.diagnosticBase, buf.diagnosticSavedDelay);
+                }
+            }
+            previousP1Update = now;
+            havePreviousP1Update = true;
+        }
         if (isP1 && tickCount > 0 && tickCount % 120 == 0) {
             // Poll only the new live controls twice a second; full settings parsing happens
             // only after a value actually changed, never on every frame or physics step.
@@ -4811,7 +4925,10 @@ class $modify(BufPlayerObject, PlayerObject) {
                 settings->getSettingValue<bool>("activation-rate-enabled") != buf.activationRateEnabled ||
                 static_cast<int>(settings->getSettingValue<int64_t>("activation-every")) != buf.activationEvery ||
                 settings->getSettingValue<bool>("show-auto-tag") != buf.showAutoTag ||
-                settings->getSettingValue<bool>("debug-tools") != buf.debugTools;
+                settings->getSettingValue<bool>("debug-tools") != buf.debugTools ||
+                settings->getSettingValue<bool>("performance-diagnostics") != buf.performanceDiagnostics ||
+                settings->getSettingValue<bool>("disable-logs") != buf.disableLogs ||
+                settings->getSettingValue<bool>("orb-prediction") != buf.orbPrediction;
             if (changed) {
                 readSettings();
                 applyStage();
@@ -4955,7 +5072,7 @@ class $modify(BufPlayerObject, PlayerObject) {
     void ringJump(RingObject* ring, bool skipCheck) {
         crashdiag::ActiveScope __diag("BufPlayerObject::ringJump");
         if (buf.simulating) {
-            if (!buf.smart || !isGhost(this)) {
+            if (!buf.smart || !buf.orbPrediction || !isGhost(this)) {
                 return;
             }
             if (buf.orbsUsed.contains(ring)) {
@@ -5068,6 +5185,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             if (!buf.smart || !isGhost(player) || !object) {
                 return false;
             }
+            if (hasType(JUMP_ORB_TYPES, object) && !buf.orbPrediction) {
+                return false;
+            }
             // v2.16: an orb can be checked on every tick you're inside it. Before, the first
             // check already "spent" it, so the ghost could only click an orb on the very
             // first tick it touched it. Now an orb is only spent once the ghost used it.
@@ -5103,7 +5223,8 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
         // Hot loop: runs for every nearby object, every ghost tick. One type lookup per
         // object, no bounds-checked at(), and the ghost rect is only fetched if needed.
-        uint64_t keep = buf.smart ? (COLLIDING_TYPES | INTERACT_TYPES) : COLLIDING_TYPES;
+        uint64_t interactTypes = buf.orbPrediction ? INTERACT_TYPES : (INTERACT_TYPES & ~JUMP_ORB_TYPES);
+        uint64_t keep = buf.smart ? (COLLIDING_TYPES | interactTypes) : COLLIDING_TYPES;
         bool haveRect = false;
         CCRect ghostRect;
         auto& list = *objects;
@@ -5206,10 +5327,34 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             // v2.21 performance log: what this click cost, measured around the whole decision.
             buf.simRuns = 0;
             buf.simTicks = 0;
+            buf.clickSawOrb = false;
+            buf.clickOrbRuns = 0;
+            auto collisionCallsBefore = buf.cacheCollisionCalls;
+            auto candidateObjectsBefore = buf.cacheCandidateObjects;
+            auto cacheHitsBefore = buf.cacheHits;
+            auto cacheMissesBefore = buf.cacheMisses;
             auto start = std::chrono::steady_clock::now();
             bool held = intercept(this, down, isPlayer1);
             clickTimed = false;
             sweepGhostLayer();
+            double decisionMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            if (buf.performanceDiagnostics && !buf.disableLogs) {
+                auto* p1 = this->m_player1;
+                char const* mode = !p1 ? "none" : p1->m_isDart ? "wave" : p1->m_isShip ? "ship" :
+                    p1->m_isBird ? "ufo" : p1->m_isBall ? "ball" : p1->m_isRobot ? "robot" :
+                    p1->m_isSpider ? "spider" : p1->m_isSwing ? "swing" : "cube";
+                crashdiag::recordf("PERF_CLICK down=%d mode=%s elapsedMs=%.3f budgetMs=%.2f reason=%s base=%d horizon=%d maxDelay=%d saved=%d landed=%d bestDelay=%d bestSurvival=%d simRuns=%d ghostTicks=%ld orbPrediction=%d orbRuns=%d orbTouched=%d orbTiming=%d tryBoth=%d collisionCalls=%llu candidates=%llu cacheHits=%llu cacheMisses=%llu queue=%zu shift=%d intercepted=%d",
+                    down ? 1 : 0, mode, decisionMs, buf.budgetMs, buf.diagnosticReason, buf.diagnosticBase,
+                    buf.diagnosticHorizon, buf.diagnosticMaxDelay, buf.diagnosticSavedDelay, buf.diagnosticLanded,
+                    buf.diagnosticBestDelay, buf.diagnosticBestSurvival, buf.simRuns, buf.simTicks,
+                    buf.orbPrediction ? 1 : 0, buf.clickOrbRuns, buf.clickSawOrb ? 1 : 0,
+                    buf.orbTiming ? 1 : 0, buf.tryBothOrbs ? 1 : 0,
+                    static_cast<unsigned long long>(buf.cacheCollisionCalls - collisionCallsBefore),
+                    static_cast<unsigned long long>(buf.cacheCandidateObjects - candidateObjectsBefore),
+                    static_cast<unsigned long long>(buf.cacheHits - cacheHitsBefore),
+                    static_cast<unsigned long long>(buf.cacheMisses - cacheMissesBefore),
+                    buf.queue.size(), buf.shift, held ? 1 : 0);
+            }
             if (buf.perfLog && buf.simRuns > 0) {
                 double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
                 say("perf: {:.2f} ms, {} runs, {} ghost ticks ({:.1f} us/tick)", ms, buf.simRuns, buf.simTicks,
@@ -5232,6 +5377,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
              ring->m_objectType == GameObjectType::GravityDashRing);
         if (buf.simulating) {
             if (!buf.smart || !isGhost(player)) {
+                return;
+            }
+            if (!buf.orbPrediction && !dashOrb) {
                 return;
             }
             snapshotObject(ring);
