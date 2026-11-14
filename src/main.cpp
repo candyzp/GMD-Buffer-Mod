@@ -1984,7 +1984,7 @@ namespace {
 
         collectMovers();
         for (; tick < total; ++tick) {
-            if (clickTimed && clickMs() >= buf.budgetMs) {
+            if (clickMs() >= buf.budgetMs) {
                 budgetExceeded = true;
                 break;
             }
